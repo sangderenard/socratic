@@ -4,6 +4,41 @@
       "zoom_in": {
         "button": 3,
         "type": "button"
+      },
+      "zoom_out": {
+        "button": 1,
+        "type": "button"
+      }
+    },
+    "controller": {
+      "channels": {},
+      "features": {
+        "axis_0": {
+          "axis": 0,
+          "type": "axis"
+        }
+      },
+      "signals": {
+        "sig1": {
+          "feature": "axis_0",
+          "op": "raw"
+        },
+        "sig2": {
+          "feature": "axis_0",
+          "op": "raw"
+        },
+        "sig3": {
+          "feature": "axis_0",
+          "op": "raw"
+        },
+        "sig4": {
+          "feature": "axis_0",
+          "op": "raw"
+        }
+      },
+      "state": {
+        "last_feature": "axis_0",
+        "last_signal": "sig4"
       }
     },
     "triggers": {

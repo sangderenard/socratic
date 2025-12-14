@@ -1,0 +1,16 @@
+{
+  "flight_physics": {
+    "atmosphere_alt_max": 0.22,
+    "auto_heading_on_move": 0,
+    "base_speed": 1.0000000000000007,
+    "drag_k": 1.0000000000000007,
+    "flight_alt_max": 5.999999999999989,
+    "flight_alt_min": 0.0,
+    "gravity_g": 1.0000000000000007,
+    "inertial": 1,
+    "lift_k": 1.0000000000000004,
+    "max_speed": 1.0000000000000044,
+    "throttle_rate": 0.9999999999999993,
+    "thrust_accel": 1.0000000000000027
+  }
+}

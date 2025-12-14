@@ -177,6 +177,13 @@ def make_batch(
             except Exception:
                 req.weapon_flags = 0
 
+        # Optional debug printing (C side).
+        try:
+            if bool(r.get("debug_print", False)):
+                req.weapon_flags |= 2
+        except Exception:
+            pass
+
         # Optional world + heightmap pointers.
         req.world_flags = 0
         try:

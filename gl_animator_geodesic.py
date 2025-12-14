@@ -28,27 +28,97 @@ except Exception:  # torch optional
     torch = None
 
 import joystick_menu
+import input_graph
 import weapons_structs
 import weapon_runtime
 import targeting_system
 import reticle_depth_finder
 import reticle_telemetry
+import airplane_structs
 import reticle_sprite
 import world_config_structs
 
 from flight_camera import PlanetFlightCamera, lookat_up_away_from_planet, clamp_radius_band
 
 
-def _get_weapon_binding(cfg: dict, key: str) -> dict | None:
+def _resolve_effective_control_set(menu: object | None) -> str:
+    """Resolve the effective control-set name for this frame.
+
+    Priority:
+    - If airplane role is explicitly set (bomber/fighter), use it.
+    - Else, if targeting is active, use view_targeting.
+    - Else, use flight.
+    """
+    if menu is None:
+        return "flight"
+    try:
+        airplane = getattr(menu, "airplane", None)
+        airplane = airplane if isinstance(airplane, dict) else {}
+        role = None
+        for k in ("control_set", "controls_set", "control_profile", "craft_role", "role"):
+            v = airplane.get(k)
+            if isinstance(v, str) and v.strip():
+                role = v.strip().lower()
+                break
+        if role in ("bomber", "fighter"):
+            return str(role)
+    except Exception:
+        pass
+    try:
+        if bool(getattr(menu, "_targeting_active", False)):
+            return "view_targeting"
+    except Exception:
+        pass
+    return "flight"
+
+
+def _get_set_binding(cfg: dict, *, set_name: str, group: str, key: str) -> dict | None:
+    """Return a binding dict from flight_controls.sets[set_name][group][key].
+
+    Falls back to legacy locations when set storage isn't present.
+    """
     try:
         fc = cfg.get("flight_controls")
         if not isinstance(fc, dict):
             return None
-        w = fc.get("weapons")
-        if not isinstance(w, dict):
+        sets = fc.get("sets")
+        if isinstance(sets, dict):
+            blk = sets.get(str(set_name))
+            if isinstance(blk, dict):
+                g = blk.get(str(group))
+                if isinstance(g, dict):
+                    b = g.get(str(key))
+                    return b if isinstance(b, dict) else None
+
+        # Legacy fallbacks (pre control-set schema).
+        legacy = fc.get(str(group))
+        if isinstance(legacy, dict):
+            b = legacy.get(str(key))
+            return b if isinstance(b, dict) else None
+        return None
+    except Exception:
+        return None
+
+
+def _get_set_trigger_mapping(cfg: dict, *, set_name: str, key: str) -> dict | None:
+    try:
+        fc = cfg.get("flight_controls")
+        if not isinstance(fc, dict):
             return None
-        b = w.get(str(key))
-        return b if isinstance(b, dict) else None
+        sets = fc.get("sets")
+        if isinstance(sets, dict):
+            blk = sets.get(str(set_name))
+            if isinstance(blk, dict):
+                t = blk.get("triggers")
+                if isinstance(t, dict):
+                    m = t.get(str(key))
+                    return m if isinstance(m, dict) else None
+        # Legacy fallback.
+        t0 = fc.get("triggers")
+        if isinstance(t0, dict):
+            m = t0.get(str(key))
+            return m if isinstance(m, dict) else None
+        return None
     except Exception:
         return None
 
@@ -119,6 +189,62 @@ def _binding_active(
         active = (int(now[0]), int(now[1])) == (int(x), int(y))
         return active, (1.0 if active else 0.0)
     return False, 0.0
+
+
+def _norm_axis_from_calib(v: float, calib: dict | None) -> float:
+    """Normalize raw axis value using stored extrema. Returns [-1, 1]."""
+    if not isinstance(calib, dict):
+        return float(max(-1.0, min(1.0, float(v))))
+    try:
+        vmin = float(calib.get("min", -1.0))
+        vmax = float(calib.get("max", 1.0))
+    except Exception:
+        return float(max(-1.0, min(1.0, float(v))))
+    if not (vmax > vmin + 1e-6):
+        return float(max(-1.0, min(1.0, float(v))))
+    center = 0.5 * (vmin + vmax)
+    half = 0.5 * (vmax - vmin)
+    return float(max(-1.0, min(1.0, (float(v) - float(center)) / float(max(1e-6, half)))))
+
+
+def _read_axis1d(mapping: object, axes_now: dict[int, float]) -> float:
+    """Read a 1D control from the new mapping schema (or legacy int axis index)."""
+    if isinstance(mapping, int):
+        return float(axes_now.get(int(mapping), 0.0))
+    if not isinstance(mapping, dict):
+        return 0.0
+    mtype = str(mapping.get("type", ""))
+    if mtype == "axis1d":
+        try:
+            a = int(mapping.get("axis", -1))
+        except Exception:
+            a = -1
+        v = float(axes_now.get(int(a), 0.0)) if int(a) >= 0 else 0.0
+        return float(_norm_axis_from_calib(v, mapping.get("calib") if isinstance(mapping.get("calib"), dict) else None))
+    # Allow axis mapping objects from older code paths.
+    if "axis" in mapping and isinstance(mapping.get("axis"), int):
+        v = float(axes_now.get(int(mapping.get("axis")), 0.0))
+        return float(max(-1.0, min(1.0, v)))
+    return 0.0
+
+
+def _read_axis2d(mapping: object, axes_now: dict[int, float]) -> tuple[float, float]:
+    """Read a 2D control from the new mapping schema."""
+    if not isinstance(mapping, dict):
+        return 0.0, 0.0
+    if str(mapping.get("type", "")) != "axis2d":
+        return 0.0, 0.0
+    x = mapping.get("x") if isinstance(mapping.get("x"), dict) else {}
+    y = mapping.get("y") if isinstance(mapping.get("y"), dict) else {}
+
+    ax = int(x.get("axis", -1)) if isinstance(x.get("axis", -1), int) else -1
+    ay = int(y.get("axis", -1)) if isinstance(y.get("axis", -1), int) else -1
+    vx = float(axes_now.get(int(ax), 0.0)) if ax >= 0 else 0.0
+    vy = float(axes_now.get(int(ay), 0.0)) if ay >= 0 else 0.0
+
+    cx = x.get("calib") if isinstance(x.get("calib"), dict) else None
+    cy = y.get("calib") if isinstance(y.get("calib"), dict) else None
+    return float(_norm_axis_from_calib(vx, cx)), float(_norm_axis_from_calib(vy, cy))
 
 
 def _draw_local_ground_grid(*, cam_pos: np.ndarray, planet_r: float) -> None:
@@ -2095,10 +2221,17 @@ _PLANET_DRAW_R = _PLANET_SURFACE_R
 
 
 def _safe_render_scale(v: object | None) -> float:
-    """Render-only scaling factor.
+    """Planet/world scaling factor.
 
-    Physics remains in unit-sphere coordinates; ship camera + planet rendering can be
-    scaled up/down by this factor.
+    The underlying physics model (particles + ship flight) operates in a unit-sphere
+    coordinate system.
+
+    `render_scale` converts that unit-sphere into larger/smaller *world units* for:
+    - planet radius + atmosphere thickness
+    - ship/camera position and velocities in world space
+
+    IMPORTANT: this does *not* scale the ship's body geometry or actuator/arm layout.
+    Arms and thrusters remain in ship-local units.
     """
     try:
         s = float(v) if v is not None else 1.0
@@ -3547,6 +3680,18 @@ def _load_airplane_spec(path: object | None) -> dict:
         "name": "default",
         "centers": {"mass": [0, 0, 0], "lift": [0, 0, 1], "thrust": [0, 0, -2]},
         "actuation": {"rudder": [0, 0, -3], "elevator": [0, 0, -3]},
+        "rigid_body": {"mass": 1.0, "inertia_diag": [200.0, 200.0, 200.0]},
+        "control_system": {"mode": "auto", "auto_kp": 6.0, "auto_kd": 2.5},
+        # Optional arm definitions used by the C flight sim.
+        # Keep these symmetric so they produce torque with ~0 net force.
+        "arms": [
+            {"type": "thruster", "input_idx": 2, "pos_b": [0, 0, -3], "dir_b": [0, 1, 0], "max_force": 0.02},
+            {"type": "thruster", "input_idx": 2, "pos_b": [0, 0, 3], "dir_b": [0, -1, 0], "max_force": 0.02},
+            {"type": "thruster", "input_idx": 3, "pos_b": [0, 0, -3], "dir_b": [-1, 0, 0], "max_force": 0.02},
+            {"type": "thruster", "input_idx": 3, "pos_b": [0, 0, 3], "dir_b": [1, 0, 0], "max_force": 0.02},
+            {"type": "thruster", "input_idx": 4, "pos_b": [3, 0, 0], "dir_b": [0, 1, 0], "max_force": 0.02},
+            {"type": "thruster", "input_idx": 4, "pos_b": [-3, 0, 0], "dir_b": [0, -1, 0], "max_force": 0.02},
+        ],
         "controls": {
             "deadzone": 0.08,
             "curve_exp": 2.5,
@@ -3571,6 +3716,23 @@ def _load_airplane_spec(path: object | None) -> dict:
         out = default
         # Shallow merge is plenty for this use.
         out.update(data)
+
+        # Optional flight-physics overrides (kept distinct from airplane.json).
+        # These override only the "motion" subsection at runtime.
+        try:
+            fp_path = "flight_physics.json"
+            if os.path.exists(fp_path):
+                with open(fp_path, "r", encoding="utf-8") as ff:
+                    fp_root = json.load(ff)
+                fp_blk = fp_root.get("flight_physics") if isinstance(fp_root, dict) else None
+                if isinstance(fp_blk, dict):
+                    motion = out.get("motion", None)
+                    if not isinstance(motion, dict):
+                        motion = {}
+                        out["motion"] = motion
+                    motion.update(fp_blk)
+        except Exception:
+            pass
 
         # Optional joystick.json overrides for control axis indices.
         # This keeps flight-control bindings decoupled from airplane.json.
@@ -3808,11 +3970,13 @@ class _JoystickSideMenu:
         self.minimap_cycle_button = 2
         self._last_minimap_cycle_time = 0.0
 
-        # Render-only flight camera state (ship view). Never affects physics.
+        # Render-only flight camera state (ship view). Never affects particle physics.
         self.flight_enabled = True
         self.flight_toggle_button = 1  # button 0 is already used for "adjust lock"
 
-        # Render-only scale factor for ship/planet view (independent of physics scale).
+        # Planet/world scale factor: scales the unit-sphere world to a desired size.
+        # This affects the planet radius and camera position/velocity in world space,
+        # but NOT ship geometry/arms/thrust.
         self.render_scale = _safe_render_scale(params.get("render_scale", 10.0))
 
         # Airplane spec (renderer-only): defines control mapping and integer offsets for
@@ -3828,12 +3992,55 @@ class _JoystickSideMenu:
             flight_r_max=float(flight_r_max),
         )
 
+        # Configure C flight controller + rigid-body + arms from airplane spec.
+        try:
+            airplane = self.airplane if isinstance(self.airplane, dict) else {}
+            rb = airplane.get("rigid_body", {}) if isinstance(airplane.get("rigid_body", {}), dict) else {}
+            cs = airplane.get("control_system", {}) if isinstance(airplane.get("control_system", {}), dict) else {}
+            arms = airplane.get("arms", None)
+
+            mass = rb.get("mass", None)
+            inertia = rb.get("inertia_diag", None)
+            inertia_diag = None
+            if isinstance(inertia, (list, tuple)) and len(inertia) == 3:
+                inertia_diag = (float(inertia[0]), float(inertia[1]), float(inertia[2]))
+
+            self.flight_cam.configure_rigid_body(
+                mass=float(mass) if isinstance(mass, (int, float)) else None,
+                inertia_diag=inertia_diag,
+            )
+
+            mode = cs.get("mode", None)
+            auto_kp = cs.get("auto_kp", None)
+            auto_kd = cs.get("auto_kd", None)
+            dbg = cs.get("debug_print", None)
+            self.flight_cam.configure_control_system(
+                mode=str(mode) if isinstance(mode, str) else None,
+                auto_kp=float(auto_kp) if isinstance(auto_kp, (int, float)) else None,
+                auto_kd=float(auto_kd) if isinstance(auto_kd, (int, float)) else None,
+                debug_print=bool(dbg) if isinstance(dbg, (bool, int, float)) else None,
+            )
+
+            if isinstance(arms, list):
+                # Arms are ship-local geometry; do NOT scale them with world/planet size.
+                self.flight_cam.configure_arms(arms=arms, scale=1.0)
+                self._airplane_arms_ref = arms
+            else:
+                self._airplane_arms_ref = None
+        except Exception:
+            self._airplane_arms_ref = None
+
         # Atmosphere model for inertial speed envelope.
         # Bind to the visible atmosphere shell thickness, not the max flight altitude.
         try:
             self.flight_cam.atmosphere_alt_max = float(_ATMOSPHERE_ALT_MAX) * float(self.render_scale)
         except Exception:
             self.flight_cam.atmosphere_alt_max = None
+        try:
+            self.flight_cam._sync_config_to_sim()
+            self.flight_cam._sync_state_to_sim()
+        except Exception:
+            pass
 
         # Persistent camera zoom state (optical zoom; affects camera weapon FOV).
         self.camera_zoom_mul = 1.0
@@ -3843,10 +4050,25 @@ class _JoystickSideMenu:
         self.view_yaw = 0.0
         self.view_pitch = 0.0
 
-    def apply_render_scale(self, scale: float) -> None:
-        """Apply a new render-only scale to the ship camera and related radii.
+        # Reticle look offsets (independent of view). Used by manual targeting.
+        self.reticle_yaw = 0.0
+        self.reticle_pitch = 0.0
 
-        This rescales the ship/camera world without changing simulation/physics.
+        # Control mode state (driven by bindable toggles in joystick.json).
+        self._active_control_set = "flight"  # flight|view_targeting|bomber|fighter
+        self._targeting_active = False
+
+        self._flaps_deflection = 0.0
+        self._prev_flaps_up = False
+        self._prev_flaps_down = False
+
+    def apply_render_scale(self, scale: float) -> None:
+        """Apply a new planet/world scale.
+
+        This rescales planet radii and the ship/camera position/velocity in world
+        coordinates so the view stays consistent.
+
+        It does NOT rescale ship geometry, actuator arms, or thrust magnitudes.
         """
         s = _safe_render_scale(scale)
         prev = float(self.render_scale)
@@ -3888,6 +4110,14 @@ class _JoystickSideMenu:
             self.flight_cam._rebuild_attitude()
         except Exception:
             pass
+        try:
+            self.flight_cam._sync_config_to_sim()
+            self.flight_cam._sync_state_to_sim()
+        except Exception:
+            pass
+
+        # Arms are ship-local geometry; never re-scale them.
+        # (If airplane arms change, we reconfigure elsewhere.)
 
     def flight_active(self, proj_mode: str) -> bool:
         return bool(self.flight_enabled) and _is_ship_proj_mode(proj_mode)
@@ -3916,6 +4146,8 @@ class _JoystickSideMenu:
         triggers = controls.get("triggers", {}) if isinstance(controls.get("triggers", {}), dict) else {}
         rates = airplane.get("rates", {}) if isinstance(airplane.get("rates", {}), dict) else {}
         motion = airplane.get("motion", {}) if isinstance(airplane.get("motion", {}), dict) else {}
+        rb = airplane.get("rigid_body", {}) if isinstance(airplane.get("rigid_body", {}), dict) else {}
+        cs = airplane.get("control_system", {}) if isinstance(airplane.get("control_system", {}), dict) else {}
 
         dz = float(controls.get("deadzone", 0.08))
         curve_exp = float(controls.get("curve_exp", 2.5))
@@ -3942,6 +4174,57 @@ class _JoystickSideMenu:
                 u = vf
             return float(max(0.0, min(1.0, u)))
 
+        # Poll full joystick snapshot so we can evaluate button-like bindings and toggles.
+        axes_now: dict[int, float] = {}
+        buttons_now: set[int] = set()
+        hats_now: dict[int, tuple[int, int]] = {}
+        try:
+            axes_now, buttons_now, hats_now = joystick_menu._poll_joystick_snapshot(self.joystick)
+        except Exception:
+            axes_now, buttons_now, hats_now = {}, set(), {}
+
+        # Select which control-set is active.
+        # Priority:
+        # - If airplane role is explicitly set (bomber/fighter), use it.
+        # - Else, if targeting is active, use view_targeting.
+        # - Else, use flight.
+        cfg = joystick_menu.load_or_create_joystick_config("joystick.json")
+        role = None
+        try:
+            airplane = self.airplane if isinstance(self.airplane, dict) else {}
+            for k in ("control_set", "controls_set", "control_profile", "craft_role", "role"):
+                v = airplane.get(k)
+                if isinstance(v, str) and v.strip():
+                    role = v.strip().lower()
+                    break
+        except Exception:
+            role = None
+
+        if role in ("bomber", "fighter"):
+            set_name = str(role)
+        else:
+            set_name = "view_targeting" if bool(getattr(self, "_targeting_active", False)) else "flight"
+
+        self._active_control_set = str(set_name)
+
+        # Load set bindings.
+        try:
+            fc = cfg.get("flight_controls") if isinstance(cfg, dict) else None
+            sets = fc.get("sets") if isinstance(fc, dict) else None
+            set_blk = sets.get(str(set_name)) if isinstance(sets, dict) else None
+            craft_blk = set_blk.get("craft") if isinstance(set_blk, dict) else None
+            look_blk = set_blk.get("look") if isinstance(set_blk, dict) else None
+            ret_blk = set_blk.get("reticle_look") if isinstance(set_blk, dict) else None
+            flaps_blk = set_blk.get("flaps") if isinstance(set_blk, dict) else None
+            trig_blk = set_blk.get("triggers") if isinstance(set_blk, dict) else None
+        except Exception:
+            craft_blk = None
+            look_blk = None
+            ret_blk = None
+            flaps_blk = None
+            trig_blk = None
+
+        # Fallback to legacy airplane.json axis indices if no new bindings exist.
         rudder_axis = int(left.get("rudder_axis", 0))
         elevator_axis = int(left.get("elevator_axis", 1))
         rudder_inv = bool(left.get("rudder_invert", True))
@@ -3952,8 +4235,19 @@ class _JoystickSideMenu:
         view_yaw_inv = bool(right.get("view_yaw_invert", True))
         view_pitch_inv = bool(right.get("view_pitch_invert", True))
 
-        rev_axis_raw = triggers.get("reverse_axis", 4)
-        fwd_axis_raw = triggers.get("forward_axis", 5)
+        # Throttle trigger mapping can be per-set (preferred) or legacy global.
+        rev_axis_raw = None
+        fwd_axis_raw = None
+        try:
+            if isinstance(trig_blk, dict):
+                rev_axis_raw = trig_blk.get("reverse_axis")
+                fwd_axis_raw = trig_blk.get("forward_axis")
+        except Exception:
+            pass
+        if rev_axis_raw is None:
+            rev_axis_raw = triggers.get("reverse_axis", 4)
+        if fwd_axis_raw is None:
+            fwd_axis_raw = triggers.get("forward_axis", 5)
 
         def _axis_mapping(v: object) -> tuple[int | None, int]:
             # Returns (axis_index, sign).
@@ -3971,26 +4265,49 @@ class _JoystickSideMenu:
         rev_axis, rev_sign = _axis_mapping(rev_axis_raw)
         fwd_axis, fwd_sign = _axis_mapping(fwd_axis_raw)
 
-        rudder_raw = float(self.axis_state.get(rudder_axis, 0.0))
-        elevator_raw = float(self.axis_state.get(elevator_axis, 0.0))
-        if rudder_inv:
+        # Craft controls (ailerons/rudder/elevators).
+        if isinstance(craft_blk, dict):
+            rudder_raw = float(_read_axis1d(craft_blk.get("rudder"), axes_now))
+            elevator_raw = float(_read_axis1d(craft_blk.get("elevators"), axes_now))
+            aileron_raw = float(_read_axis1d(craft_blk.get("ailerons"), axes_now))
+        else:
+            rudder_raw = float(axes_now.get(rudder_axis, float(self.axis_state.get(rudder_axis, 0.0))))
+            elevator_raw = float(axes_now.get(elevator_axis, float(self.axis_state.get(elevator_axis, 0.0))))
+            aileron_raw = 0.0
+        if rudder_inv and (not isinstance(craft_blk, dict)):
             rudder_raw = -rudder_raw
-        if elevator_inv:
+        if elevator_inv and (not isinstance(craft_blk, dict)):
             elevator_raw = -elevator_raw
         rudder = _curve(rudder_raw)
         elevator = _curve(elevator_raw)
+        aileron = _curve(aileron_raw)
 
-        look_x_raw = float(self.axis_state.get(view_yaw_axis, 0.0))
-        look_y_raw = float(self.axis_state.get(view_pitch_axis, 0.0))
-        if view_yaw_inv:
-            look_x_raw = -look_x_raw
-        if view_pitch_inv:
-            look_y_raw = -look_y_raw
+        # Look controls (2D) for view offsets.
+        if isinstance(look_blk, dict):
+            lx, ly = _read_axis2d(look_blk.get("axis2d"), axes_now)
+            look_x_raw = float(lx)
+            look_y_raw = float(ly)
+        else:
+            look_x_raw = float(axes_now.get(view_yaw_axis, float(self.axis_state.get(view_yaw_axis, 0.0))))
+            look_y_raw = float(axes_now.get(view_pitch_axis, float(self.axis_state.get(view_pitch_axis, 0.0))))
+            if view_yaw_inv:
+                look_x_raw = -look_x_raw
+            if view_pitch_inv:
+                look_y_raw = -look_y_raw
         look_x = _curve(look_x_raw)
         look_y = _curve(look_y_raw)
 
-        trig_back = _trigger_unit(float(rev_sign) * float(self.axis_state.get(rev_axis, 0.0))) if rev_axis is not None else 0.0
-        trig_fwd = _trigger_unit(float(fwd_sign) * float(self.axis_state.get(fwd_axis, 0.0))) if fwd_axis is not None else 0.0
+        # Reticle look controls (2D) used by manual targeting.
+        if isinstance(ret_blk, dict):
+            rx, ry = _read_axis2d(ret_blk.get("axis2d"), axes_now)
+            ret_x = _curve(float(rx))
+            ret_y = _curve(float(ry))
+        else:
+            ret_x = 0.0
+            ret_y = 0.0
+
+        trig_back = _trigger_unit(float(rev_sign) * float(axes_now.get(rev_axis, float(self.axis_state.get(rev_axis, 0.0))))) if rev_axis is not None else 0.0
+        trig_fwd = _trigger_unit(float(fwd_sign) * float(axes_now.get(fwd_axis, float(self.axis_state.get(fwd_axis, 0.0))))) if fwd_axis is not None else 0.0
         throttle_nudge = float(trig_fwd - trig_back)
 
         # Rates are split: craft movement uses `speed`; view uses view yaw/pitch rates.
@@ -4008,16 +4325,74 @@ class _JoystickSideMenu:
         craft_yaw_rate = float(rates.get("craft_yaw_rate", self.flight_cam.yaw_rate))
         craft_pitch_rate = float(rates.get("craft_pitch_rate", self.flight_cam.pitch_rate))
 
-        # Integrate the view offsets (right stick) independently from the craft.
-        self.view_yaw += float(view_yaw_rate) * float(dt) * float(look_x)
-        self.view_pitch += float(view_pitch_rate) * float(dt) * float(look_y)
-        # Keep yaw bounded to avoid precision loss after many orbits/turns.
-        self.view_yaw = _wrap_angle_pi(float(self.view_yaw))
-        self.view_pitch = float(max(-1.25, min(1.25, float(self.view_pitch))))
+        # Flight radius band (altitude clamps) and atmosphere thickness.
+        # Values are in unit-sphere sim units, scaled by render_scale at runtime.
+        try:
+            alt_min_u = float(motion.get("flight_alt_min", _FLIGHT_ALT_MIN))
+        except Exception:
+            alt_min_u = float(_FLIGHT_ALT_MIN)
+        try:
+            alt_max_u = float(motion.get("flight_alt_max", _FLIGHT_ALT_MAX))
+        except Exception:
+            alt_max_u = float(_FLIGHT_ALT_MAX)
+        try:
+            atmo_u = float(motion.get("atmosphere_alt_max", _ATMOSPHERE_ALT_MAX))
+        except Exception:
+            atmo_u = float(_ATMOSPHERE_ALT_MAX)
+
+        if not np.isfinite(alt_min_u):
+            alt_min_u = float(_FLIGHT_ALT_MIN)
+        if not np.isfinite(alt_max_u):
+            alt_max_u = float(_FLIGHT_ALT_MAX)
+        if not np.isfinite(atmo_u):
+            atmo_u = float(_ATMOSPHERE_ALT_MAX)
+
+        alt_min_u = float(max(0.0, alt_min_u))
+        alt_max_u = float(max(alt_min_u + 1e-5, alt_max_u))
+        atmo_u = float(max(0.0, atmo_u))
+
+        s = float(self.render_scale)
+        r_surface = float(self.flight_cam.planet_surface_r)
+        rmin = float(r_surface + alt_min_u * s)
+        rmax = float(r_surface + alt_max_u * s)
+        atmo_alt_max_val = (float(atmo_u * s) if atmo_u > 1e-9 else None)
+
+        # Apply immediately so config changes take effect without restarting.
+        try:
+            band_changed = (
+                abs(float(self.flight_cam.flight_r_min) - rmin) > 1e-6
+                or abs(float(self.flight_cam.flight_r_max) - rmax) > 1e-6
+            )
+            atmo_changed = (
+                (self.flight_cam.atmosphere_alt_max is None) != (atmo_alt_max_val is None)
+                or (
+                    self.flight_cam.atmosphere_alt_max is not None
+                    and atmo_alt_max_val is not None
+                    and abs(float(self.flight_cam.atmosphere_alt_max) - float(atmo_alt_max_val)) > 1e-6
+                )
+            )
+            if band_changed or atmo_changed:
+                self.flight_cam.flight_r_min = float(rmin)
+                self.flight_cam.flight_r_max = float(max(rmin, rmax))
+                self.flight_cam.atmosphere_alt_max = atmo_alt_max_val
+                clamp_radius_band(self.flight_cam.pos, r_min=float(self.flight_cam.flight_r_min), r_max=float(self.flight_cam.flight_r_max))
+        except Exception:
+            pass
+
+        # Integrate view offsets (look) unless in the view/targeting control-set.
+        if str(self._active_control_set) == "view_targeting":
+            self.view_yaw = 0.0
+            self.view_pitch = 0.0
+        else:
+            self.view_yaw += float(view_yaw_rate) * float(dt) * float(look_x)
+            self.view_pitch += float(view_pitch_rate) * float(dt) * float(look_y)
+            # Keep yaw bounded to avoid precision loss after many orbits/turns.
+            self.view_yaw = _wrap_angle_pi(float(self.view_yaw))
+            self.view_pitch = float(max(-1.25, min(1.25, float(self.view_pitch))))
 
         # Auto-recenter view when the user releases the look stick.
         # This is a simple exponential spring-to-zero (stable, no oscillation).
-        if abs(float(look_x)) <= 1e-9 and abs(float(look_y)) <= 1e-9:
+        if (str(self._active_control_set) != "view_targeting") and abs(float(look_x)) <= 1e-9 and abs(float(look_y)) <= 1e-9:
             recenter_rate = 6.0  # higher = snaps back faster
             k = float(math.exp(-float(recenter_rate) * float(dt)))
             self.view_yaw *= k
@@ -4026,6 +4401,23 @@ class _JoystickSideMenu:
                 self.view_yaw = 0.0
             if abs(float(self.view_pitch)) < 1e-4:
                 self.view_pitch = 0.0
+
+        # Reticle look offsets: always independent and spring back when released.
+        ret_yaw_rate = float(rates.get("view_yaw_rate", 1.25))
+        ret_pitch_rate = float(rates.get("view_pitch_rate", 1.10))
+        self.reticle_yaw += float(ret_yaw_rate) * float(dt) * float(ret_x)
+        self.reticle_pitch += float(ret_pitch_rate) * float(dt) * float(ret_y)
+        self.reticle_yaw = _wrap_angle_pi(float(self.reticle_yaw))
+        self.reticle_pitch = float(max(-1.25, min(1.25, float(self.reticle_pitch))))
+        if abs(float(ret_x)) <= 1e-9 and abs(float(ret_y)) <= 1e-9:
+            recenter_rate = 6.0
+            k = float(math.exp(-float(recenter_rate) * float(dt)))
+            self.reticle_yaw *= k
+            self.reticle_pitch *= k
+            if abs(float(self.reticle_yaw)) < 1e-4:
+                self.reticle_yaw = 0.0
+            if abs(float(self.reticle_pitch)) < 1e-4:
+                self.reticle_pitch = 0.0
 
         # Delegate the craft motion integration to the extracted camera module.
         # Craft heading/pitch comes from left stick; right stick is view-only.
@@ -4037,6 +4429,54 @@ class _JoystickSideMenu:
         self.flight_cam.yaw_rate = float(craft_yaw_rate)
         self.flight_cam.pitch_rate = float(craft_pitch_rate)
         self.flight_cam.inertial = bool(inertial)
+
+        # Control-system mode/gains from airplane spec.
+        try:
+            mode = cs.get("mode", motion.get("control_mode", self.flight_cam.control_mode))
+            if isinstance(mode, str):
+                self.flight_cam.control_mode = str(mode)
+            akp = cs.get("auto_kp", None)
+            akd = cs.get("auto_kd", None)
+            dbg = cs.get("debug_print", None)
+            if isinstance(akp, (int, float)):
+                self.flight_cam.auto_kp = float(akp)
+            if isinstance(akd, (int, float)):
+                self.flight_cam.auto_kd = float(akd)
+            if isinstance(dbg, (bool, int, float)):
+                self.flight_cam.debug_print = bool(dbg)
+        except Exception:
+            pass
+
+        # Rigid-body params for the C sim.
+        try:
+            mass = rb.get("mass", None)
+            inertia = rb.get("inertia_diag", None)
+            mass_v: float | None = float(mass) if isinstance(mass, (int, float)) else None
+            inertia_diag: tuple[float, float, float] | None = None
+            if isinstance(inertia, (list, tuple)) and len(inertia) == 3:
+                inertia_diag = (float(inertia[0]), float(inertia[1]), float(inertia[2]))
+
+            cur_mass = float(getattr(self.flight_cam, "mass", 1.0))
+            cur_inertia = tuple(getattr(self.flight_cam, "inertia_diag", (1.0, 1.0, 1.0)))
+            need = False
+            if mass_v is not None and abs(float(cur_mass) - float(mass_v)) > 1e-9:
+                need = True
+            if inertia_diag is not None and tuple(cur_inertia) != tuple(inertia_diag):
+                need = True
+            if need:
+                self.flight_cam.configure_rigid_body(mass=mass_v, inertia_diag=inertia_diag)
+        except Exception:
+            pass
+
+        # Arms: configure once (or after airplane reload/scale changes).
+        try:
+            arms = airplane.get("arms", None)
+            if isinstance(arms, list) and arms is not getattr(self, "_airplane_arms_ref", None):
+                # Arms are ship-local geometry; do NOT scale them with planet/world size.
+                self.flight_cam.configure_arms(arms=arms, scale=1.0)
+                self._airplane_arms_ref = arms
+        except Exception:
+            pass
         self.flight_cam.thrust_accel = float(thrust_accel)
         self.flight_cam.lift_k = float(lift_k)
         self.flight_cam.drag_k = float(drag_k)
@@ -4055,6 +4495,53 @@ class _JoystickSideMenu:
         except Exception:
             pass
 
+        # Flaps (discrete up/down bindings) -> persistent deflection in [-1, 1].
+        try:
+            flaps_up_binding = flaps_blk.get("up") if isinstance(flaps_blk, dict) else None
+            flaps_down_binding = flaps_blk.get("down") if isinstance(flaps_blk, dict) else None
+            a_up, _ = _binding_active(flaps_up_binding if isinstance(flaps_up_binding, dict) else None, axes_now, buttons_now, hats_now)
+            a_dn, _ = _binding_active(flaps_down_binding if isinstance(flaps_down_binding, dict) else None, axes_now, buttons_now, hats_now)
+
+            if bool(a_up) and (not bool(self._prev_flaps_up)):
+                self._flaps_deflection = float(max(-1.0, min(1.0, float(self._flaps_deflection) - 0.2)))
+            if bool(a_dn) and (not bool(self._prev_flaps_down)):
+                self._flaps_deflection = float(max(-1.0, min(1.0, float(self._flaps_deflection) + 0.2)))
+
+            self._prev_flaps_up = bool(a_up)
+            self._prev_flaps_down = bool(a_dn)
+        except Exception:
+            pass
+
+        try:
+            self.flight_cam.flaps = float(self._flaps_deflection)
+        except Exception:
+            pass
+
+        # Controller graph: evaluate features->signals->channels and override sim channels.
+        # Stored in joystick.json under flight_controls.controller.{features,signals,channels}.
+        try:
+            cfg_ctrl = None
+            try:
+                cfg_ctrl = cfg  # may or may not exist depending on earlier try/except
+            except Exception:
+                cfg_ctrl = None
+            if cfg_ctrl is None:
+                cfg_ctrl = joystick_menu.load_or_create_joystick_config("joystick.json")
+
+            ctx = input_graph.GraphEvalContext(
+                axes={int(k): float(v) for k, v in (axes_now or {}).items()},
+                buttons=set(int(b) for b in (buttons_now or set())),
+                hats={int(h): (int(v[0]), int(v[1])) for h, v in (hats_now or {}).items()},
+            )
+            overrides = input_graph.eval_controller_channel_overrides(cfg=cfg_ctrl, ctx=ctx, clamp=True)
+            if overrides:
+                try:
+                    self.flight_cam.controller_channels_override = overrides
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         eye, _ship_center = self.flight_cam.step(
             dt=float(dt),
             # No strafing in this mapping.
@@ -4062,7 +4549,7 @@ class _JoystickSideMenu:
             move_y=float(thr),
             look_x=float(rudder),
             look_y=float(elevator),
-            roll_in=0.0,
+            roll_in=float(aileron),
             climb=0.0,
         )
 
@@ -4790,10 +5277,61 @@ def _run_c_physics_only(
         "airplane_path": str(airplane_path or "airplane.json"),
         "scene_path": str(scene_path or "scene.json"),
     }
+
+    # --- Physics config split: World (planet/env) vs Particle (node sim) ---
+    # Migrate legacy world_config.json:{world_config:{...}} into:
+    # - particle_config.json:{particle_config:{...}}
+    # - world_config.json:{world_env:{...}}
+    try:
+        legacy_wc = joystick_menu._load_persisted_block("world_config.json", "world_config")
+        if legacy_wc:
+            p_blk, w_blk = world_config_structs.split_legacy_world_config_block(legacy_wc)
+            try:
+                if p_blk and not joystick_menu._load_persisted_block("particle_config.json", "particle_config"):
+                    joystick_menu._save_persisted_block("particle_config.json", "particle_config", p_blk)
+            except Exception:
+                pass
+            try:
+                if w_blk and not joystick_menu._load_persisted_block("world_config.json", "world_env"):
+                    joystick_menu._save_persisted_block("world_config.json", "world_env", w_blk)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Apply persisted particle/world values to params_menu before menu init.
+    particle_cfg = world_config_structs.particle_config_from_params(params_menu)
+    world_env = world_config_structs.world_env_from_params(params_menu)
+    try:
+        p_persist = joystick_menu._load_persisted_block("particle_config.json", "particle_config")
+        if p_persist:
+            world_config_structs.particle_config_update_from_dict(particle_cfg, p_persist)
+    except Exception:
+        pass
+    try:
+        w_persist = joystick_menu._load_persisted_block("world_config.json", "world_env")
+        if w_persist:
+            world_config_structs.world_env_update_from_dict(world_env, w_persist)
+        else:
+            # Back-compat: pull render_scale from legacy block if world_env absent.
+            legacy_wc = joystick_menu._load_persisted_block("world_config.json", "world_config")
+            if isinstance(legacy_wc, dict) and "render_scale" in legacy_wc:
+                world_env.render_scale = float(legacy_wc.get("render_scale"))
+    except Exception:
+        pass
+    try:
+        world_config_structs.apply_particle_config_to_params(particle_cfg, params_menu)
+    except Exception:
+        pass
+    try:
+        world_config_structs.apply_world_env_to_params(world_env, params_menu)
+    except Exception:
+        pass
+
     menu = _JoystickSideMenu.create(params=params_menu)
     joystick = menu.joystick if menu else None
 
-    wc_field_specs = {
+    particle_field_specs = {
         "k_spring": {"step": 0.05},
         "k_coulomb": {"step": 0.05},
         "G": {"step": 0.05},
@@ -4801,17 +5339,123 @@ def _run_c_physics_only(
         "temp": {"step": 0.05, "min": 0.0},
         "bond_shear": {"step": 0.05, "min": 0.0},
         "max_speed": {"step": 0.002, "min": 0.0},
-        "render_scale": {"step": 0.25, "min": 0.01},
+        "south_strength": {"step": 0.05, "min": 0.0},
+        "south_enabled": {"step": 1, "min": 0, "max": 1},
+        "south_axis": {"step": 1, "min": 0},
     }
 
-    wc = world_config_structs.world_config_from_params(params_menu)
+    world_field_specs = {
+        # Keep key name for compatibility, but present it as planet/world scale in UI.
+        "render_scale": {"label": "planet_scale", "step": 0.25, "min": 0.01},
+        "sea_level_pressure_kpa": {"step": 1.0, "min": 0.0},
+        "sea_level_temp_k": {"step": 1.0, "min": 0.0},
+    }
 
-    def _commit_world_config(cfg_obj: ctypes.Structure) -> None:
+    # Flight physics is applied as an overlay to airplane.json "motion".
+    flight_motion = {}
+    try:
+        if menu is not None and isinstance(getattr(menu, "airplane", None), dict):
+            flight_motion = menu.airplane.get("motion", {}) if isinstance(menu.airplane.get("motion", {}), dict) else {}
+    except Exception:
+        flight_motion = {}
+    flight_cfg = world_config_structs.flight_physics_from_motion(flight_motion)
+    flight_field_specs = {
+        "inertial": {"step": 1, "min": 0, "max": 1},
+        "auto_heading_on_move": {"step": 1, "min": 0, "max": 1},
+        "base_speed": {"step": 0.01, "min": 0.0},
+        "thrust_accel": {"step": 0.05, "min": 0.0},
+        "throttle_rate": {"step": 0.05, "min": 0.0},
+        "lift_k": {"step": 0.05, "min": 0.0},
+        "drag_k": {"step": 0.01, "min": 0.0},
+        "gravity_g": {"step": 0.01},
+        "max_speed": {"step": 0.1, "min": 0.0},
+        # Altitude clamps and atmosphere thickness in unit-sphere units.
+        "flight_alt_min": {"step": 0.01, "min": 0.0},
+        "flight_alt_max": {"step": 0.05, "min": 0.0},
+        "atmosphere_alt_max": {"step": 0.01, "min": 0.0},
+    }
+    try:
+        fp_persist = joystick_menu._load_persisted_block("flight_physics.json", "flight_physics")
+        if fp_persist:
+            world_config_structs.flight_physics_update_from_dict(flight_cfg, fp_persist)
+    except Exception:
+        pass
+
+    ball_cfg = world_config_structs.ballistics_default()
+    ball_field_specs = {
+        "max_points": {"step": 1, "min": 2, "max": 256},
+    }
+    try:
+        b_persist = joystick_menu._load_persisted_block("ballistics.json", "ballistics")
+        if b_persist:
+            world_config_structs.ballistics_update_from_dict(ball_cfg, b_persist)
+    except Exception:
+        pass
+
+    # Airplane tuning (persisted in airplane.json under a separate key).
+    airplane_tuning = airplane_structs.airplane_tuning_default()
+    try:
+        airplane_tuning = airplane_structs.load_airplane_tuning_json(params_menu.get("airplane_path", "airplane.json"))
+        airplane_structs.save_airplane_tuning_json(airplane_tuning, params_menu.get("airplane_path", "airplane.json"))
+    except Exception:
+        airplane_tuning = airplane_structs.airplane_tuning_default()
+    airplane_field_specs = airplane_structs.airplane_tuning_field_specs()
+
+    # Airplane tuning (persisted in airplane.json under a separate key).
+    airplane_tuning = airplane_structs.airplane_tuning_default()
+    try:
+        airplane_tuning = airplane_structs.load_airplane_tuning_json(params_menu.get("airplane_path", "airplane.json"))
+        airplane_structs.save_airplane_tuning_json(airplane_tuning, params_menu.get("airplane_path", "airplane.json"))
+    except Exception:
+        airplane_tuning = airplane_structs.airplane_tuning_default()
+    airplane_field_specs = airplane_structs.airplane_tuning_field_specs()
+
+    def _commit_particle_config(cfg_obj: ctypes.Structure) -> None:
         nonlocal params_seq
         try:
             with params_lock:
-                world_config_structs.apply_world_config_to_params(cfg_obj, params_menu)
+                world_config_structs.apply_particle_config_to_params(cfg_obj, params_menu)
                 params_seq += 1
+        except Exception:
+            pass
+
+    def _commit_world_env(cfg_obj: ctypes.Structure) -> None:
+        nonlocal params_seq
+        try:
+            with params_lock:
+                world_config_structs.apply_world_env_to_params(cfg_obj, params_menu)
+                params_seq += 1
+        except Exception:
+            pass
+        try:
+            if menu is not None and hasattr(menu, "apply_render_scale"):
+                menu.apply_render_scale(float(params_menu.get("render_scale", 10.0)))
+        except Exception:
+            pass
+
+    def _commit_flight_physics(cfg_obj: ctypes.Structure) -> None:
+        # Apply to airplane spec's motion dict (consumed every frame).
+        try:
+            if menu is None or not isinstance(getattr(menu, "airplane", None), dict):
+                return
+            motion = menu.airplane.get("motion", None)
+            if not isinstance(motion, dict):
+                motion = {}
+                menu.airplane["motion"] = motion
+            # Copy across by field name.
+            for fname, _ft in getattr(cfg_obj.__class__, "_fields_", []):
+                key = str(fname)
+                try:
+                    motion[key] = float(getattr(cfg_obj, key)) if _ft in (ctypes.c_float, ctypes.c_double) else int(getattr(cfg_obj, key))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _commit_ballistics(cfg_obj: ctypes.Structure) -> None:
+        try:
+            if weap_rt is not None and getattr(weap_rt, "sim", None) is not None:
+                weap_rt.sim.max_points = int(getattr(cfg_obj, "max_points", 16) or 16)
         except Exception:
             pass
 
@@ -4855,6 +5499,78 @@ def _run_c_physics_only(
     except Exception:
         weap_rt = None
 
+    def _commit_airplane_tuning(cfg_obj: ctypes.Structure) -> None:
+        # Persist and apply to the running subsystems.
+        try:
+            airplane_structs.save_airplane_tuning_json(
+                cfg_obj, params_menu.get("airplane_path", "airplane.json"), key="airplane_tuning"
+            )
+        except Exception:
+            pass
+
+        try:
+            if menu is not None and hasattr(menu, "flight_cam"):
+                mode = "auto" if int(getattr(cfg_obj, "control_mode", 1) or 0) != 0 else "manual"
+                auto_kp = float(getattr(cfg_obj, "auto_kp", 0.0) or 0.0)
+                auto_kd = float(getattr(cfg_obj, "auto_kd", 0.0) or 0.0)
+                dbg = bool(int(getattr(cfg_obj, "flight_debug_print", 0) or 0) != 0)
+                menu.flight_cam.configure_control_system(mode=mode, auto_kp=auto_kp, auto_kd=auto_kd, debug_print=dbg)
+
+                # If enabled, append generated arms/centers from tuning.
+                try:
+                    base_air = menu.airplane if isinstance(getattr(menu, "airplane", None), dict) else {}
+                    base_arms = base_air.get("arms", None)
+                    arms_out = list(base_arms) if isinstance(base_arms, list) else []
+                    arms_out.extend(airplane_structs.build_extra_arms_from_tuning(cfg_obj))
+                    # Arms are ship-local geometry; do NOT scale them with planet/world size.
+                    menu.flight_cam.configure_arms(arms=arms_out, scale=1.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if weap_rt is not None:
+                weap_rt.debug_print = bool(int(getattr(cfg_obj, "weapon_debug_print", 0) or 0) != 0)
+        except Exception:
+            pass
+
+    def _commit_airplane_tuning(cfg_obj: ctypes.Structure) -> None:
+        # Persist and apply to the running subsystems.
+        try:
+            airplane_structs.save_airplane_tuning_json(
+                cfg_obj, params_menu.get("airplane_path", "airplane.json"), key="airplane_tuning"
+            )
+        except Exception:
+            pass
+
+        try:
+            if menu is not None and hasattr(menu, "flight_cam"):
+                mode = "auto" if int(getattr(cfg_obj, "control_mode", 1) or 0) != 0 else "manual"
+                auto_kp = float(getattr(cfg_obj, "auto_kp", 0.0) or 0.0)
+                auto_kd = float(getattr(cfg_obj, "auto_kd", 0.0) or 0.0)
+                dbg = bool(int(getattr(cfg_obj, "flight_debug_print", 0) or 0) != 0)
+                menu.flight_cam.configure_control_system(mode=mode, auto_kp=auto_kp, auto_kd=auto_kd, debug_print=dbg)
+
+                # If enabled, append generated arms/centers from tuning.
+                try:
+                    base_air = menu.airplane if isinstance(getattr(menu, "airplane", None), dict) else {}
+                    base_arms = base_air.get("arms", None)
+                    arms_out = list(base_arms) if isinstance(base_arms, list) else []
+                    arms_out.extend(airplane_structs.build_extra_arms_from_tuning(cfg_obj))
+                    # Arms are ship-local geometry; do NOT scale them with planet/world size.
+                    menu.flight_cam.configure_arms(arms=arms_out, scale=1.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            if weap_rt is not None:
+                weap_rt.debug_print = bool(int(getattr(cfg_obj, "weapon_debug_print", 0) or 0) != 0)
+        except Exception:
+            pass
+
     # Ensure joystick.json exists and bind a menu button if missing.
     menu_button_c: int | None = None
     try:
@@ -4874,18 +5590,59 @@ def _run_c_physics_only(
                 menu_button=int(menu_button_c),
                 menu_context={
                     "ctypes_structs": {
+                                "airplane_tuning": {
+                                    "struct": airplane_tuning,
+                                    "title": "AIRPLANE",
+                                    "persist_path": params_menu.get("airplane_path", "airplane.json"),
+                                    "persist_key": "airplane_tuning",
+                                    "field_specs": airplane_field_specs,
+                                    "on_commit": _commit_airplane_tuning,
+                                    "persist_on_change": True,
+                                },
                         "weapon_loadout": {
                             "struct": loadout,
                             "title": "LOADOUT",
                             "persist_path": "weapon_loadout.json",
                             "persist_key": "weapon_loadout",
                             "field_specs": loadout_field_specs,
+                                    "persist_on_change": True,
                         },
-                        "world_config": {
-                            "struct": wc,
-                            "on_commit": _commit_world_config,
-                            "field_specs": wc_field_specs,
-                        }
+                        "particle_config": {
+                            "struct": particle_cfg,
+                            "title": "PARTICLE",
+                            "persist_path": "particle_config.json",
+                            "persist_key": "particle_config",
+                            "on_commit": _commit_particle_config,
+                            "field_specs": particle_field_specs,
+                            "persist_on_change": True,
+                        },
+                        "world_env": {
+                            "struct": world_env,
+                            "title": "WORLD",
+                            "persist_path": "world_config.json",
+                            "persist_key": "world_env",
+                            "on_commit": _commit_world_env,
+                            "field_specs": world_field_specs,
+                            "persist_on_change": True,
+                        },
+                        "flight_physics": {
+                            "struct": flight_cfg,
+                            "title": "FLIGHT",
+                            "persist_path": "flight_physics.json",
+                            "persist_key": "flight_physics",
+                            "on_commit": _commit_flight_physics,
+                            "field_specs": flight_field_specs,
+                            "persist_on_change": True,
+                        },
+                        "ballistics": {
+                            "struct": ball_cfg,
+                            "title": "BALLISTICS",
+                            "persist_path": "ballistics.json",
+                            "persist_key": "ballistics",
+                            "on_commit": _commit_ballistics,
+                            "field_specs": ball_field_specs,
+                            "persist_on_change": True,
+                        },
                     }
                 },
             )
@@ -5207,18 +5964,59 @@ def _run_c_physics_only(
                             menu_button=int(menu_button_c),
                             menu_context={
                                 "ctypes_structs": {
+                                    "airplane_tuning": {
+                                        "struct": airplane_tuning,
+                                        "title": "AIRPLANE",
+                                        "persist_path": params_menu.get("airplane_path", "airplane.json"),
+                                        "persist_key": "airplane_tuning",
+                                        "field_specs": airplane_field_specs,
+                                        "on_commit": _commit_airplane_tuning,
+                                        "persist_on_change": True,
+                                    },
                                     "weapon_loadout": {
                                         "struct": loadout,
                                         "title": "LOADOUT",
                                         "persist_path": "weapon_loadout.json",
                                         "persist_key": "weapon_loadout",
                                         "field_specs": loadout_field_specs,
+                                        "persist_on_change": True,
                                     },
-                                    "world_config": {
-                                        "struct": wc,
-                                        "on_commit": _commit_world_config,
-                                        "field_specs": wc_field_specs,
-                                    }
+                                    "particle_config": {
+                                        "struct": particle_cfg,
+                                        "title": "PARTICLE",
+                                        "persist_path": "particle_config.json",
+                                        "persist_key": "particle_config",
+                                        "on_commit": _commit_particle_config,
+                                        "field_specs": particle_field_specs,
+                                        "persist_on_change": True,
+                                    },
+                                    "world_env": {
+                                        "struct": world_env,
+                                        "title": "WORLD",
+                                        "persist_path": "world_config.json",
+                                        "persist_key": "world_env",
+                                        "on_commit": _commit_world_env,
+                                        "field_specs": world_field_specs,
+                                        "persist_on_change": True,
+                                    },
+                                    "flight_physics": {
+                                        "struct": flight_cfg,
+                                        "title": "FLIGHT",
+                                        "persist_path": "flight_physics.json",
+                                        "persist_key": "flight_physics",
+                                        "on_commit": _commit_flight_physics,
+                                        "field_specs": flight_field_specs,
+                                        "persist_on_change": True,
+                                    },
+                                    "ballistics": {
+                                        "struct": ball_cfg,
+                                        "title": "BALLISTICS",
+                                        "persist_path": "ballistics.json",
+                                        "persist_key": "ballistics",
+                                        "on_commit": _commit_ballistics,
+                                        "field_specs": ball_field_specs,
+                                        "persist_on_change": True,
+                                    },
                                 }
                             },
                         )
@@ -5283,8 +6081,23 @@ def _run_c_physics_only(
             if joystick is not None and weap_rt is not None:
                 try:
                     cfg = joystick_menu.load_or_create_joystick_config("joystick.json")
-                    b1 = _get_weapon_binding(cfg, "fire_1")
-                    b2 = _get_weapon_binding(cfg, "fire_2")
+                    if menu is not None:
+                        try:
+                            targeting_mode = int(getattr(loadout, "targeting", 0) or 0)
+                        except Exception:
+                            targeting_mode = 0
+                        try:
+                            menu._targeting_active = bool(int(targeting_mode) != 0)
+                        except Exception:
+                            pass
+                        try:
+                            menu._active_control_set = _resolve_effective_control_set(menu)
+                        except Exception:
+                            pass
+
+                    set_name = _resolve_effective_control_set(menu)
+                    b1 = _get_set_binding(cfg, set_name=set_name, group="weapons", key="fire_1")
+                    b2 = _get_set_binding(cfg, set_name=set_name, group="weapons", key="fire_2")
                     axes_now, buttons_now, hats_now = joystick_menu._poll_joystick_snapshot(joystick)
                     f1_active, f1_analog = _binding_active(b1, axes_now, buttons_now, hats_now)
                     f2_active, f2_analog = _binding_active(b2, axes_now, buttons_now, hats_now)
@@ -5863,6 +6676,11 @@ def _run_c_physics_only(
                     except Exception:
                         targeting_mode = 0
                     auto_targeting = bool(targeting_mode != 0)
+                    if menu is not None:
+                        try:
+                            menu._targeting_active = bool(targeting_mode != 0)
+                        except Exception:
+                            pass
 
                     # Decide which weapon family this reticle's LOS status represents.
                     # Keep it lightweight: use Weapon Slot 1 as "primary".
@@ -5966,8 +6784,40 @@ def _run_c_physics_only(
                             eps_ang = float(_RETICLE_AUTO_CENTER_EPS_DEG) * (math.pi / 180.0)
                             centered_on_track = bool(ang <= eps_ang)
                     else:
-                        # Manual targeting keeps the reticle centered on the camera.
+                        # Manual targeting: reticle direction can be offset from the camera via bindable reticle-look.
                         ret_dir = np.asarray(view_dir_cam, dtype=np.float32)
+                        try:
+                            if menu is not None:
+                                ry = float(getattr(menu, "reticle_yaw", 0.0))
+                                rp = float(getattr(menu, "reticle_pitch", 0.0))
+                            else:
+                                ry, rp = 0.0, 0.0
+                            if abs(float(ry)) > 1e-9 or abs(float(rp)) > 1e-9:
+                                up_rad = np.asarray(menu.flight_cam.planet_up(), dtype=np.float32) if menu is not None else np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+                                right_axis = np.cross(up_rad, ret_dir).astype(np.float32, copy=False)
+                                rn = float(np.linalg.norm(right_axis))
+                                if rn > 1e-6:
+                                    right_axis = right_axis / rn
+
+                                # Local Rodrigues rotation.
+                                def _rot(v: np.ndarray, axis: np.ndarray, ang: float) -> np.ndarray:
+                                    a = axis.astype(np.float32, copy=False)
+                                    an = float(np.linalg.norm(a))
+                                    if not (an > 1e-6):
+                                        return v
+                                    a = a / an
+                                    c = float(math.cos(float(ang)))
+                                    s = float(math.sin(float(ang)))
+                                    return (v * c + np.cross(a, v) * s + a * float(np.dot(a, v)) * (1.0 - c)).astype(np.float32, copy=False)
+
+                                # Positive yaw rotates about radial up; pitch about camera-right.
+                                ret_dir = _rot(ret_dir, up_rad, float(ry))
+                                ret_dir = _rot(ret_dir, right_axis, float(rp))
+                                dn = float(np.linalg.norm(ret_dir))
+                                if dn > 1e-6:
+                                    ret_dir = (ret_dir / dn).astype(np.float32, copy=False)
+                        except Exception:
+                            ret_dir = np.asarray(view_dir_cam, dtype=np.float32)
 
                     # LOS poll gate: only run the C depth finder periodically in auto mode.
                     prev_tracked = int(getattr(st_prev, "tracked_victim_id", 0) or 0)
@@ -5976,12 +6826,65 @@ def _run_c_physics_only(
                     if (int(tracked_id) != int(prev_tracked)) or (str(primary_weapon_type) != str(prev_primary)):
                         prev_last = 0.0
 
+                    # Precompute focus so we can gate the expensive depth finder.
+                    focus_pre = targeting_system.ReticleFocus(on_target=False, victim_id=0)
+                    try:
+                        if nodes_w is not None and radii_world is not None:
+                            focus_pre = targeting_system.raycast_nodes(
+                                ray_origin=eye_v,
+                                ray_dir=ret_dir,
+                                nodes_pos=np.asarray(nodes_w, dtype=np.float32),
+                                nodes_radius=np.asarray(radii_world, dtype=np.float32),
+                                t_max=float(z_far),
+                            )
+                    except Exception:
+                        focus_pre = targeting_system.ReticleFocus(on_target=False, victim_id=0)
+
+                    # Airplane-driven LOS probe gating.
+                    # 0=off, 1=on, 2=lock_yellow (or higher), 3=lock_red (ready only).
+                    try:
+                        los_probe_mode = int(getattr(airplane_tuning, "los_probe_mode", 1) or 0)
+                    except Exception:
+                        los_probe_mode = 1
+
+                    allow_probe = True
+                    if los_probe_mode == 0:
+                        allow_probe = False
+                    elif los_probe_mode == 1:
+                        allow_probe = True
+                    elif los_probe_mode == 2:
+                        # Yellow lock or higher.
+                        if auto_targeting:
+                            allow_probe = bool(centered_on_track)
+                        else:
+                            # Use the manual reticle animator once per frame.
+                            try:
+                                _stage_now = target_sys.reticle_stage(on_target=bool(focus_pre.on_target), now_s=float(now_s))
+                            except Exception:
+                                _stage_now = reticle_sprite.ReticleStage.IDLE
+                            allow_probe = bool(_stage_now in (reticle_sprite.ReticleStage.LOCKED, reticle_sprite.ReticleStage.READY))
+                    else:
+                        # Red lock only (auto: requires confirmed LOS; manual: READY stage).
+                        if auto_targeting:
+                            allow_probe = bool(getattr(st_prev, "los_confirmed", False))
+                        else:
+                            try:
+                                _stage_now = target_sys.reticle_stage(on_target=bool(focus_pre.on_target), now_s=float(now_s))
+                            except Exception:
+                                _stage_now = reticle_sprite.ReticleStage.IDLE
+                            allow_probe = bool(_stage_now == reticle_sprite.ReticleStage.READY)
+
                     do_los_poll = bool(
                         auto_targeting
+                        and allow_probe
                         and centered_on_track
                         and tracked_pos is not None
                         and ((now_s - prev_last) >= float(_RETICLE_LOS_POLL_S))
                     )
+
+                    depth_finder_cb = None
+                    if allow_probe and (not auto_targeting or do_los_poll):
+                        depth_finder_cb = _df
 
                     st = target_sys.solve_reticle(
                         ray_origin=eye_v,
@@ -5989,7 +6892,8 @@ def _run_c_physics_only(
                         t_max=float(z_far),
                         nodes_pos=nodes_w,
                         nodes_radius=radii_world,
-                        depth_finder=(_df if (not auto_targeting or do_los_poll) else None),
+                        depth_finder=depth_finder_cb,
+                        focus_override=focus_pre,
                     )
 
                     # Preserve the last computed intercept between LOS polls.
@@ -6080,6 +6984,21 @@ def _run_c_physics_only(
                     st.los_last_check_s = float(los_last)
                     st.los_confirmed_target_id = int(latched_tid) if bool(los_ok) else 0
                     st.los_confirmed_weapon_type = str(latched_wt) if bool(los_ok) else ""
+
+                    # Cache a stage for this frame so HUD rendering can reuse it without
+                    # advancing the animator twice.
+                    try:
+                        if auto_targeting:
+                            if bool(los_ok):
+                                st.stage = reticle_sprite.ReticleStage.READY
+                            elif bool(centered_on_track):
+                                st.stage = reticle_sprite.ReticleStage.LOCKED
+                            else:
+                                st.stage = reticle_sprite.ReticleStage.IDLE
+                        else:
+                            st.stage = _stage_now if "_stage_now" in locals() else None
+                    except Exception:
+                        pass
 
                     target_sys.set_reticle(reticle_id=reticle_id, state=st)
                     target_focus = st.focus
@@ -6397,8 +7316,9 @@ def _run_c_physics_only(
                         try:
                             if joystick is not None:
                                 cfg_zoom = joystick_menu.load_or_create_joystick_config("joystick.json")
-                                z_in = _get_camera_binding(cfg_zoom, "zoom_in")
-                                z_out = _get_camera_binding(cfg_zoom, "zoom_out")
+                                set_name = _resolve_effective_control_set(menu)
+                                z_in = _get_set_binding(cfg_zoom, set_name=set_name, group="camera", key="zoom_in")
+                                z_out = _get_set_binding(cfg_zoom, set_name=set_name, group="camera", key="zoom_out")
                                 axes_z, buttons_z, hats_z = joystick_menu._poll_joystick_snapshot(joystick)
                                 _a_in, v_in = _binding_active(z_in, axes_z, buttons_z, hats_z)
                                 _a_out, v_out = _binding_active(z_out, axes_z, buttons_z, hats_z)
@@ -6748,7 +7668,14 @@ def _run_c_physics_only(
                             else:
                                 stage = reticle_sprite.ReticleStage.IDLE
                         else:
-                            stage = target_sys.reticle_stage(on_target=bool(target_focus.on_target), now_s=float(now_s))
+                            # Manual targeting: the reticle animator may have already been advanced
+                            # earlier in the frame for LOS probe gating; reuse that stage if present.
+                            try:
+                                stage = getattr(st, "stage", None)
+                            except Exception:
+                                stage = None
+                            if stage is None:
+                                stage = target_sys.reticle_stage(on_target=bool(target_focus.on_target), now_s=float(now_s))
 
                         center_px = None
                         if auto_targeting and bool(is_ship):
@@ -6849,6 +7776,11 @@ def _run_c_physics_only(
             pygame.display.flip()
             clock.tick(60)
     finally:
+        try:
+            if menu is not None and hasattr(menu, "flight_cam"):
+                menu.flight_cam.shutdown()
+        except Exception:
+            pass
         stop_evt.set()
         phys_thread.join(timeout=1.0)
         pygame.quit()
@@ -9556,11 +10488,67 @@ def run(
         pass
 
     font = pygame.font.SysFont("consolas", 16)
+
+    # --- Physics config split: World (planet/env) vs Particle (node sim) ---
+    # Migrate legacy world_config.json:{world_config:{...}} into:
+    # - particle_config.json:{particle_config:{...}}
+    # - world_config.json:{world_env:{...}}
+    try:
+        legacy_wc = joystick_menu._load_persisted_block("world_config.json", "world_config")
+        if legacy_wc:
+            p_blk, w_blk = world_config_structs.split_legacy_world_config_block(legacy_wc)
+            try:
+                if p_blk and not joystick_menu._load_persisted_block("particle_config.json", "particle_config"):
+                    joystick_menu._save_persisted_block("particle_config.json", "particle_config", p_blk)
+            except Exception:
+                pass
+            try:
+                if w_blk and not joystick_menu._load_persisted_block("world_config.json", "world_env"):
+                    joystick_menu._save_persisted_block("world_config.json", "world_env", w_blk)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Apply persisted particle/world values to params before menu init.
+    particle_cfg = world_config_structs.particle_config_from_params(params)
+    world_env = world_config_structs.world_env_from_params(params)
+    try:
+        p_persist = joystick_menu._load_persisted_block("particle_config.json", "particle_config")
+        if p_persist:
+            world_config_structs.particle_config_update_from_dict(particle_cfg, p_persist)
+    except Exception:
+        pass
+    try:
+        w_persist = joystick_menu._load_persisted_block("world_config.json", "world_env")
+        if w_persist:
+            world_config_structs.world_env_update_from_dict(world_env, w_persist)
+        else:
+            legacy_wc = joystick_menu._load_persisted_block("world_config.json", "world_config")
+            if isinstance(legacy_wc, dict) and "render_scale" in legacy_wc:
+                world_env.render_scale = float(legacy_wc.get("render_scale"))
+    except Exception:
+        pass
+    try:
+        world_config_structs.apply_particle_config_to_params(particle_cfg, params)
+    except Exception:
+        pass
+    try:
+        world_config_structs.apply_world_env_to_params(world_env, params)
+    except Exception:
+        pass
+
     menu = _JoystickSideMenu.create(params=params)
     joystick = menu.joystick if menu else None
     axis_state: Dict[int, float] = menu.axis_state if menu else {}
 
-    wc_field_specs = {
+    try:
+        if menu is not None and hasattr(menu, "apply_render_scale"):
+            menu.apply_render_scale(float(params.get("render_scale", 10.0)))
+    except Exception:
+        pass
+
+    particle_field_specs = {
         "k_spring": {"step": 0.05},
         "k_coulomb": {"step": 0.05},
         "G": {"step": 0.05},
@@ -9568,14 +10556,91 @@ def run(
         "temp": {"step": 0.05, "min": 0.0},
         "bond_shear": {"step": 0.05, "min": 0.0},
         "max_speed": {"step": 0.002, "min": 0.0},
-        "render_scale": {"step": 0.25, "min": 0.01},
+        "south_strength": {"step": 0.05, "min": 0.0},
+        "south_enabled": {"step": 1, "min": 0, "max": 1},
+        "south_axis": {"step": 1, "min": 0},
     }
 
-    wc = world_config_structs.world_config_from_params(params)
+    world_field_specs = {
+        "render_scale": {"step": 0.25, "min": 0.01},
+        "sea_level_pressure_kpa": {"step": 1.0, "min": 0.0},
+        "sea_level_temp_k": {"step": 1.0, "min": 0.0},
+    }
 
-    def _commit_world_config(cfg_obj: ctypes.Structure) -> None:
+    flight_motion = {}
+    try:
+        if menu is not None and isinstance(getattr(menu, "airplane", None), dict):
+            flight_motion = menu.airplane.get("motion", {}) if isinstance(menu.airplane.get("motion", {}), dict) else {}
+    except Exception:
+        flight_motion = {}
+    flight_cfg = world_config_structs.flight_physics_from_motion(flight_motion)
+    flight_field_specs = {
+        "inertial": {"step": 1, "min": 0, "max": 1},
+        "auto_heading_on_move": {"step": 1, "min": 0, "max": 1},
+        "base_speed": {"step": 0.01, "min": 0.0},
+        "thrust_accel": {"step": 0.05, "min": 0.0},
+        "throttle_rate": {"step": 0.05, "min": 0.0},
+        "lift_k": {"step": 0.05, "min": 0.0},
+        "drag_k": {"step": 0.01, "min": 0.0},
+        "gravity_g": {"step": 0.01},
+        "max_speed": {"step": 0.1, "min": 0.0},
+    }
+    try:
+        fp_persist = joystick_menu._load_persisted_block("flight_physics.json", "flight_physics")
+        if fp_persist:
+            world_config_structs.flight_physics_update_from_dict(flight_cfg, fp_persist)
+    except Exception:
+        pass
+
+    ball_cfg = world_config_structs.ballistics_default()
+    ball_field_specs = {
+        "max_points": {"step": 1, "min": 2, "max": 256},
+    }
+    try:
+        b_persist = joystick_menu._load_persisted_block("ballistics.json", "ballistics")
+        if b_persist:
+            world_config_structs.ballistics_update_from_dict(ball_cfg, b_persist)
+    except Exception:
+        pass
+
+    def _commit_particle_config(cfg_obj: ctypes.Structure) -> None:
         try:
-            world_config_structs.apply_world_config_to_params(cfg_obj, params)
+            world_config_structs.apply_particle_config_to_params(cfg_obj, params)
+        except Exception:
+            pass
+
+    def _commit_world_env(cfg_obj: ctypes.Structure) -> None:
+        try:
+            world_config_structs.apply_world_env_to_params(cfg_obj, params)
+        except Exception:
+            pass
+        try:
+            if menu is not None and hasattr(menu, "apply_render_scale"):
+                menu.apply_render_scale(float(params.get("render_scale", 10.0)))
+        except Exception:
+            pass
+
+    def _commit_flight_physics(cfg_obj: ctypes.Structure) -> None:
+        try:
+            if menu is None or not isinstance(getattr(menu, "airplane", None), dict):
+                return
+            motion = menu.airplane.get("motion", None)
+            if not isinstance(motion, dict):
+                motion = {}
+                menu.airplane["motion"] = motion
+            for fname, _ft in getattr(cfg_obj.__class__, "_fields_", []):
+                key = str(fname)
+                try:
+                    motion[key] = float(getattr(cfg_obj, key)) if _ft in (ctypes.c_float, ctypes.c_double) else int(getattr(cfg_obj, key))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _commit_ballistics(cfg_obj: ctypes.Structure) -> None:
+        try:
+            if weap_rt is not None and getattr(weap_rt, "sim", None) is not None:
+                weap_rt.sim.max_points = int(getattr(cfg_obj, "max_points", 16) or 16)
         except Exception:
             pass
 
@@ -9647,11 +10712,42 @@ def run(
                             "persist_key": "weapon_loadout",
                             "field_specs": loadout_field_specs,
                         },
-                        "world_config": {
-                            "struct": wc,
-                            "on_commit": _commit_world_config,
-                            "field_specs": wc_field_specs,
-                        }
+                        "particle_config": {
+                            "struct": particle_cfg,
+                            "title": "PARTICLE",
+                            "persist_path": "particle_config.json",
+                            "persist_key": "particle_config",
+                            "field_specs": particle_field_specs,
+                            "on_commit": _commit_particle_config,
+                            "persist_on_change": True,
+                        },
+                        "world_env": {
+                            "struct": world_env,
+                            "title": "WORLD",
+                            "persist_path": "world_config.json",
+                            "persist_key": "world_env",
+                            "field_specs": world_field_specs,
+                            "on_commit": _commit_world_env,
+                            "persist_on_change": True,
+                        },
+                        "flight_physics": {
+                            "struct": flight_cfg,
+                            "title": "FLIGHT",
+                            "persist_path": "flight_physics.json",
+                            "persist_key": "flight_physics",
+                            "field_specs": flight_field_specs,
+                            "on_commit": _commit_flight_physics,
+                            "persist_on_change": True,
+                        },
+                        "ballistics": {
+                            "struct": ball_cfg,
+                            "title": "BALLISTICS",
+                            "persist_path": "ballistics.json",
+                            "persist_key": "ballistics",
+                            "field_specs": ball_field_specs,
+                            "on_commit": _commit_ballistics,
+                            "persist_on_change": True,
+                        },
                     }
                 },
             )
@@ -9754,11 +10850,42 @@ def run(
                                                 "persist_key": "weapon_loadout",
                                                 "field_specs": loadout_field_specs,
                                             },
-                                        "world_config": {
-                                            "struct": wc,
-                                            "on_commit": _commit_world_config,
-                                            "field_specs": wc_field_specs,
-                                        }
+                                        "particle_config": {
+                                            "struct": particle_cfg,
+                                            "title": "PARTICLE",
+                                            "persist_path": "particle_config.json",
+                                            "persist_key": "particle_config",
+                                            "field_specs": particle_field_specs,
+                                            "on_commit": _commit_particle_config,
+                                            "persist_on_change": True,
+                                        },
+                                        "world_env": {
+                                            "struct": world_env,
+                                            "title": "WORLD",
+                                            "persist_path": "world_config.json",
+                                            "persist_key": "world_env",
+                                            "field_specs": world_field_specs,
+                                            "on_commit": _commit_world_env,
+                                            "persist_on_change": True,
+                                        },
+                                        "flight_physics": {
+                                            "struct": flight_cfg,
+                                            "title": "FLIGHT",
+                                            "persist_path": "flight_physics.json",
+                                            "persist_key": "flight_physics",
+                                            "field_specs": flight_field_specs,
+                                            "on_commit": _commit_flight_physics,
+                                            "persist_on_change": True,
+                                        },
+                                        "ballistics": {
+                                            "struct": ball_cfg,
+                                            "title": "BALLISTICS",
+                                            "persist_path": "ballistics.json",
+                                            "persist_key": "ballistics",
+                                            "field_specs": ball_field_specs,
+                                            "on_commit": _commit_ballistics,
+                                            "persist_on_change": True,
+                                        },
                                     }
                                 },
                             )
@@ -9902,8 +11029,23 @@ def run(
                 if joystick is not None and weap_rt is not None:
                     try:
                         cfg = joystick_menu.load_or_create_joystick_config("joystick.json")
-                        b1 = _get_weapon_binding(cfg, "fire_1")
-                        b2 = _get_weapon_binding(cfg, "fire_2")
+                        if menu is not None:
+                            try:
+                                targeting_mode = int(getattr(loadout, "targeting", 0) or 0)
+                            except Exception:
+                                targeting_mode = 0
+                            try:
+                                menu._targeting_active = bool(int(targeting_mode) != 0)
+                            except Exception:
+                                pass
+                            try:
+                                menu._active_control_set = _resolve_effective_control_set(menu)
+                            except Exception:
+                                pass
+
+                        set_name = _resolve_effective_control_set(menu)
+                        b1 = _get_set_binding(cfg, set_name=set_name, group="weapons", key="fire_1")
+                        b2 = _get_set_binding(cfg, set_name=set_name, group="weapons", key="fire_2")
                         axes_now, buttons_now, hats_now = joystick_menu._poll_joystick_snapshot(joystick)
                         f1_active, f1_analog = _binding_active(b1, axes_now, buttons_now, hats_now)
                         f2_active, f2_analog = _binding_active(b2, axes_now, buttons_now, hats_now)
@@ -9912,7 +11054,8 @@ def run(
                         try:
                             proj_now = str(params_menu.get("proj_mode", proj_mode) or "pca")
                             in_flight_dbg = bool(menu is not None and menu.flight_active(proj_now))
-                            b_dbg = _get_hud_binding(cfg, "toggle")
+                            set_name = _resolve_effective_control_set(menu)
+                            b_dbg = _get_set_binding(cfg, set_name=set_name, group="hud", key="toggle")
                             dbg_active, _dbg_analog = _binding_active(b_dbg, axes_now, buttons_now, hats_now)
                             if in_flight_dbg:
                                 if bool(dbg_active) and (not bool(debug_hud_toggle_prev)):
@@ -10416,6 +11559,11 @@ def run(
             pygame.display.flip()
             clock.tick(60)
     finally:
+        try:
+            if menu is not None and hasattr(menu, "flight_cam"):
+                menu.flight_cam.shutdown()
+        except Exception:
+            pass
         stop_evt.set()
         phys_thread.join(timeout=1.0)
         pygame.quit()

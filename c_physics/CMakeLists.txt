@@ -6,6 +6,7 @@ project(geodesic_physics C)
 add_library(geodesic_physics SHARED
     geodesic_physics.c
     weapon_sim.c
+    flight_sim.c
 )
 
 target_include_directories(geodesic_physics PRIVATE

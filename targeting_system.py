@@ -240,13 +240,16 @@ class TargetingSystem:
         nodes_pos: Optional[np.ndarray] = None,
         nodes_radius: Optional[np.ndarray] = None,
         depth_finder: Optional[Callable[[np.ndarray, np.ndarray, float], Optional[Vec3]]] = None,
+        focus_override: Optional[ReticleFocus] = None,
     ) -> ReticleState:
         o = np.asarray(ray_origin, dtype=np.float32).reshape((3,))
         d = _safe_normalize(np.asarray(ray_dir, dtype=np.float32).reshape((3,)))
         view_dir = (float(d[0]), float(d[1]), float(d[2]))
 
         focus = ReticleFocus(on_target=False, victim_id=0)
-        if nodes_pos is not None and nodes_radius is not None:
+        if isinstance(focus_override, ReticleFocus):
+            focus = focus_override
+        elif nodes_pos is not None and nodes_radius is not None:
             try:
                 focus = raycast_nodes(
                     ray_origin=o,

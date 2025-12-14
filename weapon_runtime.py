@@ -94,6 +94,13 @@ class ProjectileSimulator:
             self._c_lib = None
             self._c_mod = None
 
+        # When true, request batches ask the C simulator to print details.
+        self.debug_print: bool = False
+
+        # Max spline points per request (C output buffer cap).
+        # Exposed via the in-game BALLISTICS menu.
+        self.max_points: int = 16
+
     def start(self) -> None:
         if not self._thr.is_alive():
             self._thr.start()
@@ -191,6 +198,9 @@ class ProjectileSimulator:
                                     "source": str(req.source),
                                     "weapon_type": str(req.weapon_type),
 
+                                    # Debug / instrumentation
+                                    "debug_print": bool(self.debug_print),
+
                                     # Weapon behavior (purely from stats/config)
                                     "kinematics_mode": int(k_mode),
                                     "inherit_ship_velocity": bool(inherit),
@@ -213,7 +223,7 @@ class ProjectileSimulator:
                                     "nodes": getattr(req.ship, "nodes", None),
                                 }
                             ],
-                            max_points=16,
+                            max_points=int(max(2, min(256, int(getattr(self, "max_points", 16) or 16)))),
                         )
                         ok = bool(self._c_mod.process_batch(lib=self._c_lib, batch=batch))
                         if ok:
@@ -342,6 +352,9 @@ class WeaponRuntime:
         self.sim.start()
         self.state = WeaponRuntimeState()
 
+        # Controls C-side request logging (when the DLL backend is enabled).
+        self.debug_print: bool = False
+
         self._req_id = 1
 
     def stop(self) -> None:
@@ -369,6 +382,10 @@ class WeaponRuntime:
         `resolved` is an iterable of (source_name, weapon_type).
         """
         ids: List[int] = []
+        try:
+            self.sim.debug_print = bool(self.debug_print)
+        except Exception:
+            pass
         ship_s = ship if ship is not None else ShipSnapshot()
         for source_name, weapon_type in resolved:
             cfg = get_weapon_type_stats(self.stats, str(weapon_type))

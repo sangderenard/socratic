@@ -316,13 +316,30 @@ GP_EXPORT int gp_weapon_process_batch(GP_WpnBatch* batch) {
     return 0;
   }
   if (batch->hdr.magic != GP_WPN_MAGIC) {
-    fprintf(stderr, "[wpn] bad magic: 0x%08X\n", (unsigned)batch->hdr.magic);
-    fflush(stderr);
+    // Avoid spamming stderr if the caller is polling frequently (e.g. reticle LOS probes).
+    // Still emit a signal once so ABI mismatches are discoverable.
+    static uint32_t s_last_bad_magic = 0u;
+    static int s_bad_magic_reported = 0;
+    const uint32_t got = (uint32_t)batch->hdr.magic;
+    if (!s_bad_magic_reported || got != s_last_bad_magic) {
+      s_last_bad_magic = got;
+      s_bad_magic_reported = 1;
+      fprintf(stderr, "[wpn] bad magic: 0x%08X\n", (unsigned)got);
+      fflush(stderr);
+    }
     return 0;
   }
   if (batch->hdr.version != 6u) {
-    fprintf(stderr, "[wpn] bad version: %u\n", (unsigned)batch->hdr.version);
-    fflush(stderr);
+    // Same spam-avoidance as the magic mismatch case.
+    static uint32_t s_last_bad_version = 0u;
+    static int s_bad_version_reported = 0;
+    const uint32_t got = (uint32_t)batch->hdr.version;
+    if (!s_bad_version_reported || got != s_last_bad_version) {
+      s_last_bad_version = got;
+      s_bad_version_reported = 1;
+      fprintf(stderr, "[wpn] bad version: %u\n", (unsigned)got);
+      fflush(stderr);
+    }
     return 0;
   }
 
@@ -341,37 +358,39 @@ GP_EXPORT int gp_weapon_process_batch(GP_WpnBatch* batch) {
     _safe_cstr(src, sizeof(src), r->source);
     _safe_cstr(wtype, sizeof(wtype), r->weapon_type);
 
-    fprintf(
-      stderr,
-      "[wpn] req[%u] id=%u slot=%u analog=%.3f source='%s' type='%s' "
-      "pos=(%.3f,%.3f,%.3f) vel=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) "
-      "wflags=0x%X worigin=(%.3f,%.3f,%.3f) wdir=(%.3f,%.3f,%.3f) "
-      "k_mode=%u inh=%u add_v=%.3f sim_pts=%u t_end=%.3f beam=%.3f drop=%.3f "
-      "flags=0x%X hm=%ux%u nodes=%u\n",
-      (unsigned)i,
-      (unsigned)r->request_id,
-      (unsigned)r->weapon_slot,
-      (double)r->analog,
-      src,
-      wtype,
-      (double)r->ship_pos[0], (double)r->ship_pos[1], (double)r->ship_pos[2],
-      (double)r->ship_vel[0], (double)r->ship_vel[1], (double)r->ship_vel[2],
-      (double)r->ship_fwd[0], (double)r->ship_fwd[1], (double)r->ship_fwd[2],
-      (unsigned)r->weapon_flags,
-      (double)r->weapon_origin[0], (double)r->weapon_origin[1], (double)r->weapon_origin[2],
-      (double)r->weapon_dir[0], (double)r->weapon_dir[1], (double)r->weapon_dir[2],
-      (unsigned)r->kinematics_mode,
-      (unsigned)r->inherit_ship_velocity,
-      (double)r->add_velocity,
-      (unsigned)r->sim_points,
-      (double)r->sim_t_end,
-      (double)r->sim_beam_len,
-      (double)r->sim_drop_off,
-      (unsigned)r->world_flags,
-      (unsigned)r->terrain_hm_w,
-      (unsigned)r->terrain_hm_h,
-      (unsigned)r->nodes_count
-    );
+    if ((r->weapon_flags & 2u) != 0u) {
+      fprintf(
+        stderr,
+        "[wpn] req[%u] id=%u slot=%u analog=%.3f source='%s' type='%s' "
+        "pos=(%.3f,%.3f,%.3f) vel=(%.3f,%.3f,%.3f) fwd=(%.3f,%.3f,%.3f) "
+        "wflags=0x%X worigin=(%.3f,%.3f,%.3f) wdir=(%.3f,%.3f,%.3f) "
+        "k_mode=%u inh=%u add_v=%.3f sim_pts=%u t_end=%.3f beam=%.3f drop=%.3f "
+        "flags=0x%X hm=%ux%u nodes=%u\n",
+        (unsigned)i,
+        (unsigned)r->request_id,
+        (unsigned)r->weapon_slot,
+        (double)r->analog,
+        src,
+        wtype,
+        (double)r->ship_pos[0], (double)r->ship_pos[1], (double)r->ship_pos[2],
+        (double)r->ship_vel[0], (double)r->ship_vel[1], (double)r->ship_vel[2],
+        (double)r->ship_fwd[0], (double)r->ship_fwd[1], (double)r->ship_fwd[2],
+        (unsigned)r->weapon_flags,
+        (double)r->weapon_origin[0], (double)r->weapon_origin[1], (double)r->weapon_origin[2],
+        (double)r->weapon_dir[0], (double)r->weapon_dir[1], (double)r->weapon_dir[2],
+        (unsigned)r->kinematics_mode,
+        (unsigned)r->inherit_ship_velocity,
+        (double)r->add_velocity,
+        (unsigned)r->sim_points,
+        (double)r->sim_t_end,
+        (double)r->sim_beam_len,
+        (double)r->sim_drop_off,
+        (unsigned)r->world_flags,
+        (unsigned)r->terrain_hm_w,
+        (unsigned)r->terrain_hm_h,
+        (unsigned)r->nodes_count
+      );
+    }
 
     // Initialize outputs; mark invalid until we successfully run the requested mode.
     memset(o, 0, sizeof(*o));

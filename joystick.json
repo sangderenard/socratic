@@ -10,6 +10,41 @@
         "type": "button"
       }
     },
+    "controller": {
+      "channels": {},
+      "features": {
+        "axis_0": {
+          "axis": 0,
+          "type": "axis"
+        },
+        "button_1": {
+          "button": 1,
+          "type": "button"
+        }
+      },
+      "signals": {
+        "sig1": {
+          "feature": "axis_0",
+          "op": "raw"
+        },
+        "sig2": {
+          "feature": "axis_0",
+          "op": "raw"
+        },
+        "sig3": {
+          "feature": "axis_0",
+          "op": "raw"
+        },
+        "sig4": {
+          "feature": "axis_0",
+          "op": "raw"
+        }
+      },
+      "state": {
+        "last_feature": "button_1",
+        "last_signal": "sig4"
+      }
+    },
     "triggers": {
       "forward_axis": {
         "axis": 5,

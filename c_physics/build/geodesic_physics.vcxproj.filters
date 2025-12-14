@@ -7,6 +7,9 @@
     <ClCompile Include="C:\dev\Powershell\socratic\c_physics\weapon_sim.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="C:\dev\Powershell\socratic\c_physics\flight_sim.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="C:\dev\Powershell\socratic\c_physics\CMakeLists.txt" />

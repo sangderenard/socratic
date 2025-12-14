@@ -8,6 +8,7 @@ from typing import Any
 
 import pygame
 
+import input_graph
 import reticle_sprite
 
 
@@ -373,6 +374,8 @@ def ensure_menu_navigation_bindings(
     menu_button: int | None,
     axis_threshold: float = 0.85,
     axis_wake_deadzone: float = 0.25,
+    keys: list[str] | None = None,
+    force: bool = False,
 ) -> bool:
     """Interactive puzzle to bind menu navigation controls.
 
@@ -395,7 +398,9 @@ def ensure_menu_navigation_bindings(
         return False
 
     directions = ["up", "down", "left", "right", "confirm", "cancel"]
-    missing = [d for d in directions if d not in nav]
+    wanted = [str(d) for d in (keys or directions)]
+    targets = [d for d in wanted if d in directions]
+    missing = [d for d in targets if bool(force) or (d not in nav)]
     if not missing:
         return False
 
@@ -1023,6 +1028,7 @@ def run_ctypes_struct_editor(
     persist_path: str,
     persist_key: str,
     field_specs: dict[str, dict[str, Any]] | None = None,
+    persist_on_change: bool = False,
 ) -> bool:
     """Edit a ctypes.Structure using menu-nav bindings.
 
@@ -1078,9 +1084,12 @@ def run_ctypes_struct_editor(
 
     changed = False
     start_snapshot = _ctypes_struct_to_dict(struct_obj)
+    last_saved_snapshot = dict(start_snapshot)
 
     def _sel_y(idx: int) -> float:
         return float(0.66 - 0.07 * int(idx))
+
+    max_visible = 10
 
     while True:
         exit_now = False
@@ -1161,6 +1170,14 @@ def run_ctypes_struct_editor(
                     direction=int(lr_dir),
                     field_specs=field_specs,
                 )
+                if bool(persist_on_change):
+                    try:
+                        snap_now = _ctypes_struct_to_dict(struct_obj)
+                        if snap_now != last_saved_snapshot:
+                            _save_persisted_block(str(persist_path), str(persist_key), snap_now)
+                            last_saved_snapshot = dict(snap_now)
+                    except Exception:
+                        pass
             else:
                 held_for = float(now_s) - float(lr_held_since or now_s)
                 if held_for >= float(lr_first_delay_s):
@@ -1174,6 +1191,14 @@ def run_ctypes_struct_editor(
                             field_specs=field_specs,
                         )
                         last_lr_time = float(now_s)
+                        if bool(persist_on_change):
+                            try:
+                                snap_now = _ctypes_struct_to_dict(struct_obj)
+                                if snap_now != last_saved_snapshot:
+                                    _save_persisted_block(str(persist_path), str(persist_key), snap_now)
+                                    last_saved_snapshot = dict(snap_now)
+                            except Exception:
+                                pass
 
         # Detect changes.
         if not changed:
@@ -1186,14 +1211,22 @@ def run_ctypes_struct_editor(
             prefix = "> " if int(i) == int(sel) else "  "
             lines.append(f"{prefix}{_fmt_name(fname)}: {_fmt_value(fname, ftype)}")
 
-        ret_y_des = _sel_y(sel)
+        first_idx = 0
+        if int(len(lines)) > int(max_visible):
+            half = int(max_visible // 2)
+            first_idx = int(sel) - int(half)
+            first_idx = max(0, min(int(first_idx), int(len(lines) - max_visible)))
+        visible_sel = int(sel) - int(first_idx)
+        lines_vis = lines[int(first_idx) : int(first_idx) + int(max_visible)] if int(len(lines)) > int(max_visible) else lines
+
+        ret_y_des = _sel_y(visible_sel)
         ret_y += (float(ret_y_des) - float(ret_y)) * 0.35
         _draw_menu_list(
             font=font,
             width=int(width),
             height=int(height),
             title=str(title),
-            items=lines,
+            items=lines_vis,
             selected_idx=int(sel),
             ret_x=float(ret_x),
             ret_y=float(ret_y),
@@ -1811,10 +1844,11 @@ def ensure_menu_button_binding(
     width: int,
     height: int,
     joystick: pygame.joystick.Joystick | None,
+    force: bool = False,
 ) -> tuple[int | None, bool]:
     cfg = load_or_create_joystick_config(cfg_path)
     existing = cfg.get("menu_button", None)
-    if isinstance(existing, int) and existing >= 0:
+    if (not bool(force)) and isinstance(existing, int) and existing >= 0:
         return int(existing), False
 
     if joystick is None:
@@ -1840,7 +1874,6 @@ def ensure_menu_button_binding(
                     try:
                         if int(joystick.get_button(b)) != 0:
                             binding = int(b)
-                            break
                     except Exception:
                         pass
             except Exception:
@@ -1864,6 +1897,576 @@ def run_main_menu(
     menu_button: int | None,
     menu_context: dict[str, Any] | None = None,
 ) -> str:
+    def _ensure_flight_controls_profiles(cfg: dict) -> dict:
+        """Ensure cfg["flight_controls"]["profiles"][profile][mode] skeleton exists."""
+        if not isinstance(cfg.get("flight_controls", None), dict):
+            cfg["flight_controls"] = {}
+        fc = cfg["flight_controls"]
+        if not isinstance(fc.get("profiles", None), dict):
+            fc["profiles"] = {}
+        profiles = fc["profiles"]
+
+        for prof in ("fighter", "bomber"):
+            if not isinstance(profiles.get(prof, None), dict):
+                profiles[prof] = {}
+            pblk = profiles[prof]
+            for mode in ("flight", "view"):
+                if not isinstance(pblk.get(mode, None), dict):
+                    pblk[mode] = {}
+                mblk = pblk[mode]
+                if not isinstance(mblk.get("craft", None), dict):
+                    mblk["craft"] = {}
+                if not isinstance(mblk.get("look", None), dict):
+                    mblk["look"] = {}
+                if not isinstance(mblk.get("reticle_look", None), dict):
+                    mblk["reticle_look"] = {}
+                if not isinstance(mblk.get("flaps", None), dict):
+                    mblk["flaps"] = {}
+
+        if not isinstance(fc.get("toggles", None), dict):
+            fc["toggles"] = {}
+        if not isinstance(fc.get("state", None), dict):
+            fc["state"] = {}
+        st = fc["state"]
+        if not isinstance(st.get("active_profile", None), str):
+            st["active_profile"] = "fighter"
+        if not isinstance(st.get("active_mode", None), str):
+            st["active_mode"] = "flight"
+        if not isinstance(st.get("view_targeting", None), bool):
+            st["view_targeting"] = False
+
+        return cfg
+
+    def _ensure_flight_controls_sets(cfg: dict) -> dict:
+        """Ensure cfg["flight_controls"]["sets"][set_name] skeleton exists."""
+        if not isinstance(cfg.get("flight_controls", None), dict):
+            cfg["flight_controls"] = {}
+        fc = cfg["flight_controls"]
+        if not isinstance(fc.get("sets", None), dict):
+            fc["sets"] = {}
+        sets = fc["sets"]
+        for sname in ("flight", "view_targeting", "bomber", "fighter"):
+            if not isinstance(sets.get(sname, None), dict):
+                sets[sname] = {}
+            blk = sets[sname]
+            for group in (
+                "craft",
+                "look",
+                "reticle_look",
+                "flaps",
+                "triggers",
+                "weapons",
+                "camera",
+                "hud",
+            ):
+                if not isinstance(blk.get(group, None), dict):
+                    blk[group] = {}
+        return cfg
+
+    def _write_set_mapping(*, set_name: str, group: str, key: str, mapping: dict[str, Any]) -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_flight_controls_sets(cfg)
+        fc = cfg["flight_controls"]
+        blk = fc["sets"][str(set_name)]
+        if not isinstance(blk.get(str(group), None), dict):
+            blk[str(group)] = {}
+        blk[str(group)][str(key)] = dict(mapping)
+        save_joystick_config(cfg, "joystick.json")
+
+    def _write_set_trigger_mapping(*, set_name: str, key: str, mapping: dict[str, Any]) -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_flight_controls_sets(cfg)
+        fc = cfg["flight_controls"]
+        blk = fc["sets"][str(set_name)]
+        if not isinstance(blk.get("triggers", None), dict):
+            blk["triggers"] = {}
+        blk["triggers"][str(key)] = {"axis": int(mapping["axis"]), "sign": int(mapping["sign"])}
+        save_joystick_config(cfg, "joystick.json")
+
+    def _ensure_controller_graph(cfg: dict) -> dict:
+        return input_graph.ensure_controller_graph(cfg)
+
+    def _pick_from_list(
+        *,
+        title: str,
+        options: list[tuple[str, str]],
+    ) -> str | None:
+        """Return the selected option key, or None if cancelled."""
+        if joystick is None:
+            return None
+        if not options:
+            return None
+
+        cfg_local = load_or_create_joystick_config("joystick.json")
+        nav = _get_menu_nav(cfg_local)
+        b_up = nav.get("up")
+        b_down = nav.get("down")
+        b_confirm = nav.get("confirm")
+        b_cancel = nav.get("cancel")
+
+        sel = 0
+        clock = pygame.time.Clock()
+
+        axes_prev: dict[int, float] = {}
+        buttons_prev: set[int] = set()
+        hats_prev: dict[int, tuple[int, int]] = {}
+
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return None
+
+            axes_now, buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+
+            up_edge = _nav_edge(
+                b_up,
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            )
+            down_edge = _nav_edge(
+                b_down,
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            )
+            ok_edge = _nav_edge(
+                b_confirm,
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            )
+            cancel_edge = _nav_edge(
+                b_cancel,
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            )
+
+            if cancel_edge:
+                return None
+            if up_edge:
+                sel = (sel - 1) % max(1, len(options))
+            if down_edge:
+                sel = (sel + 1) % max(1, len(options))
+            if ok_edge:
+                return str(options[int(sel)][0])
+
+            labels = [str(lbl) for _k, lbl in options]
+            _draw_menu_list(
+                font=font,
+                width=int(width),
+                height=int(height),
+                title=str(title),
+                items=labels,
+                selected_idx=int(sel),
+                ret_x=0.04,
+                ret_y=0.66,
+                stage=reticle_sprite.ReticleStage.READY,
+            )
+            pygame.display.flip()
+            clock.tick(60)
+
+            axes_prev, buttons_prev, hats_prev = axes_now, set(buttons_now), dict(hats_now)
+
+    def _edit_float(
+        *,
+        title: str,
+        initial: float,
+        lo: float = -1.0,
+        hi: float = 1.0,
+        rate: float = 0.9,
+        deadzone: float = 0.18,
+    ) -> float | None:
+        """Simple float editor: move stick left/right, press any button to confirm."""
+        if joystick is None:
+            return None
+        try:
+            joystick.init()
+        except Exception:
+            pass
+        v = float(initial)
+        clock = pygame.time.Clock()
+
+        # Snapshot current buttons so confirm is a new press.
+        last_buttons: set[int] = set()
+        try:
+            n_buttons0 = int(joystick.get_numbuttons())
+            for b0 in range(max(0, n_buttons0)):
+                try:
+                    if int(joystick.get_button(int(b0))) != 0:
+                        last_buttons.add(int(b0))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        while True:
+            try:
+                pygame.event.pump()
+            except Exception:
+                pass
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if menu_button is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button):
+                    return None
+
+            # Confirm by new press.
+            polled: set[int] = set()
+            try:
+                n_buttons = int(joystick.get_numbuttons())
+            except Exception:
+                n_buttons = 0
+            for b in range(max(0, n_buttons)):
+                try:
+                    if int(joystick.get_button(int(b))) != 0:
+                        polled.add(int(b))
+                except Exception:
+                    pass
+            new_presses = polled - last_buttons
+            if new_presses:
+                b = int(sorted(list(new_presses))[0])
+                if menu_button is None or int(b) != int(menu_button):
+                    return float(v)
+            last_buttons = polled
+
+            # Axis 0 as adjustment.
+            try:
+                ax = float(joystick.get_axis(0))
+            except Exception:
+                ax = 0.0
+            if abs(float(ax)) < float(deadzone):
+                ax = 0.0
+            v += float(rate) * float(ax) * (1.0 / 60.0)
+            v = float(max(float(lo), min(float(hi), float(v))))
+
+            _draw_fullscreen_lines(
+                font,
+                int(width),
+                int(height),
+                [
+                    str(title),
+                    f"value: {v:+.3f}",
+                    "move stick left/right to adjust",
+                    "press any button to confirm",
+                    "(menu button cancels)",
+                ],
+            )
+            pygame.display.flip()
+            clock.tick(60)
+
+    def _discover_feature(*, label: str) -> dict[str, int] | None:
+        """Listen for any joystick input and return a feature descriptor."""
+        if joystick is None:
+            return None
+        clock = pygame.time.Clock()
+        try:
+            joystick.init()
+        except Exception:
+            pass
+
+        init_axis: dict[int, float] = {}
+        try:
+            n_axes = int(joystick.get_numaxes())
+        except Exception:
+            n_axes = 0
+        for a in range(max(0, n_axes)):
+            try:
+                init_axis[int(a)] = float(joystick.get_axis(int(a)))
+            except Exception:
+                init_axis[int(a)] = 0.0
+
+        last_buttons: set[int] = set()
+        try:
+            n_buttons0 = int(joystick.get_numbuttons())
+        except Exception:
+            n_buttons0 = 0
+        for b0 in range(max(0, n_buttons0)):
+            try:
+                if int(joystick.get_button(int(b0))) != 0:
+                    last_buttons.add(int(b0))
+            except Exception:
+                pass
+
+        last_hats: dict[int, tuple[int, int]] = {}
+        try:
+            n_hats0 = int(joystick.get_numhats())
+        except Exception:
+            n_hats0 = 0
+        for h0 in range(max(0, n_hats0)):
+            try:
+                v0 = joystick.get_hat(int(h0))
+                last_hats[int(h0)] = (int(v0[0]), int(v0[1]))
+            except Exception:
+                last_hats[int(h0)] = (0, 0)
+
+        while True:
+            try:
+                pygame.event.pump()
+            except Exception:
+                pass
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if menu_button is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button):
+                    return None
+
+            # New button press.
+            polled_buttons: set[int] = set()
+            try:
+                n_buttons = int(joystick.get_numbuttons())
+            except Exception:
+                n_buttons = 0
+            for b in range(max(0, n_buttons)):
+                try:
+                    if int(joystick.get_button(int(b))) != 0:
+                        polled_buttons.add(int(b))
+                except Exception:
+                    pass
+            new_presses = polled_buttons - last_buttons
+            if new_presses:
+                b = int(sorted(list(new_presses))[0])
+                if menu_button is None or int(b) != int(menu_button):
+                    return {"type": "button", "button": int(b)}
+            last_buttons = polled_buttons
+
+            # Hat move.
+            try:
+                n_hats = int(joystick.get_numhats())
+            except Exception:
+                n_hats = 0
+            for h in range(max(0, n_hats)):
+                try:
+                    v = joystick.get_hat(int(h))
+                    now = (int(v[0]), int(v[1]))
+                except Exception:
+                    now = (0, 0)
+                if now != (0, 0) and last_hats.get(int(h), (0, 0)) == (0, 0):
+                    return {"type": "hat", "hat": int(h), "x": int(now[0]), "y": int(now[1])}
+                last_hats[int(h)] = now
+
+            # Axis motion.
+            try:
+                n_axes = int(joystick.get_numaxes())
+            except Exception:
+                n_axes = 0
+            for a in range(max(0, n_axes)):
+                try:
+                    v = float(joystick.get_axis(int(a)))
+                except Exception:
+                    continue
+                v0 = float(init_axis.get(int(a), 0.0))
+                if abs(float(v) - float(v0)) >= 0.35:
+                    return {"type": "axis", "axis": int(a)}
+
+            _draw_fullscreen_lines(
+                font,
+                int(width),
+                int(height),
+                [
+                    f"{label}",
+                    "move any axis or press any button",
+                    "(menu button cancels)",
+                ],
+            )
+            pygame.display.flip()
+            clock.tick(60)
+
+    def _controller_add_feature(feature: dict[str, int]) -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_controller_graph(cfg)
+        ctrl = cfg["flight_controls"]["controller"]
+        feats = ctrl["features"]
+
+        ftype = str(feature.get("type", ""))
+        if ftype == "axis" and isinstance(feature.get("axis"), int):
+            base = f"axis_{int(feature['axis'])}"
+        elif ftype == "button" and isinstance(feature.get("button"), int):
+            base = f"button_{int(feature['button'])}"
+        elif ftype == "hat" and isinstance(feature.get("hat"), int) and isinstance(feature.get("x"), int) and isinstance(feature.get("y"), int):
+            base = f"hat_{int(feature['hat'])}_{int(feature['x'])}_{int(feature['y'])}"
+        else:
+            return
+
+        fid = base
+        k = 2
+        while fid in feats:
+            fid = f"{base}_{k}"
+            k += 1
+
+        feats[fid] = dict(feature)
+        ctrl["state"]["last_feature"] = str(fid)
+        save_joystick_config(cfg, "joystick.json")
+
+    def _controller_create_signal() -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_controller_graph(cfg)
+        ctrl = cfg["flight_controls"]["controller"]
+        feats: dict = ctrl.get("features", {}) if isinstance(ctrl.get("features", {}), dict) else {}
+        sigs: dict = ctrl.get("signals", {}) if isinstance(ctrl.get("signals", {}), dict) else {}
+
+        op = _pick_from_list(
+            title="SIGNAL OP",
+            options=[
+                ("raw", "RAW (feature)"),
+                ("const", "CONST"),
+                ("scale", "SCALE"),
+                ("add", "ADD"),
+                ("sub", "SUB"),
+                ("clamp", "CLAMP"),
+                ("deadzone", "DEADZONE"),
+            ],
+        )
+        if op is None:
+            return
+
+        def _sources_list() -> list[tuple[str, str]]:
+            out: list[tuple[str, str]] = []
+            for k in sorted(list(feats.keys())):
+                out.append((f"feat:{k}", f"FEATURE {k}"))
+            for k in sorted(list(sigs.keys())):
+                out.append((f"sig:{k}", f"SIGNAL {k}"))
+            return out
+
+        def _pick_src(prompt: str) -> str | None:
+            return _pick_from_list(title=prompt, options=_sources_list())
+
+        node: dict[str, Any] = {"op": str(op)}
+        if op == "raw":
+            if not feats:
+                return
+            src = _pick_from_list(
+                title="SELECT FEATURE",
+                options=[(k, k) for k in sorted(list(feats.keys()))],
+            )
+            if src is None:
+                return
+            node["feature"] = str(src)
+        elif op == "const":
+            v = _edit_float(title="CONST VALUE", initial=0.0)
+            if v is None:
+                return
+            node["value"] = float(v)
+        elif op == "scale":
+            src = _pick_src("SCALE INPUT")
+            if src is None:
+                return
+            g = _edit_float(title="GAIN", initial=1.0, lo=-4.0, hi=4.0)
+            if g is None:
+                return
+            node["in"] = str(src)
+            node["gain"] = float(g)
+        elif op in ("add", "sub"):
+            a = _pick_src("INPUT A")
+            if a is None:
+                return
+            b = _pick_src("INPUT B")
+            if b is None:
+                return
+            node["a"] = str(a)
+            node["b"] = str(b)
+        elif op == "clamp":
+            src = _pick_src("CLAMP INPUT")
+            if src is None:
+                return
+            lo = _edit_float(title="CLAMP LO", initial=-1.0, lo=-10.0, hi=10.0)
+            if lo is None:
+                return
+            hi = _edit_float(title="CLAMP HI", initial=1.0, lo=-10.0, hi=10.0)
+            if hi is None:
+                return
+            node["in"] = str(src)
+            node["lo"] = float(lo)
+            node["hi"] = float(hi)
+        elif op == "deadzone":
+            src = _pick_src("DEADZONE INPUT")
+            if src is None:
+                return
+            dz = _edit_float(title="DEADZONE", initial=0.08, lo=0.0, hi=0.95)
+            if dz is None:
+                return
+            node["in"] = str(src)
+            node["dz"] = float(dz)
+
+        sid_base = "sig"
+        i = 1
+        sid = f"{sid_base}{i}"
+        while sid in sigs:
+            i += 1
+            sid = f"{sid_base}{i}"
+
+        sigs[sid] = node
+        ctrl["state"]["last_signal"] = str(sid)
+        save_joystick_config(cfg, "joystick.json")
+
+    def _controller_map_channel() -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_controller_graph(cfg)
+        ctrl = cfg["flight_controls"]["controller"]
+        sigs: dict = ctrl.get("signals", {}) if isinstance(ctrl.get("signals", {}), dict) else {}
+
+        ch_key = _pick_from_list(
+            title="CHANNEL",
+            options=[(str(i), f"channel[{i}]") for i in range(8)],
+        )
+        if ch_key is None:
+            return
+
+        src_kind = _pick_from_list(
+            title="MAP TYPE",
+            options=[
+                ("signal", "FROM SIGNAL"),
+                ("const", "CONSTANT"),
+                ("clear", "CLEAR"),
+            ],
+        )
+        if src_kind is None:
+            return
+
+        if src_kind == "clear":
+            try:
+                ctrl["channels"].pop(str(ch_key), None)
+            except Exception:
+                pass
+            save_joystick_config(cfg, "joystick.json")
+            return
+
+        if src_kind == "const":
+            v = _edit_float(title=f"channel[{ch_key}] CONST", initial=0.0)
+            if v is None:
+                return
+            ctrl["channels"][str(ch_key)] = {"source": "const", "value": float(v)}
+            save_joystick_config(cfg, "joystick.json")
+            return
+
+        if src_kind == "signal":
+            if not sigs:
+                return
+            sid = _pick_from_list(
+                title="SELECT SIGNAL",
+                options=[(k, k) for k in sorted(list(sigs.keys()))],
+            )
+            if sid is None:
+                return
+            ctrl["channels"][str(ch_key)] = {"source": "signal", "id": str(sid)}
+            save_joystick_config(cfg, "joystick.json")
+            return
+
     def _bind_axis(
         label: str,
         *,
@@ -2015,6 +2618,195 @@ def run_main_menu(
             if candidate is not None and not candidate_active:
                 candidate = None
                 anim._on_since = None
+
+    def _bind_axis_calibrated(
+        label: str,
+        *,
+        joystick: pygame.joystick.Joystick,
+        threshold: float,
+        wake_deadzone: float = 0.25,
+        pair_threshold: float | None = 0.85,
+    ) -> dict[str, Any] | None:
+        """Standardized axis binding: choose axis then calibrate extrema (or optionally pair to 2D)."""
+        a0 = _bind_axis(str(label), joystick=joystick, threshold=float(threshold))
+        if a0 is None or int(a0) < 0:
+            return None
+
+        try:
+            joystick.init()
+        except Exception:
+            pass
+
+        def _poll_axis(idx: int) -> float:
+            try:
+                return float(joystick.get_axis(int(idx)))
+            except Exception:
+                return 0.0
+
+        # Track min/max while the user moves the control.
+        v0 = _poll_axis(int(a0))
+        min0 = float(v0)
+        max0 = float(v0)
+
+        a1: int | None = None
+        min1: float = 0.0
+        max1: float = 0.0
+
+        # Snapshot current button state so "confirm" is a new press.
+        last_buttons: set[int] = set()
+        try:
+            n_buttons0 = int(joystick.get_numbuttons())
+            for b0 in range(max(0, n_buttons0)):
+                try:
+                    if int(joystick.get_button(int(b0))) != 0:
+                        last_buttons.add(int(b0))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        clock = pygame.time.Clock()
+        while True:
+            try:
+                pygame.event.pump()
+            except Exception:
+                pass
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return None
+                if menu_button is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button):
+                    return None
+
+            # Confirm by *new* button press (anything except menu button).
+            polled_buttons: set[int] = set()
+            try:
+                n_buttons = int(joystick.get_numbuttons())
+            except Exception:
+                n_buttons = 0
+            for b in range(max(0, n_buttons)):
+                try:
+                    if int(joystick.get_button(int(b))) != 0:
+                        polled_buttons.add(int(b))
+                except Exception:
+                    pass
+            new_presses = polled_buttons - last_buttons
+            if new_presses:
+                b = int(sorted(list(new_presses))[0])
+                if menu_button is None or int(b) != int(menu_button):
+                    if a1 is None:
+                        return {
+                            "type": "axis1d",
+                            "axis": int(a0),
+                            "calib": {"min": float(min0), "max": float(max0)},
+                        }
+                    return {
+                        "type": "axis2d",
+                        "x": {"axis": int(a0), "calib": {"min": float(min0), "max": float(max0)}},
+                        "y": {"axis": int(a1), "calib": {"min": float(min1), "max": float(max1)}},
+                    }
+
+            last_buttons = polled_buttons
+
+            v = _poll_axis(int(a0))
+            min0 = float(min(min0, float(v)))
+            max0 = float(max(max0, float(v)))
+
+            # Optional: detect a second axis for 2D-mode if the user moves another axis to an extreme.
+            if pair_threshold is not None and a1 is None:
+                try:
+                    n_axes = int(joystick.get_numaxes())
+                except Exception:
+                    n_axes = 0
+                for a in range(max(0, n_axes)):
+                    if int(a) == int(a0):
+                        continue
+                    vv = _poll_axis(int(a))
+                    if abs(float(vv)) >= float(pair_threshold):
+                        a1 = int(a)
+                        min1 = float(vv)
+                        max1 = float(vv)
+                        break
+
+            if a1 is not None:
+                v1 = _poll_axis(int(a1))
+                min1 = float(min(min1, float(v1)))
+                max1 = float(max(max1, float(v1)))
+
+            lines = [
+                f"bind {label}",
+                f"axis: {int(a0)}  min/max: {min0:+.3f} / {max0:+.3f}",
+            ]
+            if a1 is None and pair_threshold is not None:
+                lines.append(f"move optional 2D axis (abs >= {float(pair_threshold):.2f})")
+            if a1 is not None:
+                lines.append(f"2D axis: {int(a1)}  min/max: {min1:+.3f} / {max1:+.3f}")
+            lines += [
+                "move through full range",
+                "press any button to confirm",
+                "(menu button cancels)",
+            ]
+            _draw_fullscreen_lines(font, int(width), int(height), lines)
+            pygame.display.flip()
+            clock.tick(60)
+
+    def _bind_buttonish(label: str, *, joystick: pygame.joystick.Joystick) -> dict[str, int] | None:
+        # Reuse the existing mapping capture: button/hat/axis.
+        return _bind_fire_mapping(str(label), joystick=joystick, delta_threshold=0.30)
+
+    def _write_toggle_mapping(*, key: str, mapping: dict[str, int]) -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_flight_controls_profiles(cfg)
+        fc = cfg["flight_controls"]
+        if not isinstance(fc.get("toggles", None), dict):
+            fc["toggles"] = {}
+        t = fc["toggles"]
+        mtype = str(mapping.get("type", ""))
+        if mtype == "button" and isinstance(mapping.get("button"), int):
+            t[str(key)] = {"type": "button", "button": int(mapping["button"])}
+        elif (
+            mtype == "hat"
+            and isinstance(mapping.get("hat"), int)
+            and isinstance(mapping.get("x"), int)
+            and isinstance(mapping.get("y"), int)
+        ):
+            t[str(key)] = {"type": "hat", "hat": int(mapping["hat"]), "x": int(mapping["x"]), "y": int(mapping["y"])}
+        elif mtype == "axis" and isinstance(mapping.get("axis"), int) and int(mapping.get("sign", 0)) in (-1, 1):
+            t[str(key)] = {"type": "axis", "axis": int(mapping["axis"]), "sign": int(mapping["sign"])}
+        save_joystick_config(cfg, "joystick.json")
+
+    def _write_profile_mapping(*, profile: str, mode: str, group: str, key: str, mapping: Any) -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_flight_controls_profiles(cfg)
+        fc = cfg["flight_controls"]
+        pblk = fc["profiles"].get(str(profile))
+        if not isinstance(pblk, dict):
+            return
+        mblk = pblk.get(str(mode))
+        if not isinstance(mblk, dict):
+            return
+        if not isinstance(mblk.get(str(group), None), dict):
+            mblk[str(group)] = {}
+        g = mblk[str(group)]
+        g[str(key)] = mapping
+        save_joystick_config(cfg, "joystick.json")
+
+    def _sync_all_to(*, src_profile: str, src_mode: str) -> None:
+        cfg = load_or_create_joystick_config("joystick.json")
+        cfg = _ensure_flight_controls_profiles(cfg)
+        fc = cfg["flight_controls"]
+        profiles = fc.get("profiles", {})
+        src = profiles.get(str(src_profile), {}).get(str(src_mode), {})
+        if not isinstance(src, dict):
+            return
+        for prof in ("fighter", "bomber"):
+            for mode in ("flight", "view"):
+                try:
+                    profiles[prof][mode] = json.loads(json.dumps(src))
+                except Exception:
+                    # Fall back to shallow copy if needed.
+                    profiles[prof][mode] = dict(src)
+        save_joystick_config(cfg, "joystick.json")
 
     def _bind_trigger_mapping(
         label: str,
@@ -2369,6 +3161,8 @@ def run_main_menu(
         clock = pygame.time.Clock()
         sel = 0
 
+        max_visible = 10
+
         axes_prev: dict[int, float] = {}
         buttons_prev: set[int] = set()
         hats_prev: dict[int, tuple[int, int]] = {}
@@ -2380,8 +3174,8 @@ def run_main_menu(
 
         anim = reticle_sprite.ReticleAnimator(lock_delay_s=0.20, ready_delay_s=0.45)
 
-        def _sel_y(idx: int) -> float:
-            return float(0.66 - 0.07 * int(idx))
+        def _sel_y(idx_visible: int) -> float:
+            return float(0.66 - 0.07 * int(idx_visible))
 
         while True:
             for event in pygame.event.get():
@@ -2446,7 +3240,15 @@ def run_main_menu(
 
             confirm_held = _nav_is_held(b_confirm, axes_now=axes_now, buttons_now=buttons_now, hats_now=hats_now)
 
-            ret_y_des = _sel_y(sel)
+            first_idx = 0
+            if int(len(labels)) > int(max_visible):
+                half = int(max_visible // 2)
+                first_idx = int(sel) - int(half)
+                first_idx = max(0, min(int(first_idx), int(len(labels) - max_visible)))
+            visible_sel = int(sel) - int(first_idx)
+            labels_vis = labels[int(first_idx) : int(first_idx) + int(max_visible)] if int(len(labels)) > int(max_visible) else labels
+
+            ret_y_des = _sel_y(visible_sel)
             ret_y += (float(ret_y_des) - float(ret_y)) * 0.25
             ret_x_des = target_x if confirm_held else start_x
             ret_x += (float(ret_x_des) - float(ret_x)) * 0.25
@@ -2479,6 +3281,7 @@ def run_main_menu(
                             persist_key = str(edit_struct.get("persist_key") or entry.get("persist_key") or sid)
                             etitle = str(edit_struct.get("title") or entry.get("title") or sid)
                             specs = entry.get("field_specs") if isinstance(entry.get("field_specs"), dict) else None
+                            poc = bool(edit_struct.get("persist_on_change", entry.get("persist_on_change", False)))
                             did = run_ctypes_struct_editor(
                                 font=font,
                                 width=int(width),
@@ -2490,6 +3293,7 @@ def run_main_menu(
                                 persist_path=persist_path,
                                 persist_key=persist_key,
                                 field_specs=specs,
+                                persist_on_change=bool(poc),
                             )
                             if did:
                                 cb = entry.get("on_commit")
@@ -2543,7 +3347,7 @@ def run_main_menu(
                 width=int(width),
                 height=int(height),
                 title=title,
-                items=labels,
+                items=labels_vis,
                 selected_idx=int(sel),
                 ret_x=float(ret_x),
                 ret_y=float(ret_y),
@@ -2571,113 +3375,162 @@ def run_main_menu(
         "bind_view_pitch": _mk_bind_handler("view pitch", section="right_stick", key="view_pitch_axis", threshold=0.85),
     }
 
-    # Triggers are special: allow shared-axis binding by capturing axis+sign.
-    def _bind_throttle(*, label: str, key: str) -> None:
+    # Controller graph menu actions.
+    handlers["controller_discover_feature"] = lambda: (
+        (lambda f: _controller_add_feature(f) if isinstance(f, dict) else None)(
+            _discover_feature(label="discover feature")
+        )
+    )
+    handlers["controller_create_signal"] = lambda: _controller_create_signal()
+    handlers["controller_map_channel"] = lambda: _controller_map_channel()
+
+    def _controller_status() -> None:
+        if joystick is None:
+            return
+        clock = pygame.time.Clock()
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return
+                if menu_button is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button):
+                    return
+
+            axes_now, buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+            header = "JOYSTICK STATUS"
+            lines: list[str] = []
+            try:
+                lines.append(f"axes: {int(joystick.get_numaxes())}  buttons: {int(joystick.get_numbuttons())}  hats: {int(joystick.get_numhats())}")
+            except Exception:
+                pass
+            for a in sorted(axes_now.keys()):
+                lines.append(f"axis {int(a)}: {float(axes_now[a]):+.3f}")
+            if buttons_now:
+                lines.append("pressed buttons: " + ", ".join(str(int(b)) for b in sorted(list(buttons_now))))
+            if hats_now:
+                for h in sorted(hats_now.keys()):
+                    hx, hy = hats_now[int(h)]
+                    lines.append(f"hat {int(h)}: ({int(hx)}, {int(hy)})")
+            if not buttons_now and not hats_now:
+                lines.append("(no buttons/hats pressed)")
+            lines.append("(menu button / Esc exits)")
+
+            _draw_fullscreen_lines(font, int(width), int(height), [header] + lines)
+            pygame.display.flip()
+            clock.tick(60)
+
+    handlers["controller_status"] = lambda: _controller_status()
+
+    # Menus: bind menu navigation explicitly.
+    handlers["bind_menu_navigation"] = lambda: ensure_menu_navigation_bindings(
+        cfg_path="joystick.json",
+        font=font,
+        width=int(width),
+        height=int(height),
+        joystick=joystick,
+        menu_button=menu_button,
+    )
+
+    handlers["bind_menu_button"] = lambda: ensure_menu_button_binding(
+        cfg_path="joystick.json",
+        font=font,
+        width=int(width),
+        height=int(height),
+        joystick=joystick,
+        force=True,
+    )
+
+    def _bind_menu_key(k: str) -> None:
+        ensure_menu_navigation_bindings(
+            cfg_path="joystick.json",
+            font=font,
+            width=int(width),
+            height=int(height),
+            joystick=joystick,
+            menu_button=menu_button,
+            keys=[str(k)],
+            force=True,
+        )
+
+    handlers["bind_menu_up"] = lambda: _bind_menu_key("up")
+    handlers["bind_menu_down"] = lambda: _bind_menu_key("down")
+    handlers["bind_menu_left"] = lambda: _bind_menu_key("left")
+    handlers["bind_menu_right"] = lambda: _bind_menu_key("right")
+    handlers["bind_menu_confirm"] = lambda: _bind_menu_key("confirm")
+    handlers["bind_menu_back"] = lambda: _bind_menu_key("cancel")
+
+    # Control-set bindings.
+    def _bind_set_axis1d(*, label: str, set_name: str, group: str, key: str) -> None:
+        m = _bind_axis_calibrated(label, joystick=joystick, threshold=0.85)
+        if isinstance(m, dict):
+            _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+
+    def _bind_set_axis2d(*, label: str, set_name: str, group: str, key: str) -> None:
+        m = _bind_axis_calibrated(label, joystick=joystick, threshold=0.85)
+        if not isinstance(m, dict):
+            return
+        if str(m.get("type", "")) == "axis2d":
+            out = m
+        else:
+            out = {
+                "type": "axis2d",
+                "x": {"axis": int(m.get("axis", -1)), "calib": dict(m.get("calib", {}) if isinstance(m.get("calib", {}), dict) else {})},
+                "y": {"axis": -1, "calib": {"min": 0.0, "max": 0.0}},
+            }
+        _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=out)
+
+    def _bind_set_buttonish(*, label: str, set_name: str, group: str, key: str) -> None:
+        m = _bind_buttonish(label, joystick=joystick)
+        if isinstance(m, dict):
+            _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+
+    def _bind_set_trigger(*, label: str, set_name: str, key: str) -> None:
         m = _bind_trigger_mapping(label, joystick=joystick, delta_threshold=0.30, wake_deadzone=0.05)
         if isinstance(m, dict) and isinstance(m.get("axis"), int) and isinstance(m.get("sign"), int):
-            cfg = load_or_create_joystick_config("joystick.json")
-            if not isinstance(cfg.get("flight_controls", None), dict):
-                cfg["flight_controls"] = {}
-            fc = cfg["flight_controls"]
-            if not isinstance(fc.get("triggers", None), dict):
-                fc["triggers"] = {}
-            # Store mapping as a dict so gl_animator_geodesic can interpret axis+sign.
-            fc["triggers"][key] = {"axis": int(m["axis"]), "sign": int(m["sign"])}
-            save_joystick_config(cfg, "joystick.json")
+            _write_set_trigger_mapping(set_name=str(set_name), key=str(key), mapping=m)
 
-    handlers["bind_throttle_fwd"] = lambda: _bind_throttle(label="throttle fwd", key="forward_axis")
-    handlers["bind_throttle_rev"] = lambda: _bind_throttle(label="throttle rev", key="reverse_axis")
-
-    def _write_fire_mapping(*, key: str, mapping: dict[str, int]) -> None:
-        cfg = load_or_create_joystick_config("joystick.json")
-        if not isinstance(cfg.get("flight_controls", None), dict):
-            cfg["flight_controls"] = {}
-        fc = cfg["flight_controls"]
-        if not isinstance(fc.get("weapons", None), dict):
-            fc["weapons"] = {}
-        fcw = fc["weapons"]
-        mtype = str(mapping.get("type", ""))
-        if mtype == "button" and isinstance(mapping.get("button"), int):
-            fcw[str(key)] = {"type": "button", "button": int(mapping["button"])}
-        elif (
-            mtype == "hat"
-            and isinstance(mapping.get("hat"), int)
-            and isinstance(mapping.get("x"), int)
-            and isinstance(mapping.get("y"), int)
-        ):
-            fcw[str(key)] = {"type": "hat", "hat": int(mapping["hat"]), "x": int(mapping["x"]), "y": int(mapping["y"])}
-        elif mtype == "axis" and isinstance(mapping.get("axis"), int) and int(mapping.get("sign", 0)) in (-1, 1):
-            fcw[str(key)] = {"type": "axis", "axis": int(mapping["axis"]), "sign": int(mapping["sign"])}
-        save_joystick_config(cfg, "joystick.json")
-
-    def _bind_fire(*, label: str, key: str) -> None:
+    def _bind_set_firelike(*, label: str, set_name: str, group: str, key: str) -> None:
         m = _bind_fire_mapping(str(label), joystick=joystick, delta_threshold=0.30)
         if isinstance(m, dict):
-            _write_fire_mapping(key=str(key), mapping=m)
+            _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
 
-    handlers["bind_fire_1"] = lambda: _bind_fire(label="fire 1", key="fire_1")
-    handlers["bind_fire_2"] = lambda: _bind_fire(label="fire 2", key="fire_2")
+    def _install_set_handlers(prefix: str, set_name: str) -> None:
+        # Craft surfaces.
+        handlers[f"bind_set_{prefix}_craft_ailerons"] = lambda: _bind_set_axis1d(label=f"{prefix} craft ailerons", set_name=set_name, group="craft", key="ailerons")
+        handlers[f"bind_set_{prefix}_craft_rudder"] = lambda: _bind_set_axis1d(label=f"{prefix} craft rudder", set_name=set_name, group="craft", key="rudder")
+        handlers[f"bind_set_{prefix}_craft_elevators"] = lambda: _bind_set_axis1d(label=f"{prefix} craft elevators", set_name=set_name, group="craft", key="elevators")
 
-    def _write_camera_mapping(*, key: str, mapping: dict[str, int]) -> None:
-        cfg = load_or_create_joystick_config("joystick.json")
-        if not isinstance(cfg.get("flight_controls", None), dict):
-            cfg["flight_controls"] = {}
-        fc = cfg["flight_controls"]
-        if not isinstance(fc.get("camera", None), dict):
-            fc["camera"] = {}
-        cam = fc["camera"]
+        # Flaps.
+        handlers[f"bind_set_{prefix}_flaps_up"] = lambda: _bind_set_buttonish(label=f"{prefix} flaps up", set_name=set_name, group="flaps", key="up")
+        handlers[f"bind_set_{prefix}_flaps_down"] = lambda: _bind_set_buttonish(label=f"{prefix} flaps down", set_name=set_name, group="flaps", key="down")
 
-        mtype = str(mapping.get("type", ""))
-        if mtype == "button" and isinstance(mapping.get("button"), int):
-            cam[str(key)] = {"type": "button", "button": int(mapping["button"])}
-        elif (
-            mtype == "hat"
-            and isinstance(mapping.get("hat"), int)
-            and isinstance(mapping.get("x"), int)
-            and isinstance(mapping.get("y"), int)
-        ):
-            cam[str(key)] = {"type": "hat", "hat": int(mapping["hat"]), "x": int(mapping["x"]), "y": int(mapping["y"])}
-        elif mtype == "axis" and isinstance(mapping.get("axis"), int) and int(mapping.get("sign", 0)) in (-1, 1):
-            cam[str(key)] = {"type": "axis", "axis": int(mapping["axis"]), "sign": int(mapping["sign"])}
-        save_joystick_config(cfg, "joystick.json")
+        # Throttle triggers.
+        handlers[f"bind_set_{prefix}_throttle_fwd"] = lambda: _bind_set_trigger(label=f"{prefix} throttle fwd", set_name=set_name, key="forward_axis")
+        handlers[f"bind_set_{prefix}_throttle_rev"] = lambda: _bind_set_trigger(label=f"{prefix} throttle rev", set_name=set_name, key="reverse_axis")
 
-    def _bind_camera_zoom(*, label: str, key: str) -> None:
-        m = _bind_fire_mapping(str(label), joystick=joystick, delta_threshold=0.30)
-        if isinstance(m, dict):
-            _write_camera_mapping(key=str(key), mapping=m)
+        # Look + reticle look.
+        handlers[f"bind_set_{prefix}_look_2d"] = lambda: _bind_set_axis2d(label=f"{prefix} look", set_name=set_name, group="look", key="axis2d")
+        handlers[f"bind_set_{prefix}_reticle_look_2d"] = lambda: _bind_set_axis2d(label=f"{prefix} reticle look", set_name=set_name, group="reticle_look", key="axis2d")
 
-    handlers["bind_camera_zoom_in"] = lambda: _bind_camera_zoom(label="camera zoom in", key="zoom_in")
-    handlers["bind_camera_zoom_out"] = lambda: _bind_camera_zoom(label="camera zoom out", key="zoom_out")
+        # Weapons.
+        handlers[f"bind_set_{prefix}_fire_1"] = lambda: _bind_set_firelike(label=f"{prefix} fire 1", set_name=set_name, group="weapons", key="fire_1")
+        handlers[f"bind_set_{prefix}_fire_2"] = lambda: _bind_set_firelike(label=f"{prefix} fire 2", set_name=set_name, group="weapons", key="fire_2")
 
-    def _write_hud_mapping(*, key: str, mapping: dict[str, int]) -> None:
-        cfg = load_or_create_joystick_config("joystick.json")
-        if not isinstance(cfg.get("flight_controls", None), dict):
-            cfg["flight_controls"] = {}
-        fc = cfg["flight_controls"]
-        if not isinstance(fc.get("hud", None), dict):
-            fc["hud"] = {}
-        hud = fc["hud"]
+        # Camera.
+        handlers[f"bind_set_{prefix}_camera_zoom_in"] = lambda: _bind_set_firelike(label=f"{prefix} camera zoom in", set_name=set_name, group="camera", key="zoom_in")
+        handlers[f"bind_set_{prefix}_camera_zoom_out"] = lambda: _bind_set_firelike(label=f"{prefix} camera zoom out", set_name=set_name, group="camera", key="zoom_out")
 
-        mtype = str(mapping.get("type", ""))
-        if mtype == "button" and isinstance(mapping.get("button"), int):
-            hud[str(key)] = {"type": "button", "button": int(mapping["button"])}
-        elif (
-            mtype == "hat"
-            and isinstance(mapping.get("hat"), int)
-            and isinstance(mapping.get("x"), int)
-            and isinstance(mapping.get("y"), int)
-        ):
-            hud[str(key)] = {"type": "hat", "hat": int(mapping["hat"]), "x": int(mapping["x"]), "y": int(mapping["y"])}
-        elif mtype == "axis" and isinstance(mapping.get("axis"), int) and int(mapping.get("sign", 0)) in (-1, 1):
-            hud[str(key)] = {"type": "axis", "axis": int(mapping["axis"]), "sign": int(mapping["sign"])}
-        save_joystick_config(cfg, "joystick.json")
+        # HUD.
+        handlers[f"bind_set_{prefix}_debug_hud_toggle"] = lambda: _bind_set_firelike(label=f"{prefix} debug hud toggle", set_name=set_name, group="hud", key="toggle")
 
-    def _bind_debug_hud_toggle(*, label: str, key: str) -> None:
-        m = _bind_fire_mapping(str(label), joystick=joystick, delta_threshold=0.30)
-        if isinstance(m, dict):
-            _write_hud_mapping(key=str(key), mapping=m)
+    _install_set_handlers("flight", "flight")
+    _install_set_handlers("view_targeting", "view_targeting")
+    _install_set_handlers("bomber", "bomber")
+    _install_set_handlers("fighter", "fighter")
 
-    handlers["bind_debug_hud_toggle"] = lambda: _bind_debug_hud_toggle(label="debug hud toggle", key="toggle")
+    # Note: legacy global weapon/camera/hud/throttle handlers removed from the menu,
+    # but older configs are still read as fallback by the runtime.
 
     return _run_menu_from_json(spec_path=MENU_SPEC_PATH, start_node="main", action_handlers=handlers)
 

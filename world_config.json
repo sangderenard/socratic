@@ -8,5 +8,8 @@
     "max_speed": 0.009999999999999993,
     "render_scale": 75.75,
     "temp": 64.55000000000202
+  },
+  "world_env": {
+    "render_scale": 75.75
   }
 }

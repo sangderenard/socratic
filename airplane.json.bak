@@ -12,134 +12,116 @@
     ]
   },
   "airplane_tuning": {
-    "control_mode": 1,
-    "flight_debug_print": 1,
-    "weapon_debug_print": 0,
-    "los_probe_mode": 2,
-    "auto_kp": 6.0,
+    "att_arm_x": 3.0,
+    "att_arm_z": 3.0,
+    "att_max_force": 0.019999999552965164,
     "auto_kd": 2.5,
-    "use_thrust_center_arm": 0,
-    "use_drag_center_arm": 0,
-    "thrust_center_x": 0.0,
-    "thrust_center_y": 0.0,
-    "thrust_center_z": -2.0,
+    "auto_kp": 6.0,
+    "control_mode": 1,
+    "drag_center_k": 0.0,
     "drag_center_x": 0.0,
     "drag_center_y": 0.0,
     "drag_center_z": 1.0,
-    "drag_center_k": 0.0,
+    "flight_debug_print": 1,
+    "los_probe_mode": 2,
+    "thrust_center_x": 0.0,
+    "thrust_center_y": 0.0,
+    "thrust_center_z": -2.0,
+    "use_drag_center_arm": 0,
     "use_generated_attitude_arms": 0,
-    "att_arm_x": 3.0,
-    "att_arm_z": 3.0,
-    "att_max_force": 0.019999999552965164
+    "use_thrust_center_arm": 0,
+    "weapon_debug_print": 0
   },
   "arms": [
     {
-      "axis_b": [
+      "dir_b": [
         0,
         1,
         0
       ],
       "input_idx": 2,
-      "k_drag": 0.05,
-      "k_lift": 2.5,
+      "max_force": 0.02,
       "pos_b": [
         0,
         0,
         -3
       ],
-      "type": "aero_surface"
+      "type": "thruster"
     },
     {
-      "axis_b": [
+      "dir_b": [
+        0,
+        -1,
+        0
+      ],
+      "input_idx": 2,
+      "max_force": 0.02,
+      "pos_b": [
+        0,
+        0,
+        3
+      ],
+      "type": "thruster"
+    },
+    {
+      "dir_b": [
+        -1,
+        0,
+        0
+      ],
+      "input_idx": 3,
+      "max_force": 0.02,
+      "pos_b": [
+        0,
+        0,
+        -3
+      ],
+      "type": "thruster"
+    },
+    {
+      "dir_b": [
         1,
         0,
         0
       ],
       "input_idx": 3,
-      "k_drag": 0.05,
-      "k_lift": 2.0,
+      "max_force": 0.02,
       "pos_b": [
         0,
         0,
-        -3
+        3
       ],
-      "type": "aero_surface"
+      "type": "thruster"
     },
     {
-      "axis_b": [
+      "dir_b": [
         0,
         1,
         0
       ],
       "input_idx": 4,
-      "k_drag": 0.05,
-      "k_lift": 2.0,
+      "max_force": 0.02,
       "pos_b": [
         3,
         0,
         0
       ],
-      "type": "aero_surface"
+      "type": "thruster"
     },
     {
-      "axis_b": [
+      "dir_b": [
         0,
         -1,
         0
       ],
       "input_idx": 4,
-      "k_drag": 0.05,
-      "k_lift": 2.0,
+      "max_force": 0.02,
       "pos_b": [
         -3,
         0,
         0
       ],
-      "type": "aero_surface"
-    },
-    {
-      "k_drag": 0.08,
-      "pos_b": [
-        0,
-        0,
-        1
-      ],
-      "type": "drag_center"
-    },
-    {
-      "axis_b": [
-        0,
-        1,
-        0
-      ],
-      "input_idx": 5,
-      "k_drag": 0.18,
-      "k_lift": 1.6,
-      "pos_b": [
-        3,
-        0,
-        -1
-      ],
-      "type": "aero_surface"
-    },
-    {
-      "axis_b": [
-        0,
-        1,
-        0
-      ],
-      "input_idx": 5,
-      "k_drag": 0.18,
-      "k_lift": 1.6,
-      "pos_b": [
-        -3,
-        0,
-        -1
-      ],
-      "type": "aero_surface"
-    },
-    {
-      "type": "none"
+      "type": "thruster"
     }
   ],
   "axes": {
@@ -202,16 +184,16 @@
   },
   "name": "default",
   "rates": {
-    "craft_pitch_rate": 1.2,
-    "craft_yaw_rate": 1.6,
+    "craft_pitch_rate": 0.12,
+    "craft_yaw_rate": 0.16,
     "view_pitch_rate": 0.11,
     "view_yaw_rate": 0.125
   },
   "rigid_body": {
     "inertia_diag": [
-      5.0,
-      5.0,
-      5.0
+      200.0,
+      200.0,
+      200.0
     ],
     "mass": 1.0
   },

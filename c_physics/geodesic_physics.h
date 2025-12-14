@@ -15,6 +15,215 @@
 extern "C" {
 #endif
 
+// ---------------- Flight integrator ABI (prototype) ----------------
+// Minimal vector integrator: integrates pos/vel given basis vectors and params.
+
+#pragma pack(push, 1)
+typedef struct GP_FlightIn {
+  float dt;
+  float pos[3];
+  float vel[3];
+  float right_b[3];
+  float up_b[3];
+  float fwd_b[3];
+  float up_rad[3];
+  float throttle;  // [-1..1]
+  float strafe;    // [-1..1]
+  float thrust_accel;
+  float strafe_accel;
+  float lift_k;
+  float drag_k;
+  float gravity_g;
+  float max_speed;
+  float rho;       // [0..1] atmosphere density ratio
+} GP_FlightIn;
+
+typedef struct GP_FlightOut {
+  float pos[3];
+  float vel[3];
+} GP_FlightOut;
+
+#pragma pack(pop)
+
+GP_EXPORT int gp_flight_step(const GP_FlightIn* in, GP_FlightOut* out);
+
+// ---------------- Flight simulator buffer ABI (threaded) ----------------
+// Packed shared buffer protocol intended to be stepped from a dedicated thread.
+//
+// Reader/writer swap protocol mirrors GP_Header (node physics):
+// - Reader reads from front_idx.
+// - Writer simulates in sim_idx (kept != front_idx).
+// - Reader sets swap_requested.
+// - Writer publishes at step boundary by swapping front_idx to sim_idx and copying
+//   state once so the writer continues in the other buffer.
+
+#define GP_FLIGHT_MAGIC 0x544C4647u  // 'GFLT'
+
+#pragma pack(push, 1)
+typedef struct GP_FlightBufHeader {
+  uint32_t magic;      // GP_FLIGHT_MAGIC
+  uint32_t version;    // 4
+  volatile uint32_t front_idx;      // 0 or 1 (read buffer)
+  volatile uint32_t sim_idx;        // 0 or 1 (writer buffer)
+  volatile uint32_t swap_requested; // set by reader, cleared by writer
+  volatile uint32_t swap_seq;       // increments when writer completes a swap
+  volatile uint32_t controls_seq;   // increments each time controls are written
+  uint32_t _pad0;
+} GP_FlightBufHeader;
+
+typedef struct GP_FlightConfig {
+  float planet_surface_r;
+  float flight_r_min;
+  float flight_r_max;
+  float atmosphere_alt_max; // >0 => falloff to 0 by alt_max; 0 => vacuum (rho=0); <0 => uniform (rho=1)
+
+  // Rigid-body parameters (body frame)
+  float mass;               // <=0 treated as 1
+  float inertia_diag[3];    // principal moments (Ix, Iy, Iz), <=0 treated as 1
+
+  // Optional terrain heightmap (equirectangular lon/lat, grayscale in [0..1]).
+  // r_surface(dir) = planet_surface_r + (h(dir) - terrain_height_bias) * terrain_height_scale
+  uintptr_t terrain_hm_ptr;   // float32[hm_h][hm_w]
+  uint32_t terrain_hm_w;
+  uint32_t terrain_hm_h;
+  uint32_t terrain_hm_stride; // elements per row
+  float terrain_height_scale;
+  float terrain_height_bias;
+} GP_FlightConfig;
+
+// Flight "lever arm" definitions.
+// The solver treats these as force generators applied at points in body space.
+// All vectors are in body coordinates.
+typedef struct GP_FlightArm {
+  uint32_t type;       // 0=disabled, 1=thruster, 2=aero_surface, 3=drag_center
+  uint32_t input_idx;  // which control channel drives this arm (meaning depends on type)
+  uint32_t flags;      // reserved
+  uint32_t _pad0;
+
+  float pos_b[3];      // application point relative to body origin (COM) in body coords
+  float dir_b[3];      // nominal force direction (+) in body coords (thruster)
+  float axis_b[3];     // aero axis/normal in body coords (aero_surface)
+
+  float max_force;     // thruster max force (units of accel*mass)
+  float k_lift;        // aero lift coefficient (scaled by rho*v^2)
+  float k_drag;        // aero drag coefficient (scaled by rho*v^2)
+
+  // Thruster efficiency model (optional, only used when type==thruster).
+  // Efficiency scales the applied force magnitude by:
+  //   eff = rho^eff_rho_pow * 1/(1 + (airspeed/eff_speed_ref)^eff_speed_pow) * temp_eff
+  // with temp_eff linearly falling from 1->0 between temp_overheat_start..temp_overheat_end.
+  // Setting these to 0 keeps default behavior (eff=1).
+  float eff_rho_pow;         // >=0; 0 disables rho scaling
+  float eff_speed_ref;       // >0 enables speed scaling
+  float eff_speed_pow;       // >=0; 0 disables speed scaling
+  float temp_heat_rate;      // >=0; temp += dt * temp_heat_rate * |input|
+  float temp_cool_rate;      // >=0; temp -= dt * temp_cool_rate * temp
+  float temp_overheat_start; // if end>start and temp>start, reduce eff
+  float temp_overheat_end;
+} GP_FlightArm;
+
+#define GP_FLIGHT_ARM_CAP 32u
+
+typedef struct GP_FlightControls {
+  // Inputs
+  float throttle;  // [-1..1]
+  float strafe;    // [-1..1]
+
+  // Requested craft orientation as quaternion (world space), q=[w,x,y,z].
+  // The simulator may clamp toward this based on max_ang_rate.
+  float desired_q[4];
+  float max_ang_rate; // rad/s, <=0 disables clamping (snap to desired)
+
+  // Control mode:
+  // - 0: manual (channels are direct actuator intentions; desired_q is ignored)
+  // - 1: auto (desired_q is the goal; sim computes channel activations)
+  uint32_t mode;
+  uint32_t _pad_mode;
+
+  // Auto-control gains (PD in body frame). Only used when mode=1.
+  float auto_kp;
+  float auto_kd;
+
+  // Optional raw control channels for arm inputs.
+  // These are interpreted by arms via input_idx.
+  float channels[8];  // [-1..1]
+
+  // Flight dynamics params (can change at runtime via airplane.json).
+  float thrust_accel;
+  float strafe_accel;
+  float lift_k;
+  float drag_k;
+  float gravity_g;
+  float max_speed;
+
+  uint32_t flags;  // bit0: desired_q valid
+  uint32_t _pad0;
+} GP_FlightControls;
+
+typedef struct GP_FlightControlSystem {
+  uint32_t mode;   // 0 manual, 1 auto
+  uint32_t flags;  // bit0: solved this tick
+  uint32_t _pad0;
+  uint32_t _pad1;
+
+  float desired_q[4];
+  float err_axis_b[3];
+  float err_angle;
+
+  float tau_des_b[3];
+  float tau_est_b[3];
+  float _pad2[2];
+
+  float channel_cmd[8];
+} GP_FlightControlSystem;
+
+typedef struct GP_FlightState {
+  float pos[3];
+  float vel[3];
+  float q[4]; // achieved orientation q=[w,x,y,z]
+
+  // Angular velocity in body frame (rad/s).
+  float omega_b[3];
+  float _pad_omega;
+
+  // Derived metrics (for HUD/telemetry/debug)
+  float rho;
+  float altitude;
+  float r_surface;
+  float _pad0;
+
+  float last_requested_ang;    // radians
+  float last_applied_ang;      // radians
+  float last_ang_clamp_ratio;  // applied/requested (0..1)
+  float _pad1;
+
+  // Per-arm thruster telemetry/state (indexed by arm slot).
+  // Only meaningful for thruster arms; other types are 0.
+  float arm_temp[GP_FLIGHT_ARM_CAP];
+  float arm_eff[GP_FLIGHT_ARM_CAP];
+
+  GP_FlightControlSystem ctrl;
+} GP_FlightState;
+
+typedef struct GP_FlightBuffer {
+  GP_FlightBufHeader hdr;
+  GP_FlightConfig cfg;
+  GP_FlightControls ctl;
+  uint32_t arm_count;
+  uint32_t _pad_arm0;
+  uint32_t _pad_arm1;
+  uint32_t _pad_arm2;
+  GP_FlightArm arms[GP_FLIGHT_ARM_CAP];
+  GP_FlightState state[2];
+} GP_FlightBuffer;
+#pragma pack(pop)
+
+GP_EXPORT size_t gp_flight_required_bytes(void);
+GP_EXPORT int gp_flight_init(void* mem);
+GP_EXPORT void gp_flight_request_swap(void* mem);
+GP_EXPORT uint32_t gp_flight_get_swap_seq(void* mem);
+GP_EXPORT void gp_flight_buf_step(void* mem, float dt, uint32_t steps);
+
 #pragma pack(push, 1)
 typedef struct GP_Header {
     uint32_t magic;        // 'GPPH' = 0x48505047

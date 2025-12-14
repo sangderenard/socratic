@@ -4,26 +4,143 @@
     "main": {
       "title": "MAIN MENU",
       "items": [
-        { "label": "LOADOUT", "edit_struct": { "id": "weapon_loadout", "persist_path": "weapon_loadout.json", "persist_key": "weapon_loadout", "title": "LOADOUT" } },
+        { "label": "CRAFT", "submenu": "craft" },
+        { "label": "PHYSICS", "submenu": "physics" },
         { "label": "CONTROLS", "submenu": "controls" },
-        { "label": "WORLD CONFIG", "edit_struct": { "id": "world_config", "persist_path": "world_config.json", "persist_key": "world_config", "title": "WORLD CONFIG" } },
         { "label": "START", "action": "start" }
+      ]
+    },
+    "craft": {
+      "title": "CRAFT",
+      "items": [
+        { "label": "CRAFT CONFIG", "edit_struct": { "id": "airplane_tuning", "persist_path": "airplane.json", "persist_key": "airplane_tuning", "title": "CRAFT" } },
+        { "label": "LOADOUT", "edit_struct": { "id": "weapon_loadout", "persist_path": "weapon_loadout.json", "persist_key": "weapon_loadout", "title": "LOADOUT" } },
+        { "label": "BACK", "action": "back" }
+      ]
+    },
+    "physics": {
+      "title": "PHYSICS",
+      "items": [
+        { "label": "FLIGHT", "edit_struct": { "id": "flight_physics", "persist_path": "flight_physics.json", "persist_key": "flight_physics", "title": "FLIGHT" } },
+        { "label": "BALLISTICS", "edit_struct": { "id": "ballistics", "persist_path": "ballistics.json", "persist_key": "ballistics", "title": "BALLISTICS" } },
+        { "label": "WORLD", "edit_struct": { "id": "world_env", "persist_path": "world_config.json", "persist_key": "world_env", "title": "WORLD" } },
+        { "label": "PARTICLE", "edit_struct": { "id": "particle_config", "persist_path": "particle_config.json", "persist_key": "particle_config", "title": "PARTICLE" } },
+        { "label": "BACK", "action": "back" }
       ]
     },
     "controls": {
       "title": "CONTROLS",
       "items": [
-        { "label": "BIND RUDDER", "action": "bind_rudder" },
-        { "label": "BIND ELEVATOR", "action": "bind_elevator" },
-        { "label": "BIND VIEW YAW", "action": "bind_view_yaw" },
-        { "label": "BIND VIEW PITCH", "action": "bind_view_pitch" },
-        { "label": "BIND CAMERA ZOOM IN", "action": "bind_camera_zoom_in" },
-        { "label": "BIND CAMERA ZOOM OUT", "action": "bind_camera_zoom_out" },
-        { "label": "BIND DEBUG HUD TOGGLE", "action": "bind_debug_hud_toggle" },
-        { "label": "BIND FIRE 1", "action": "bind_fire_1" },
-        { "label": "BIND FIRE 2", "action": "bind_fire_2" },
-        { "label": "BIND THROTTLE FWD", "action": "bind_throttle_fwd" },
-        { "label": "BIND THROTTLE REV", "action": "bind_throttle_rev" },
+        { "label": "CONTROLLER / SIGNALS / CHANNELS", "submenu": "controls_controller" },
+        { "label": "MENUS", "submenu": "controls_menus" },
+        { "label": "FLIGHT", "submenu": "controls_flight" },
+        { "label": "VIEW / TARGETING", "submenu": "controls_view_targeting" },
+        { "label": "BOMBER", "submenu": "controls_bomber" },
+        { "label": "FIGHTER", "submenu": "controls_fighter" },
+        { "label": "BACK", "action": "back" }
+      ]
+    },
+    "controls_controller": {
+      "title": "CONTROLLER / SIGNALS / CHANNELS",
+      "items": [
+        { "label": "JOYSTICK STATUS", "action": "controller_status" },
+        { "label": "DISCOVER FEATURE", "action": "controller_discover_feature" },
+        { "label": "CREATE SIGNAL", "action": "controller_create_signal" },
+        { "label": "MAP CHANNEL", "action": "controller_map_channel" },
+        { "label": "BACK", "action": "back" }
+      ]
+    },
+    "controls_menus": {
+      "title": "MENUS",
+      "items": [
+        { "label": "BIND MENU BUTTON", "action": "bind_menu_button" },
+        { "label": "BIND MENU UP", "action": "bind_menu_up" },
+        { "label": "BIND MENU DOWN", "action": "bind_menu_down" },
+        { "label": "BIND MENU LEFT", "action": "bind_menu_left" },
+        { "label": "BIND MENU RIGHT", "action": "bind_menu_right" },
+        { "label": "BIND MENU CONFIRM", "action": "bind_menu_confirm" },
+        { "label": "BIND MENU BACK", "action": "bind_menu_back" },
+        { "label": "BIND MENU NAVIGATION", "action": "bind_menu_navigation" },
+        { "label": "BACK", "action": "back" }
+      ]
+    },
+    "controls_flight": {
+      "title": "FLIGHT",
+      "items": [
+        { "label": "BIND CRAFT AILERONS", "action": "bind_set_flight_craft_ailerons" },
+        { "label": "BIND CRAFT RUDDER", "action": "bind_set_flight_craft_rudder" },
+        { "label": "BIND CRAFT ELEVATORS", "action": "bind_set_flight_craft_elevators" },
+        { "label": "BIND FLAPS UP", "action": "bind_set_flight_flaps_up" },
+        { "label": "BIND FLAPS DOWN", "action": "bind_set_flight_flaps_down" },
+        { "label": "BIND THROTTLE FWD", "action": "bind_set_flight_throttle_fwd" },
+        { "label": "BIND THROTTLE REV", "action": "bind_set_flight_throttle_rev" },
+        { "label": "BIND LOOK (2D)", "action": "bind_set_flight_look_2d" },
+        { "label": "BIND RETICLE LOOK (2D)", "action": "bind_set_flight_reticle_look_2d" },
+        { "label": "BIND FIRE 1", "action": "bind_set_flight_fire_1" },
+        { "label": "BIND FIRE 2", "action": "bind_set_flight_fire_2" },
+        { "label": "BIND CAMERA ZOOM IN", "action": "bind_set_flight_camera_zoom_in" },
+        { "label": "BIND CAMERA ZOOM OUT", "action": "bind_set_flight_camera_zoom_out" },
+        { "label": "BIND DEBUG HUD TOGGLE", "action": "bind_set_flight_debug_hud_toggle" },
+        { "label": "BACK", "action": "back" }
+      ]
+    },
+    "controls_view_targeting": {
+      "title": "VIEW / TARGETING",
+      "items": [
+        { "label": "BIND CRAFT AILERONS", "action": "bind_set_view_targeting_craft_ailerons" },
+        { "label": "BIND CRAFT RUDDER", "action": "bind_set_view_targeting_craft_rudder" },
+        { "label": "BIND CRAFT ELEVATORS", "action": "bind_set_view_targeting_craft_elevators" },
+        { "label": "BIND FLAPS UP", "action": "bind_set_view_targeting_flaps_up" },
+        { "label": "BIND FLAPS DOWN", "action": "bind_set_view_targeting_flaps_down" },
+        { "label": "BIND THROTTLE FWD", "action": "bind_set_view_targeting_throttle_fwd" },
+        { "label": "BIND THROTTLE REV", "action": "bind_set_view_targeting_throttle_rev" },
+        { "label": "BIND LOOK (2D)", "action": "bind_set_view_targeting_look_2d" },
+        { "label": "BIND RETICLE LOOK (2D)", "action": "bind_set_view_targeting_reticle_look_2d" },
+        { "label": "BIND FIRE 1", "action": "bind_set_view_targeting_fire_1" },
+        { "label": "BIND FIRE 2", "action": "bind_set_view_targeting_fire_2" },
+        { "label": "BIND CAMERA ZOOM IN", "action": "bind_set_view_targeting_camera_zoom_in" },
+        { "label": "BIND CAMERA ZOOM OUT", "action": "bind_set_view_targeting_camera_zoom_out" },
+        { "label": "BIND DEBUG HUD TOGGLE", "action": "bind_set_view_targeting_debug_hud_toggle" },
+        { "label": "BACK", "action": "back" }
+      ]
+    },
+    "controls_bomber": {
+      "title": "BOMBER",
+      "items": [
+        { "label": "BIND CRAFT AILERONS", "action": "bind_set_bomber_craft_ailerons" },
+        { "label": "BIND CRAFT RUDDER", "action": "bind_set_bomber_craft_rudder" },
+        { "label": "BIND CRAFT ELEVATORS", "action": "bind_set_bomber_craft_elevators" },
+        { "label": "BIND FLAPS UP", "action": "bind_set_bomber_flaps_up" },
+        { "label": "BIND FLAPS DOWN", "action": "bind_set_bomber_flaps_down" },
+        { "label": "BIND THROTTLE FWD", "action": "bind_set_bomber_throttle_fwd" },
+        { "label": "BIND THROTTLE REV", "action": "bind_set_bomber_throttle_rev" },
+        { "label": "BIND LOOK (2D)", "action": "bind_set_bomber_look_2d" },
+        { "label": "BIND RETICLE LOOK (2D)", "action": "bind_set_bomber_reticle_look_2d" },
+        { "label": "BIND FIRE 1", "action": "bind_set_bomber_fire_1" },
+        { "label": "BIND FIRE 2", "action": "bind_set_bomber_fire_2" },
+        { "label": "BIND CAMERA ZOOM IN", "action": "bind_set_bomber_camera_zoom_in" },
+        { "label": "BIND CAMERA ZOOM OUT", "action": "bind_set_bomber_camera_zoom_out" },
+        { "label": "BIND DEBUG HUD TOGGLE", "action": "bind_set_bomber_debug_hud_toggle" },
+        { "label": "BACK", "action": "back" }
+      ]
+    },
+    "controls_fighter": {
+      "title": "FIGHTER",
+      "items": [
+        { "label": "BIND CRAFT AILERONS", "action": "bind_set_fighter_craft_ailerons" },
+        { "label": "BIND CRAFT RUDDER", "action": "bind_set_fighter_craft_rudder" },
+        { "label": "BIND CRAFT ELEVATORS", "action": "bind_set_fighter_craft_elevators" },
+        { "label": "BIND FLAPS UP", "action": "bind_set_fighter_flaps_up" },
+        { "label": "BIND FLAPS DOWN", "action": "bind_set_fighter_flaps_down" },
+        { "label": "BIND THROTTLE FWD", "action": "bind_set_fighter_throttle_fwd" },
+        { "label": "BIND THROTTLE REV", "action": "bind_set_fighter_throttle_rev" },
+        { "label": "BIND LOOK (2D)", "action": "bind_set_fighter_look_2d" },
+        { "label": "BIND RETICLE LOOK (2D)", "action": "bind_set_fighter_reticle_look_2d" },
+        { "label": "BIND FIRE 1", "action": "bind_set_fighter_fire_1" },
+        { "label": "BIND FIRE 2", "action": "bind_set_fighter_fire_2" },
+        { "label": "BIND CAMERA ZOOM IN", "action": "bind_set_fighter_camera_zoom_in" },
+        { "label": "BIND CAMERA ZOOM OUT", "action": "bind_set_fighter_camera_zoom_out" },
+        { "label": "BIND DEBUG HUD TOGGLE", "action": "bind_set_fighter_debug_hud_toggle" },
         { "label": "BACK", "action": "back" }
       ]
     }

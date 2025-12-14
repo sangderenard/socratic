@@ -27,7 +27,9 @@ class ReticleAssets:
 def _surf_to_rgba_u8(surf: pygame.Surface) -> np.ndarray:
     w, h = surf.get_size()
     raw = pygame.image.tostring(surf, "RGBA", True)
-    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4))
+    # np.frombuffer on bytes produces a read-only array; torch.from_numpy warns
+    # and writes would be undefined behavior. Copy to ensure writable memory.
+    arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, w, 4)).copy()
     return arr
 
 

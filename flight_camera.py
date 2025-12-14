@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+import ctypes
 from dataclasses import dataclass
 
 import numpy as np
+
+from c_physics.flight_runtime import FlightSimRuntime
 
 
 def _safe_norm(v: np.ndarray) -> float:
@@ -158,6 +161,22 @@ class PlanetFlightCamera:
     gravity_g: float = 0.0
     max_speed: float = 0.0
 
+    # Control mode for inertial flight:
+    # - "auto": UI requests desired orientation; sim computes actuator channels.
+    # - "manual": UI inputs are actuator intentions; sim integrates orientation.
+    control_mode: str = "auto"
+
+    # Rigid-body parameters (used by the C solver when arms are configured).
+    mass: float = 1.0
+    inertia_diag: tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+    # Auto-control gains (PD) used by the C sim in auto mode.
+    auto_kp: float = 6.0
+    auto_kd: float = 2.5
+
+    # When enabled, the C flight sim prints rate-limited debug info to stdout.
+    debug_print: bool = False
+
     # Optional atmosphere model for inertial flight.
     # If provided (>0), atmospheric influence decreases with altitude and reaches ~0 at this altitude.
     # This is used to scale drag and the effective max-speed clamp so that:
@@ -196,6 +215,8 @@ class PlanetFlightCamera:
         self._fwd_level_last = np.array([0.0, 0.0, 1.0], dtype=np.float32)
         self._right_last = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         self.pitch = float(-0.25)
+        # Roll about the forward axis (radians). Used in auto mode so ailerons matter.
+        self.roll = float(0.0)
         self.q = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         if self.radius_target is None:
             self.radius_target = float(self.flight_r_min)
@@ -203,6 +224,101 @@ class PlanetFlightCamera:
         self.radius_target = max(float(self.radius_target), float(rmin))
         clamp_radius_band(self.pos, r_min=float(rmin), r_max=float(rmax))
         self._rebuild_attitude()
+
+        # Dedicated C flight simulation runtime (always used for inertial flight).
+        self._flight_rt = FlightSimRuntime(tick_hz=120.0)
+        self._flight_rt.set_config(
+            planet_surface_r=float(self.planet_surface_r),
+            flight_r_min=float(self.flight_r_min),
+            flight_r_max=float(self.flight_r_max),
+            atmosphere_alt_max=float(self.atmosphere_alt_max) if self.atmosphere_alt_max is not None else None,
+            mass=float(self.mass),
+            inertia_diag=tuple(self.inertia_diag),
+            terrain_heightmap=self.terrain_heightmap,
+            terrain_height_scale=float(self.terrain_height_scale),
+            terrain_height_bias=float(self.terrain_height_bias),
+        )
+        self._flight_rt.reset_state(pos=self.pos, vel=self.vel, q=self.q)
+        self._flight_rt.start()
+
+    def shutdown(self) -> None:
+        try:
+            if getattr(self, "_flight_rt", None) is not None:
+                self._flight_rt.stop()
+        except Exception:
+            pass
+
+    def _sync_config_to_sim(self) -> None:
+        # Lightweight: called whenever config may have changed.
+        self._flight_rt.set_config(
+            planet_surface_r=float(self.planet_surface_r),
+            flight_r_min=float(self.flight_r_min),
+            flight_r_max=float(self.flight_r_max),
+            atmosphere_alt_max=float(self.atmosphere_alt_max) if self.atmosphere_alt_max is not None else None,
+            mass=float(self.mass),
+            inertia_diag=tuple(self.inertia_diag),
+            terrain_heightmap=self.terrain_heightmap,
+            terrain_height_scale=float(self.terrain_height_scale),
+            terrain_height_bias=float(self.terrain_height_bias),
+        )
+
+    def configure_control_system(
+        self,
+        *,
+        mode: str | None = None,
+        auto_kp: float | None = None,
+        auto_kd: float | None = None,
+        debug_print: bool | None = None,
+    ) -> None:
+        if mode is not None:
+            self.control_mode = str(mode)
+        if auto_kp is not None:
+            self.auto_kp = float(auto_kp)
+        if auto_kd is not None:
+            self.auto_kd = float(auto_kd)
+        if debug_print is not None:
+            self.debug_print = bool(debug_print)
+
+    def configure_rigid_body(self, *, mass: float | None = None, inertia_diag: tuple[float, float, float] | None = None) -> None:
+        if mass is not None:
+            self.mass = float(mass)
+        if inertia_diag is not None:
+            self.inertia_diag = (float(inertia_diag[0]), float(inertia_diag[1]), float(inertia_diag[2]))
+        try:
+            self._sync_config_to_sim()
+        except Exception:
+            pass
+
+    def configure_arms(self, *, arms: list[dict], scale: float = 1.0) -> None:
+        # `scale` is for unit conversion of arm geometry only.
+        # Do not couple it to planet/world `render_scale`.
+        try:
+            self._flight_rt.set_arms(arms, scale=float(scale))
+        except Exception:
+            pass
+
+    def _sync_state_to_sim(self) -> None:
+        self._flight_rt.reset_state(pos=self.pos, vel=self.vel, q=self.q)
+
+    def _update_from_sim(self) -> None:
+        snap = self._flight_rt.snapshot(request_swap=True)
+        self.pos = snap.pos
+        self.vel = snap.vel
+        self.q = quat_normalize(snap.q)
+        # Keep heading/pitch consistent with the achieved orientation.
+        try:
+            up_rad = self.planet_up()
+            _, _, fwd = self.basis()
+            fwd_t = (fwd - up_rad * float(np.dot(fwd, up_rad))).astype(np.float32, copy=False)
+            fn = _safe_norm(fwd_t)
+            if fn > 1e-6:
+                self.heading_t = (fwd_t / fn).astype(np.float32, copy=False)
+            # pitch = atan2(radial component, tangent component)
+            fwd_n = _safe_normalize(fwd.astype(np.float32, copy=False))
+            tan_mag = float(max(1e-9, _safe_norm(fwd_t)))
+            self.pitch = float(math.atan2(float(np.dot(fwd_n, up_rad)), float(tan_mag)))
+        except Exception:
+            pass
 
     def reset_north_pole(self) -> None:
         self.pos[:] = np.array([0.0, float(self.flight_r_min), 0.0], dtype=np.float32)
@@ -218,6 +334,11 @@ class PlanetFlightCamera:
         self.radius_target = max(float(self.radius_target), float(rmin))
         clamp_radius_band(self.pos, r_min=float(rmin), r_max=float(rmax))
         self._rebuild_attitude()
+        try:
+            self._sync_config_to_sim()
+            self._sync_state_to_sim()
+        except Exception:
+            pass
 
     def default_eye_center(self) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
         r = float(self.flight_r_min)
@@ -235,8 +356,12 @@ class PlanetFlightCamera:
             if alt_max is None:
                 return 1.0
             alt_max_f = float(alt_max)
-            if not np.isfinite(alt_max_f) or alt_max_f <= 1e-9:
+            if not np.isfinite(alt_max_f):
+                return 0.0
+            if alt_max_f < -1e-9:
                 return 1.0
+            if alt_max_f <= 1e-9:
+                return 0.0
             alt = float(self.altitude())
             x = float(max(0.0, min(1.0, alt / alt_max_f)))
             # Simple smooth falloff to 0 at x=1.
@@ -365,6 +490,15 @@ class PlanetFlightCamera:
         up = _safe_normalize(np.cross(fwd, right))
         if _safe_norm(up) <= 1e-6:
             up = up_rad
+
+        # Apply roll about the forward axis.
+        cr = float(math.cos(float(self.roll)))
+        sr = float(math.sin(float(self.roll)))
+        right_r = (right * cr + up * sr).astype(np.float32, copy=False)
+        up_r = _safe_normalize(np.cross(fwd, right_r))
+        if _safe_norm(up_r) > 1e-6:
+            right = _safe_normalize(np.cross(up_r, fwd))
+            up = up_r
         self.q = quat_from_basis(right, up, fwd)
 
     def planet_up(self) -> np.ndarray:
@@ -401,19 +535,27 @@ class PlanetFlightCamera:
         # Build the current local planet frame.
         right, up_rad, fwd_level = self._planet_frame()
 
-        # Ship-relative look: yaw changes heading on the horizon; pitch changes look pitch.
-        if look_x != 0.0:
-            d_yaw = float(self.yaw_rate) * dt_f * float(look_x)
-            self.heading_t = _rotate_vec_axis_angle(self.heading_t, up_rad, d_yaw)
-            # Keep heading strictly tangent to avoid numerical drift that can cause discrete flips.
-            self.heading_t = (self.heading_t - up_rad * float(np.dot(self.heading_t, up_rad))).astype(np.float32, copy=False)
-            self.heading_t = _safe_normalize(self.heading_t)
+        manual = bool(self.inertial) and str(getattr(self, "control_mode", "auto")).lower().startswith("manual")
 
-        if look_y != 0.0:
-            self.pitch += float(self.pitch_rate) * dt_f * float(look_y)
+        # Ship-relative look:
+        # - Auto mode: UI changes desired attitude (heading/pitch) directly.
+        # - Manual mode: UI inputs are actuator intentions; do not directly change heading/pitch.
+        if (not manual):
+            if look_x != 0.0:
+                d_yaw = float(self.yaw_rate) * dt_f * float(look_x)
+                self.heading_t = _rotate_vec_axis_angle(self.heading_t, up_rad, d_yaw)
+                # Keep heading strictly tangent to avoid numerical drift that can cause discrete flips.
+                self.heading_t = (self.heading_t - up_rad * float(np.dot(self.heading_t, up_rad))).astype(np.float32, copy=False)
+                self.heading_t = _safe_normalize(self.heading_t)
 
-        # Roll is intentionally ignored for a steady horizon (renderer up is radial).
-        _ = roll_in
+            if look_y != 0.0:
+                self.pitch += float(self.pitch_rate) * dt_f * float(look_y)
+
+            if roll_in != 0.0:
+                self.roll += float(self.roll_rate) * dt_f * float(roll_in)
+                # Keep bounded.
+                if abs(float(self.roll)) > (math.pi * 8.0):
+                    self.roll = float(math.fmod(float(self.roll), float(2.0 * math.pi)))
 
         # Recompute after look changes.
         right, up_rad, fwd_level = self._planet_frame()
@@ -423,69 +565,71 @@ class PlanetFlightCamera:
             throttle = float(max(-1.0, min(1.0, float(move_y))))
             strafe = float(max(-1.0, min(1.0, float(move_x))))
 
-            # Ensure attitude is current before applying thrust direction.
-            self._rebuild_attitude()
-            right_b, up_b, fwd_b = self.basis()
-            up_rad = self.planet_up()
+            # Desired attitude from UI (auto) or current attitude (manual).
+            if not manual:
+                self._rebuild_attitude()
 
-            a = np.zeros(3, dtype=np.float32)
-            if abs(throttle) > 1e-9 and float(self.thrust_accel) != 0.0:
-                a += fwd_b.astype(np.float32, copy=False) * (float(self.thrust_accel) * throttle)
-            if abs(strafe) > 1e-9 and float(self.strafe_accel) != 0.0:
-                a += right_b.astype(np.float32, copy=False) * (float(self.strafe_accel) * strafe)
+            # Max angular capability for this tick (used by the sim to rate-limit UI desires).
+            max_ang_rate = float(max(abs(float(self.yaw_rate) * float(look_x)), abs(float(self.pitch_rate) * float(look_y))))
+            if not (max_ang_rate > 1e-6):
+                max_ang_rate = float(max(float(self.yaw_rate), float(self.pitch_rate)))
 
-            v = self.vel.astype(np.float32, copy=False)
-            speed = _safe_norm(v)
+            # Channel convention (8):
+            # 0 throttle, 1 strafe, 2 pitch, 3 yaw, 4 roll, 5..7 reserved/rcs
+            channels = [0.0] * 8
+            channels[0] = float(throttle)
+            channels[1] = float(strafe)
+            # 5 is reserved for flaps in this project (if configured in airplane.json arms).
+            try:
+                channels[5] = float(max(-1.0, min(1.0, float(getattr(self, "flaps", 0.0)))))
+            except Exception:
+                channels[5] = 0.0
+            # In manual mode, pitch/yaw/roll are direct actuator intentions.
+            if manual:
+                channels[2] = float(_clamp := max(-1.0, min(1.0, float(look_y))))
+                channels[3] = float(max(-1.0, min(1.0, float(look_x))))
+                channels[4] = float(max(-1.0, min(1.0, float(roll_in))))
 
-            # Atmosphere factor (0..1): scales drag and the effective speed clamp.
-            rho = float(self.atmosphere_ratio())
-            if speed > 1e-6:
-                vhat = (v / float(speed)).astype(np.float32, copy=False)
-                # Lift direction: component of the craft's up axis perpendicular to velocity.
-                lift_dir = (up_b - vhat * float(np.dot(up_b, vhat))).astype(np.float32, copy=False)
-                lift_dir = _safe_normalize(lift_dir)
-                if _safe_norm(lift_dir) > 1e-6 and float(self.lift_k) != 0.0:
-                    a += lift_dir * (float(self.lift_k) * float(speed) * float(speed))
+            # Optional controller graph override (from joystick.json -> flight_controls.controller.channels).
+            # The UI (gl_animator_geodesic) may precompute this each frame and stash it on the camera.
+            try:
+                ov = getattr(self, "controller_channels_override", None)
+                if isinstance(ov, dict):
+                    for k, v in ov.items():
+                        try:
+                            i = int(k)
+                        except Exception:
+                            continue
+                        if 0 <= int(i) < len(channels):
+                            channels[int(i)] = float(max(-1.0, min(1.0, float(v))))
+            except Exception:
+                pass
 
-                # Quadratic drag opposing velocity.
-                if float(self.drag_k) != 0.0 and rho > 0.0:
-                    a += (-vhat) * (float(self.drag_k) * rho * float(speed) * float(speed))
+            try:
+                self._sync_config_to_sim()
+            except Exception:
+                pass
+            self._flight_rt.set_controls(
+                throttle=float(throttle),
+                strafe=float(strafe),
+                desired_q=self.q,
+                max_ang_rate=float(max_ang_rate),
+                mode=("manual" if manual else "auto"),
+                auto_kp=float(getattr(self, "auto_kp", 6.0)),
+                auto_kd=float(getattr(self, "auto_kd", 2.5)),
+                debug_print=bool(getattr(self, "debug_print", False)),
+                channels=channels,
+                thrust_accel=float(self.thrust_accel),
+                strafe_accel=float(self.strafe_accel),
+                lift_k=float(self.lift_k),
+                drag_k=float(self.drag_k),
+                gravity_g=float(self.gravity_g),
+                max_speed=float(self.max_speed),
+            )
 
-            # Simple gravity toward planet center.
-            if float(self.gravity_g) != 0.0:
-                a += (-up_rad) * float(self.gravity_g)
-
-            # Semi-implicit Euler.
-            self.vel = (self.vel + a * dt_f).astype(np.float32, copy=False)
-
-            # Atmosphere-limited max speed: in vacuum (rho ~ 0) this effectively disables
-            # clamping; in atmosphere it enforces a finite speed envelope.
-            ms = float(self.max_speed)
-            if ms > 1e-6:
-                if rho <= 1e-4:
-                    ms_eff = 0.0
-                else:
-                    ms_eff = float(ms / math.sqrt(float(max(1e-6, rho))))
-                if ms_eff > 1e-6:
-                    sp2 = _safe_norm(self.vel)
-                    if sp2 > ms_eff:
-                        self.vel = (self.vel * (ms_eff / float(sp2))).astype(np.float32, copy=False)
-
-            self.pos = (self.pos + self.vel * dt_f).astype(np.float32, copy=False)
-
-            # Constrain to flight radius band; if we hit a boundary, remove radial velocity.
-            r_before = _safe_norm(self.pos)
-            rmin, rmax = self._dynamic_radius_band_at_pos(self.pos)
-            if self.radius_target is not None:
-                self.radius_target = max(float(self.radius_target), float(rmin))
-            clamp_radius_band(self.pos, r_min=float(rmin), r_max=float(rmax))
-            r_after = _safe_norm(self.pos)
-            if abs(float(r_after) - float(r_before)) > 1e-7:
-                up_new = self.planet_up()
-                self.vel = (self.vel - up_new * float(np.dot(self.vel, up_new))).astype(np.float32, copy=False)
-
-            # Update quaternion from the stable heading/pitch.
-            self._rebuild_attitude()
+            # Consume achieved state from the sim (pos/vel/q + metrics) and keep our
+            # heading/pitch consistent with what actually happened.
+            self._update_from_sim()
 
             eye = (float(self.pos[0]), float(self.pos[1]), float(self.pos[2]))
             _, _, fwd = self.basis()
@@ -552,6 +696,31 @@ class PlanetFlightCamera:
 
         # Update quaternion from the stable heading/pitch.
         self._rebuild_attitude()
+
+        # Keep the always-on C flight sim aligned with surface mode so it cannot
+        # drift in the background and later "snap" the craft when inertial is enabled.
+        try:
+            self.vel[:] = 0.0
+        except Exception:
+            pass
+        try:
+            self._sync_config_to_sim()
+            self._sync_state_to_sim()
+            self._flight_rt.set_controls(
+                throttle=0.0,
+                strafe=0.0,
+                desired_q=self.q,
+                max_ang_rate=0.0,
+                debug_print=bool(getattr(self, "debug_print", False)),
+                thrust_accel=0.0,
+                strafe_accel=0.0,
+                lift_k=0.0,
+                drag_k=0.0,
+                gravity_g=0.0,
+                max_speed=0.0,
+            )
+        except Exception:
+            pass
 
         eye = (float(self.pos[0]), float(self.pos[1]), float(self.pos[2]))
         # Look direction follows the camera attitude (heading + pitch).
