@@ -1,0 +1,12 @@
+{
+  "world_config": {
+    "G": 0.05,
+    "bond_shear": 1.6,
+    "damping": 0.0,
+    "k_coulomb": 0.2,
+    "k_spring": 1.0,
+    "max_speed": 0.009999999999999993,
+    "render_scale": 75.75,
+    "temp": 93.60000000000036
+  }
+}

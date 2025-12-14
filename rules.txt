@@ -1,0 +1,28 @@
+# Corpus tokens/rules for corpus physics mode
+# Lines starting with # are ignored. Whitespace-separated tokens allowed per line.
+# Feel free to edit/extend.
+
+gravity
+inertia
+entropy
+charge
+field
+mass
+spring
+anchor
+
+# elementary charges
+E+
+E-
+
+# magnitudes
+1
+10
+100
+
+# traits / labels
+attracts
+repels
+neutral
+stable
+unstable

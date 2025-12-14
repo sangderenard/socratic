@@ -1,0 +1,54 @@
+{
+  "name": "default",
+  "units": "ship-local integer offsets",
+  "axes": {
+    "right": "+x",
+    "up": "+y",
+    "forward": "+z"
+  },
+  "centers": {
+    "mass": [0, 0, 0],
+    "lift": [0, 0, 1],
+    "thrust": [0, 0, -2]
+  },
+  "actuation": {
+    "rudder": [0, 0, -3],
+    "elevator": [0, 0, -3]
+  },
+  "controls": {
+    "deadzone": 0.08,
+    "curve_exp": 2.5,
+    "left_stick": {
+      "rudder_axis": 0,
+      "rudder_invert": true,
+      "elevator_axis": 1,
+      "elevator_invert": false
+    },
+    "right_stick": {
+      "view_yaw_axis": 2,
+      "view_yaw_invert": true,
+      "view_pitch_axis": 3,
+      "view_pitch_invert": true
+    },
+    "triggers": {
+      "reverse_axis": null,
+      "forward_axis": 5
+    }
+  },
+  "rates": {
+    "craft_yaw_rate": 0.16,
+    "craft_pitch_rate": 0.12,
+    "view_yaw_rate": 0.125,
+    "view_pitch_rate": 0.11
+  },
+  "motion": {
+    "inertial": true,
+    "base_speed": 0.038,
+    "thrust_accel": 3.0,
+    "lift_k": 0.55,
+    "drag_k": 0.08,
+    "gravity_g": 0.20,
+    "max_speed": 6.0,
+    "auto_heading_on_move": false
+  }
+}

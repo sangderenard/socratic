@@ -1,0 +1,3 @@
+C:/dev/Powershell/socratic/c_physics/build/CMakeFiles/geodesic_physics.dir
+C:/dev/Powershell/socratic/c_physics/build/CMakeFiles/ALL_BUILD.dir
+C:/dev/Powershell/socratic/c_physics/build/CMakeFiles/ZERO_CHECK.dir

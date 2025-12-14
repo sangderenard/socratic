@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "nodes": {
+    "main": {
+      "title": "MAIN MENU",
+      "items": [
+        { "label": "LOADOUT", "edit_struct": { "id": "weapon_loadout", "persist_path": "weapon_loadout.json", "persist_key": "weapon_loadout", "title": "LOADOUT" } },
+        { "label": "CONTROLS", "submenu": "controls" },
+        { "label": "WORLD CONFIG", "edit_struct": { "id": "world_config", "persist_path": "world_config.json", "persist_key": "world_config", "title": "WORLD CONFIG" } },
+        { "label": "START", "action": "start" }
+      ]
+    },
+    "controls": {
+      "title": "CONTROLS",
+      "items": [
+        { "label": "BIND RUDDER", "action": "bind_rudder" },
+        { "label": "BIND ELEVATOR", "action": "bind_elevator" },
+        { "label": "BIND VIEW YAW", "action": "bind_view_yaw" },
+        { "label": "BIND VIEW PITCH", "action": "bind_view_pitch" },
+        { "label": "BIND CAMERA ZOOM IN", "action": "bind_camera_zoom_in" },
+        { "label": "BIND CAMERA ZOOM OUT", "action": "bind_camera_zoom_out" },
+        { "label": "BIND DEBUG HUD TOGGLE", "action": "bind_debug_hud_toggle" },
+        { "label": "BIND FIRE 1", "action": "bind_fire_1" },
+        { "label": "BIND FIRE 2", "action": "bind_fire_2" },
+        { "label": "BIND THROTTLE FWD", "action": "bind_throttle_fwd" },
+        { "label": "BIND THROTTLE REV", "action": "bind_throttle_rev" },
+        { "label": "BACK", "action": "back" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "weapon_loadout": {
+    "bay_inner": 1,
+    "bay_outer": 1,
+    "left_hp1": 3,
+    "left_hp2": 3,
+    "nose_gun": 2,
+    "right_hp1": 3,
+    "right_hp2": 3,
+    "sourcing_mode": 1,
+    "targeting": 0,
+    "thrust": 0,
+    "type_fire_policy": 0,
+    "weapon1_source": 0,
+    "weapon1_type": 5,
+    "weapon2_source": 0,
+    "weapon2_type": 1
+  }
+}

@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"C:/dev/Powershell/socratic/c_physics/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

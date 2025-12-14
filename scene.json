@@ -1,0 +1,37 @@
+{
+
+  "terrain": { "enabled": true, "planet_enabled": true },
+  "sea": {
+    "enabled": true,
+    "use_heightmap_level": true,
+    "heightmap_level": 0.50,
+    "radius_offset": 0.0,
+    "color": [0.08, 0.26, 0.52],
+    "alpha": 0.55,
+    "depth_write": false
+  },
+  "sun": {
+    "direction": [-0.25, 0.35, 1.0],
+    "color": [1.0, 0.98, 0.92],
+    "intensity": 1.0,
+    "distance": 800.0,
+    "size_px": 160.0
+  },
+  "sky": {
+    "space_color": [0.02, 0.03, 0.06],
+    "atmo_color": [0.32, 0.52, 0.86],
+    "curve": 1.8
+  },
+  "haze": {
+    "fog_k": 0.018,
+    "strength_at_ground": 1.0,
+    "strength_at_top": 0.15
+  },
+  "atmosphere_shell": {
+    "enabled": true,
+    "radius_mult": 1.04,
+    "color": [0.55, 0.75, 1.0],
+    "alpha": 0.28,
+    "power": 2.2
+  }
+}

@@ -1,0 +1,10 @@
+^C:\DEV\POWERSHELL\SOCRATIC\C_PHYSICS\BUILD\CMAKEFILES\A5CCEA826204744FC6FE968CE70FD67F\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/Powershell/socratic/c_physics -BC:/dev/Powershell/socratic/c_physics/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file C:/dev/Powershell/socratic/c_physics/build/geodesic_physics.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

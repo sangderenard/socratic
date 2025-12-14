@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "units": {
+    "mass": "mass_u",
+    "velocity": "vel_u",
+    "ammo": "unit-count",
+    "ammo_mass": "mass_u-per-unit",
+    "notes": "All values are prototype-normalized. Later we can map mass_u/vel_u to SI."
+  },
+  "notes": {
+    "empty_mass": "Mass of the weapon/pod/launcher without ammo (mass_u).",
+    "ammo_mass_per_unit": "Mass per round/missile/bomb/etc. (mass_u-per-unit).",
+    "kinematics.mode": "How the weapon leaves the ship: fall (released, inherits ship velocity), fire (projectile with added muzzle/eject velocity), beam (instant/continuous).",
+    "kinematics.inherit_ship_velocity": "Whether the emitted object inherits ship momentum at the instant of release.",
+    "kinematics.add_velocity": "Supplemental velocity added in the ship's forward axis for fire/fall ejection (vel_u).",
+    "ammo.capacity": "Total ammo units when full; null means unlimited/does not apply.",
+    "fire_modes": "List of tags interpreted by future weapon mechanics (pulsed, sustained, throttled, ramp-up, etc.).",
+    "mechanics_tags": "Extra tags for advanced triggers/sourcing behavior (prototype only; future system will own semantics).",
+    "trigger_behavior": "Optional per-weapon hints for analog trigger behavior (e.g. axis hard-pull ramps ROF).",
+    "heat": "Optional placeholder for heat model parameters; semantics TBD."
+  },
+  "weapon_types": {
+    "bomb": {
+      "display_name": "Bomb",
+      "category": "ordnance",
+      "delivery": "released",
+      "ammo": { "capacity": 4, "unit": "bomb", "ammo_mass_per_unit": 9 },
+      "empty_mass": 4,
+      "kinematics": {
+        "mode": "fall",
+        "inherit_ship_velocity": true,
+        "add_velocity": 1
+      },
+      "sim": {"sim_points": 16, "t_end": 3.0, "beam_len": 0.0, "drop_off": 2.5},
+      "fire_modes": ["released"],
+      "mechanics_tags": ["stores", "gravity"],
+      "trigger_behavior": {"type": "edge"}
+    },
+    "laser": {
+      "display_name": "Laser",
+      "category": "energy",
+      "delivery": "emitter",
+      "ammo": { "capacity": null, "unit": "energy", "ammo_mass_per_unit": 0 },
+      "empty_mass": 3,
+      "kinematics": {
+        "mode": "beam",
+        "inherit_ship_velocity": false,
+        "add_velocity": null
+      },
+      "sim": {"sim_points": 2, "t_end": 0.0, "beam_len": 250.0, "drop_off": 0.0},
+      "fire_modes": ["beam", "pulsed", "sustained", "throttled"],
+      "mechanics_tags": ["heat"],
+      "heat": {"model": "placeholder", "max": 100, "cool_rate": 8, "heat_per_shot": 6, "heat_per_sec": 10},
+      "trigger_behavior": {"type": "held"}
+    },
+    "rocket": {
+      "display_name": "Rocket",
+      "category": "ordnance",
+      "delivery": "launcher",
+      "ammo": { "capacity": 12, "unit": "rocket", "ammo_mass_per_unit": 1 },
+      "empty_mass": 2,
+      "kinematics": {
+        "mode": "fire",
+        "inherit_ship_velocity": true,
+        "add_velocity": 18
+      },
+      "sim": {"sim_points": 16, "t_end": 3.25, "beam_len": 0.0, "drop_off": 0.0},
+      "fire_modes": ["projectile"],
+      "mechanics_tags": ["unguided"],
+      "trigger_behavior": {"type": "edge"}
+    },
+    "machine gun": {
+      "display_name": "Machine Gun",
+      "category": "ballistic",
+      "delivery": "gun",
+      "ammo": { "capacity": 600, "unit": "round", "ammo_mass_per_unit": 0.01 },
+      "empty_mass": 3,
+      "kinematics": {
+        "mode": "fire",
+        "inherit_ship_velocity": true,
+        "add_velocity": 60
+      },
+      "sim": {"sim_points": 16, "t_end": 2.0, "beam_len": 0.0, "drop_off": 0.0},
+      "fire_modes": ["projectile", "rate_ramp"],
+      "mechanics_tags": ["hitscan_like", "spread"],
+      "trigger_behavior": {"type": "held", "axis_hard_pull": {"ramp_rate": 1.5, "max_multiplier": 2.0}}
+    },
+    "missile": {
+      "display_name": "Missile",
+      "category": "ordnance",
+      "delivery": "rack",
+      "ammo": { "capacity": 6, "unit": "missile", "ammo_mass_per_unit": 6 },
+      "empty_mass": 3,
+      "kinematics": {
+        "mode": "fire",
+        "inherit_ship_velocity": true,
+        "add_velocity": 10
+      },
+      "sim": {"sim_points": 16, "t_end": 4.0, "beam_len": 0.0, "drop_off": 0.0},
+      "fire_modes": ["projectile"],
+      "mechanics_tags": ["guided"],
+      "trigger_behavior": {"type": "edge"}
+    },
+    "camera": {
+      "display_name": "Camera Pod",
+      "category": "pod",
+      "delivery": "mounted",
+      "ammo": { "capacity": null, "unit": "n/a", "ammo_mass_per_unit": 0 },
+      "empty_mass": 1,
+      "camera": {
+        "focal_length_mm": 35.0,
+        "sensor_width_mm": 36.0,
+        "sensor_height_mm": 24.0,
+        "priority": 10
+      },
+      "kinematics": {
+        "mode": "beam",
+        "inherit_ship_velocity": false,
+        "add_velocity": null
+      },
+      "sim": {"sim_points": 2, "t_end": 0.0, "beam_len": 120.0, "drop_off": 0.0},
+      "fire_modes": ["utility"],
+      "mechanics_tags": ["sensor"],
+      "trigger_behavior": {"type": "held"}
+    },
+    "glider": {
+      "display_name": "Deployable Glider",
+      "category": "vehicle",
+      "delivery": "released",
+      "ammo": { "capacity": 1, "unit": "glider", "ammo_mass_per_unit": 12 },
+      "empty_mass": 2,
+      "kinematics": {
+        "mode": "fall",
+        "inherit_ship_velocity": true,
+        "add_velocity": 1
+      },
+      "sim": {"sim_points": 16, "t_end": 3.5, "beam_len": 0.0, "drop_off": 2.5},
+      "fire_modes": ["released"],
+      "mechanics_tags": ["deployable"],
+      "trigger_behavior": {"type": "edge"}
+    },
+    "ultra heavy": {
+      "display_name": "Ultra Heavy Store",
+      "category": "ordnance",
+      "delivery": "released",
+      "ammo": { "capacity": 1, "unit": "store", "ammo_mass_per_unit": 30 },
+      "empty_mass": 6,
+      "kinematics": {
+        "mode": "fall",
+        "inherit_ship_velocity": true,
+        "add_velocity": 1
+      },
+      "sim": {"sim_points": 16, "t_end": 3.5, "beam_len": 0.0, "drop_off": 3.0},
+      "fire_modes": ["released"],
+      "mechanics_tags": ["stores", "ultra_heavy"],
+      "trigger_behavior": {"type": "edge"}
+    }
+  }
+}
