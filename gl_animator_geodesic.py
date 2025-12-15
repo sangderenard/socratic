@@ -29,6 +29,7 @@ except Exception:  # torch optional
 
 import joystick_menu
 import input_graph
+import controller_backend
 import weapons_structs
 import weapon_runtime
 import targeting_system
@@ -3939,6 +3940,40 @@ class _JoystickSideMenu:
         self.joystick = joystick
         self.axis_state: Dict[int, float] = {}
 
+        # Optional C signal kernel and controller backend evaluator.
+        # This is the bridge step: gameplay can read controls from the backend even if
+        # the graph executor is still Python-orchestrated.
+        self._sigk = None
+        self._ctrl_backend: controller_backend.ControllerBackend | None = None
+        self._sigk_buttons_prev: set[int] = set()
+        self._sigk_hats_prev: dict[int, tuple[int, int]] = {}
+
+        # Keyboard axes for safe-mode navigation (DirOR).
+        # Keep ids small (<= 65535) because item_id is stored in 16 bits in the kernel signal_id.
+        self._KBD_AXIS_WASD_X = 0
+        self._KBD_AXIS_WASD_Y = 1
+        self._KBD_AXIS_ARROWS_X = 2
+        self._KBD_AXIS_ARROWS_Y = 3
+
+        # Virtual id ranges used elsewhere (workbench); keep consistent.
+        self._HARD_HAT_AXIS_BASE = 50000
+        self._HARD_HAT_BTN_BASE = 51000
+
+        try:
+            from c_physics import signal_kernel_api
+
+            _lib, api = signal_kernel_api.try_load_signal_kernel()
+            self._sigk = api
+            if self._sigk is not None:
+                try:
+                    self._sigk.gp_sigk_reset()
+                except Exception:
+                    pass
+                self._ctrl_backend = controller_backend.ControllerBackend(self._sigk)
+        except Exception:
+            self._sigk = None
+            self._ctrl_backend = None
+
         self.control_names = list(self.CONTROL_NAMES)
         self.projection_modes = list(self.PROJECTION_MODES)
 
@@ -4182,6 +4217,260 @@ class _JoystickSideMenu:
             axes_now, buttons_now, hats_now = joystick_menu._poll_joystick_snapshot(self.joystick)
         except Exception:
             axes_now, buttons_now, hats_now = {}, set(), {}
+
+        # Backend funnel (step 1): push raw inputs into the C signal kernel.
+        # This allows controller graphs/channels to be sourced from the backend.
+        if self._sigk is not None:
+            try:
+                from c_physics.signal_kernel_ctypes import GP_InputEvent
+                from c_physics import signal_kernel_api
+
+                now_ns = int(time.monotonic_ns())
+
+                # Button edges.
+                b_evs: list[GP_InputEvent] = []
+                try:
+                    nb = int(self.joystick.get_numbuttons())
+                except Exception:
+                    nb = 0
+                for b in range(max(0, nb)):
+                    was_down = int(b) in self._sigk_buttons_prev
+                    is_down = int(b) in (buttons_now or set())
+                    if was_down == is_down:
+                        continue
+                    b_evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                            kind=int(signal_kernel_api.GP_EV_BUTTON),
+                            id=int(b),
+                            v0=1.0 if is_down else 0.0,
+                            v1=0.0,
+                            flags=0,
+                        )
+                    )
+                if b_evs:
+                    arrb_t = GP_InputEvent * len(b_evs)
+                    self._sigk.gp_sigk_push_events(arrb_t(*b_evs), int(len(b_evs)))
+
+                # Axes each frame.
+                a_evs: list[GP_InputEvent] = []
+                try:
+                    na = int(self.joystick.get_numaxes())
+                except Exception:
+                    na = 0
+                for a in range(max(0, na)):
+                    vv = float((axes_now or {}).get(int(a), 0.0))
+                    a_evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                            kind=int(signal_kernel_api.GP_EV_AXIS),
+                            id=int(a),
+                            v0=float(vv),
+                            v1=0.0,
+                            flags=0,
+                        )
+                    )
+                if a_evs:
+                    arra_t = GP_InputEvent * len(a_evs)
+                    self._sigk.gp_sigk_push_events(arra_t(*a_evs), int(len(a_evs)))
+
+                # Keyboard direction axes (WASD + arrows) each frame.
+                try:
+                    pressed = pygame.key.get_pressed()
+                except Exception:
+                    pressed = None
+
+                def _is_down(k: int) -> int:
+                    if pressed is None:
+                        return 0
+                    try:
+                        return 1 if bool(pressed[int(k)]) else 0
+                    except Exception:
+                        return 0
+
+                wasd_x = float(_is_down(pygame.K_d) - _is_down(pygame.K_a))
+                wasd_y = float(_is_down(pygame.K_w) - _is_down(pygame.K_s))
+                arrows_x = float(_is_down(pygame.K_RIGHT) - _is_down(pygame.K_LEFT))
+                arrows_y = float(_is_down(pygame.K_UP) - _is_down(pygame.K_DOWN))
+
+                k_evs: list[GP_InputEvent] = [
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(self._KBD_AXIS_WASD_X),
+                        v0=float(wasd_x),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(self._KBD_AXIS_WASD_Y),
+                        v0=float(wasd_y),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(self._KBD_AXIS_ARROWS_X),
+                        v0=float(arrows_x),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(self._KBD_AXIS_ARROWS_Y),
+                        v0=float(arrows_y),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                ]
+                arrk_t = GP_InputEvent * len(k_evs)
+                self._sigk.gp_sigk_push_events(arrk_t(*k_evs), int(len(k_evs)))
+
+                # Mouse delta each frame (dx/dy). Use two motion ids: 0=dx, 1=dy.
+                try:
+                    mdx, mdy = pygame.mouse.get_rel()
+                except Exception:
+                    mdx, mdy = 0, 0
+                m_evs: list[GP_InputEvent] = [
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_MOUSE),
+                        kind=int(signal_kernel_api.GP_EV_MOUSE_MOTION),
+                        id=0,
+                        v0=float(mdx),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_MOUSE),
+                        kind=int(signal_kernel_api.GP_EV_MOUSE_MOTION),
+                        id=1,
+                        v0=float(mdy),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                ]
+                arrm_t = GP_InputEvent * len(m_evs)
+                self._sigk.gp_sigk_push_events(arrm_t(*m_evs), int(len(m_evs)))
+
+                # Hat axes + direction buttons as virtual joystick ids.
+                def _dir_idx_8(x: int, y: int) -> int | None:
+                    if int(x) == 0 and int(y) == 0:
+                        return None
+                    dirs = [(-1, 1), (0, 1), (1, 1), (-1, 0), (1, 0), (-1, -1), (0, -1), (1, -1)]
+                    for i, (dx, dy) in enumerate(dirs):
+                        if int(dx) == int(x) and int(dy) == int(y):
+                            return int(i)
+                    return None
+
+                def _hard_hat_axis_id(hat_idx: int, comp: str) -> int:
+                    return int(self._HARD_HAT_AXIS_BASE + int(max(0, int(hat_idx))) * 2 + (1 if str(comp) == "y" else 0))
+
+                def _hard_hat_btn_id(hat_idx: int, dir_idx: int) -> int:
+                    return int(self._HARD_HAT_BTN_BASE + int(max(0, int(hat_idx))) * 8 + int(dir_idx))
+
+                h_evs: list[GP_InputEvent] = []
+                hb_evs: list[GP_InputEvent] = []
+                try:
+                    nh = int(self.joystick.get_numhats())
+                except Exception:
+                    nh = 0
+                for h in range(max(0, nh)):
+                    hx, hy = (hats_now or {}).get(int(h), (0, 0))
+                    phx, phy = self._sigk_hats_prev.get(int(h), (0, 0))
+                    cur_dir = _dir_idx_8(int(hx), int(hy))
+                    prev_dir = _dir_idx_8(int(phx), int(phy))
+
+                    if cur_dir != prev_dir:
+                        if prev_dir is not None:
+                            hb_evs.append(
+                                GP_InputEvent(
+                                    t_mono_ns=now_ns,
+                                    device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                    kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                    id=int(_hard_hat_btn_id(int(h), int(prev_dir))),
+                                    v0=0.0,
+                                    v1=0.0,
+                                    flags=0,
+                                )
+                            )
+                        if cur_dir is not None:
+                            hb_evs.append(
+                                GP_InputEvent(
+                                    t_mono_ns=now_ns,
+                                    device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                    kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                    id=int(_hard_hat_btn_id(int(h), int(cur_dir))),
+                                    v0=1.0,
+                                    v1=0.0,
+                                    flags=0,
+                                )
+                            )
+
+                    h_evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                            kind=int(signal_kernel_api.GP_EV_AXIS),
+                            id=int(_hard_hat_axis_id(int(h), "x")),
+                            v0=float(int(hx)),
+                            v1=0.0,
+                            flags=0,
+                        )
+                    )
+                    h_evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                            kind=int(signal_kernel_api.GP_EV_AXIS),
+                            id=int(_hard_hat_axis_id(int(h), "y")),
+                            v0=float(int(hy)),
+                            v1=0.0,
+                            flags=0,
+                        )
+                    )
+
+                if hb_evs:
+                    arrhb_t = GP_InputEvent * len(hb_evs)
+                    self._sigk.gp_sigk_push_events(arrhb_t(*hb_evs), int(len(hb_evs)))
+                if h_evs:
+                    arrh_t = GP_InputEvent * len(h_evs)
+                    self._sigk.gp_sigk_push_events(arrh_t(*h_evs), int(len(h_evs)))
+
+                # Backend funnel (step 2): evaluate controller graph and publish channels.
+                if self._ctrl_backend is not None:
+                    overrides_1d, channels_2d = self._ctrl_backend.step(now_ns=now_ns)
+                    if overrides_1d:
+                        try:
+                            self.flight_cam.controller_channels_override = overrides_1d
+                        except Exception:
+                            pass
+                    try:
+                        self.flight_cam.controller_channels_2d = channels_2d
+                    except Exception:
+                        pass
+
+                if hasattr(self._sigk, "gp_sigk_clear_pulses"):
+                    try:
+                        self._sigk.gp_sigk_clear_pulses()
+                    except Exception:
+                        pass
+
+                self._sigk_buttons_prev = set(int(b) for b in (buttons_now or set()))
+                self._sigk_hats_prev = {int(k): (int(v[0]), int(v[1])) for k, v in (hats_now or {}).items()}
+            except Exception:
+                pass
 
         # Select which control-set is active.
         # Priority:
@@ -4517,30 +4806,7 @@ class _JoystickSideMenu:
         except Exception:
             pass
 
-        # Controller graph: evaluate features->signals->channels and override sim channels.
-        # Stored in joystick.json under flight_controls.controller.{features,signals,channels}.
-        try:
-            cfg_ctrl = None
-            try:
-                cfg_ctrl = cfg  # may or may not exist depending on earlier try/except
-            except Exception:
-                cfg_ctrl = None
-            if cfg_ctrl is None:
-                cfg_ctrl = joystick_menu.load_or_create_joystick_config("joystick.json")
-
-            ctx = input_graph.GraphEvalContext(
-                axes={int(k): float(v) for k, v in (axes_now or {}).items()},
-                buttons=set(int(b) for b in (buttons_now or set())),
-                hats={int(h): (int(v[0]), int(v[1])) for h, v in (hats_now or {}).items()},
-            )
-            overrides = input_graph.eval_controller_channel_overrides(cfg=cfg_ctrl, ctx=ctx, clamp=True)
-            if overrides:
-                try:
-                    self.flight_cam.controller_channels_override = overrides
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # Controller graph override: now sourced from the backend funnel (signal kernel + compiled final graph).
 
         eye, _ship_center = self.flight_cam.step(
             dt=float(dt),

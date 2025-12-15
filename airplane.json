@@ -13,7 +13,7 @@
   },
   "airplane_tuning": {
     "control_mode": 1,
-    "flight_debug_print": 1,
+    "flight_debug_print": 0,
     "weapon_debug_print": 0,
     "los_probe_mode": 2,
     "auto_kp": 6.0,
@@ -167,7 +167,7 @@
   "control_system": {
     "auto_kd": 2.5,
     "auto_kp": 6.0,
-    "debug_print": true,
+    "debug_print": false,
     "mode": "auto"
   },
   "controls": {

@@ -5,6 +5,7 @@ project(geodesic_physics C)
 # Build a shared library that can be loaded from Python via ctypes.
 add_library(geodesic_physics SHARED
     geodesic_physics.c
+    signal_kernel.c
     weapon_sim.c
     flight_sim.c
 )

@@ -362,6 +362,7 @@ if %errorlevel% neq 0 goto :VCEnd</Command>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="C:\dev\Powershell\socratic\c_physics\geodesic_physics.c" />
+    <ClCompile Include="C:\dev\Powershell\socratic\c_physics\signal_kernel.c" />
     <ClCompile Include="C:\dev\Powershell\socratic\c_physics\weapon_sim.c" />
     <ClCompile Include="C:\dev\Powershell\socratic\c_physics\flight_sim.c" />
   </ItemGroup>

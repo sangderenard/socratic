@@ -1,0 +1,333 @@
+{
+  "channels": {
+    "0": {
+      "dim": 2,
+      "sid": "DirOR"
+    },
+    "1": {
+      "dim": 2,
+      "sid": "sig2"
+    },
+    "2": {
+      "dim": 2,
+      "sid": "sig3"
+    },
+    "3": {
+      "dim": 2,
+      "sid": "sig4"
+    },
+    "4": {
+      "dim": 2,
+      "sid": "hat_view"
+    },
+    "5": {
+      "dim": 2,
+      "sid": "hat_flight"
+    }
+  },
+  "generated_utc_ms": 1765775305167,
+  "inputs": [
+    {
+      "cap_max": 0.999969482421875,
+      "cap_min": -1.0,
+      "deadzone": 0.0,
+      "device": "joystick",
+      "id": 0,
+      "iid": 0,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis",
+      "trim": 0.050217441062027926
+    },
+    {
+      "cap_max": 1.0,
+      "cap_min": -0.999969482421875,
+      "deadzone": 0.0,
+      "device": "joystick",
+      "id": 1,
+      "iid": 1,
+      "invert": true,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis",
+      "trim": 0.011306935225452048
+    },
+    {
+      "cap_max": 0.999969482421875,
+      "cap_min": -1.0,
+      "deadzone": 0.0,
+      "device": "joystick",
+      "id": 2,
+      "iid": 2,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis",
+      "trim": 0.06343175402456702
+    },
+    {
+      "cap_max": 1.0,
+      "cap_min": -0.999969482421875,
+      "deadzone": 0.0,
+      "device": "joystick",
+      "id": 3,
+      "iid": 3,
+      "invert": true,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis",
+      "trim": -0.010543984130617228
+    },
+    {
+      "device": "joystick",
+      "id": 50000,
+      "iid": 4,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis"
+    },
+    {
+      "device": "joystick",
+      "id": 50001,
+      "iid": 5,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis"
+    },
+    {
+      "device": "keyboard",
+      "id": 0,
+      "iid": 6,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis"
+    },
+    {
+      "device": "keyboard",
+      "id": 1,
+      "iid": 7,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis"
+    },
+    {
+      "device": "keyboard",
+      "id": 2,
+      "iid": 8,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis"
+    },
+    {
+      "device": "keyboard",
+      "id": 3,
+      "iid": 9,
+      "invert": false,
+      "kind": "axis",
+      "sigsel": 0,
+      "state": "axis"
+    },
+    {
+      "device": "mouse",
+      "id": 0,
+      "iid": 10,
+      "invert": false,
+      "kind": "mouse_motion",
+      "sigsel": 0,
+      "state": "axis"
+    },
+    {
+      "device": "mouse",
+      "id": 1,
+      "iid": 11,
+      "invert": false,
+      "kind": "mouse_motion",
+      "sigsel": 0,
+      "state": "axis"
+    }
+  ],
+  "nodes": [
+    {
+      "args": [
+        {
+          "iid": 0,
+          "ref": "input"
+        },
+        {
+          "iid": 1,
+          "ref": "input"
+        },
+        {
+          "iid": 2,
+          "ref": "input"
+        },
+        {
+          "iid": 3,
+          "ref": "input"
+        },
+        {
+          "iid": 4,
+          "ref": "input"
+        },
+        {
+          "iid": 5,
+          "ref": "input"
+        },
+        {
+          "iid": 6,
+          "ref": "input"
+        },
+        {
+          "iid": 7,
+          "ref": "input"
+        },
+        {
+          "iid": 8,
+          "ref": "input"
+        },
+        {
+          "iid": 9,
+          "ref": "input"
+        },
+        {
+          "iid": 10,
+          "ref": "input"
+        },
+        {
+          "iid": 11,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 0,
+      "op": "2dsumclamp"
+    },
+    {
+      "args": [
+        {
+          "iid": 4,
+          "ref": "input"
+        },
+        {
+          "iid": 5,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 1,
+      "op": "2dflightstick"
+    },
+    {
+      "args": [
+        {
+          "iid": 4,
+          "ref": "input"
+        },
+        {
+          "iid": 5,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 2,
+      "op": "2dseek"
+    },
+    {
+      "args": [
+        {
+          "iid": 0,
+          "ref": "input"
+        },
+        {
+          "iid": 1,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 3,
+      "op": "2dseek"
+    },
+    {
+      "args": [
+        {
+          "iid": 0,
+          "ref": "input"
+        },
+        {
+          "iid": 1,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 4,
+      "op": "2dflightstick"
+    },
+    {
+      "args": [
+        {
+          "iid": 2,
+          "ref": "input"
+        },
+        {
+          "iid": 3,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 5,
+      "op": "2dseek"
+    },
+    {
+      "args": [
+        {
+          "iid": 2,
+          "ref": "input"
+        },
+        {
+          "iid": 3,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 6,
+      "op": "2dflightstick"
+    }
+  ],
+  "signals": {
+    "DirOR": {
+      "dim": 2,
+      "nid": 0
+    },
+    "hat_flight": {
+      "dim": 2,
+      "nid": 1
+    },
+    "hat_view": {
+      "dim": 2,
+      "nid": 2
+    },
+    "sig1": {
+      "dim": 2,
+      "nid": 3
+    },
+    "sig2": {
+      "dim": 2,
+      "nid": 4
+    },
+    "sig3": {
+      "dim": 2,
+      "nid": 5
+    },
+    "sig4": {
+      "dim": 2,
+      "nid": 6
+    }
+  },
+  "version": 1
+}

@@ -11,34 +11,319 @@
       }
     },
     "controller": {
-      "channels": {},
+      "channels": {
+        "0": {
+          "id": "DirOR",
+          "source": "signal"
+        },
+        "1": {
+          "id": "sig2",
+          "source": "signal"
+        },
+        "2": {
+          "id": "sig3",
+          "source": "signal"
+        },
+        "3": {
+          "id": "sig4",
+          "source": "signal"
+        },
+        "4": {
+          "id": "hat_view",
+          "source": "signal"
+        },
+        "5": {
+          "id": "hat_flight",
+          "source": "signal"
+        }
+      },
+      "device_prefs": {
+        "joystick": {
+          "axis_calib": {
+            "0": {
+              "cap_max": 0.999969482421875,
+              "cap_min": -1.0,
+              "deadzone": 0.0,
+              "trim": 0.050217441062027926
+            },
+            "1": {
+              "cap_max": 1.0,
+              "cap_min": -0.999969482421875,
+              "deadzone": 0.0,
+              "trim": 0.011306935225452048
+            },
+            "2": {
+              "cap_max": 0.999969482421875,
+              "cap_min": -1.0,
+              "deadzone": 0.0,
+              "trim": 0.06343175402456702
+            },
+            "3": {
+              "cap_max": 1.0,
+              "cap_min": -0.999969482421875,
+              "deadzone": 0.0,
+              "trim": -0.010543984130617228
+            }
+          },
+          "axis_invert": {
+            "1": true,
+            "3": true
+          }
+        },
+        "keyboard": {
+          "axis_calib": {},
+          "axis_invert": {}
+        },
+        "mouse": {
+          "axis_calib": {},
+          "axis_invert": {}
+        }
+      },
       "features": {
         "axis_0": {
           "axis": 0,
           "type": "axis"
+        },
+        "button_1": {
+          "button": 1,
+          "type": "button"
         }
       },
       "signals": {
+        "DirOR": {
+          "args": [
+            {
+              "device": "joystick",
+              "id": 0,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 1,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 2,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 3,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 50000,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 50001,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "keyboard",
+              "id": 0,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "keyboard",
+              "id": 1,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "keyboard",
+              "id": 2,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "keyboard",
+              "id": 3,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "mouse",
+              "id": 0,
+              "kind": "mouse_motion",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "mouse",
+              "id": 1,
+              "kind": "mouse_motion",
+              "source": "input",
+              "state": "axis"
+            }
+          ],
+          "dim": 2,
+          "op": "2dsumclamp"
+        },
+        "hat_flight": {
+          "args": [
+            {
+              "device": "joystick",
+              "id": 50000,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 50001,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            }
+          ],
+          "dim": 2,
+          "kernel": "I",
+          "op": "2dflightstick"
+        },
+        "hat_view": {
+          "args": [
+            {
+              "device": "joystick",
+              "id": 50000,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 50001,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            }
+          ],
+          "dim": 2,
+          "kernel": "I",
+          "op": "2dseek"
+        },
         "sig1": {
-          "feature": "axis_0",
-          "op": "raw"
+          "args": [
+            {
+              "device": "joystick",
+              "id": 0,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 1,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            }
+          ],
+          "device": "joystick",
+          "dim": 2,
+          "id": 0,
+          "kernel": "I",
+          "kind": "button",
+          "op": "2dseek",
+          "signal_id": 50462720,
+          "state": "D"
         },
         "sig2": {
-          "feature": "axis_0",
-          "op": "raw"
+          "args": [
+            {
+              "device": "joystick",
+              "id": 0,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 1,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            }
+          ],
+          "device": "joystick",
+          "dim": 2,
+          "id": 3,
+          "kernel": "I",
+          "kind": "axis",
+          "op": "2dflightstick",
+          "signal_id": 50397187,
+          "state": "axis"
         },
         "sig3": {
+          "args": [
+            {
+              "device": "joystick",
+              "id": 2,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 3,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            }
+          ],
+          "dim": 2,
           "feature": "axis_0",
-          "op": "raw"
+          "op": "2dseek"
         },
         "sig4": {
+          "args": [
+            {
+              "device": "joystick",
+              "id": 2,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            },
+            {
+              "device": "joystick",
+              "id": 3,
+              "kind": "axis",
+              "source": "input",
+              "state": "axis"
+            }
+          ],
+          "dim": 2,
+          "feature": "axis_0",
+          "op": "2dflightstick"
+        },
+        "sig5": {
           "feature": "axis_0",
           "op": "raw"
         }
       },
       "state": {
-        "last_feature": "axis_0",
-        "last_signal": "sig4"
+        "last_feature": "button_1",
+        "last_signal": "sig5"
       }
     },
     "triggers": {

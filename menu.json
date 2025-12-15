@@ -43,6 +43,8 @@
     "controls_controller": {
       "title": "CONTROLLER / SIGNALS / CHANNELS",
       "items": [
+        { "label": "SIGNAL WORKBENCH", "action": "controller_workbench" },
+        { "label": "CHANNEL MIXER", "action": "controller_channel_mixer" },
         { "label": "JOYSTICK STATUS", "action": "controller_status" },
         { "label": "DISCOVER FEATURE", "action": "controller_discover_feature" },
         { "label": "CREATE SIGNAL", "action": "controller_create_signal" },

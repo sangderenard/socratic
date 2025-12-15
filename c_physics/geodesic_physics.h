@@ -15,6 +15,32 @@
 extern "C" {
 #endif
 
+// ---------------- Signal kernel ABI (planned) ----------------
+// Status/gesture flags + frame structs shared across Python<->C.
+// Kept separate to remain stable while the kernel implementation evolves.
+#include "signal_kernel_abi.h"
+
+GP_EXPORT void gp_sigk_reset(void);
+GP_EXPORT void gp_sigk_push_events(const GP_InputEvent* ev, uint32_t count);
+GP_EXPORT int gp_sigk_peek(uint64_t now_ns, uint32_t signal_id, GP_SignalFrame* out);
+GP_EXPORT int gp_sigk_peek_sel(uint64_t now_ns, uint32_t signal_id, uint32_t selector, GP_SignalFrame* out);
+GP_EXPORT void gp_sigk_clear_pulses(void);
+// Convert a scalar signal into a button-like state machine.
+// Treats value > epsilon as down, else up. Output is stored under out_button_signal_id.
+GP_EXPORT void gp_sigk_sigtobutton(uint64_t now_ns, uint32_t out_button_signal_id, float value, float epsilon);
+
+// ---------------- Signal operator helpers (prototype) ----------------
+// These are small math/logic kernels intended to be used by the upcoming
+// signal graph scheduler. Exposed now so the workbench can exercise them.
+
+// 2D ops: take two scalar inputs (a,b) and produce (x,y).
+GP_EXPORT void gp_sigop_2dseek(float a, float b, float* out_x, float* out_y);
+GP_EXPORT void gp_sigop_2dflightstick(float a, float b, float* out_x, float* out_y);
+
+// Decompose (x,y) into unilateral control channels.
+// roll_left/right are derived from x, pitch_up/down from y.
+GP_EXPORT void gp_sigop_2dstereocontrolsurface(float x, float y, float* roll_left, float* roll_right, float* pitch_up, float* pitch_down);
+
 // ---------------- Flight integrator ABI (prototype) ----------------
 // Minimal vector integrator: integrates pos/vel given basis vectors and params.
 

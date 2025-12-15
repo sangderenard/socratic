@@ -4,12 +4,16 @@ import json
 import os
 import shutil
 import ctypes
+import time
 from typing import Any
+import sys
 
 import pygame
 
 import input_graph
+import controller_backend
 import reticle_sprite
+import scroll_model
 
 
 MENU_SPEC_PATH = "menu.json"
@@ -40,12 +44,40 @@ def load_or_create_joystick_config(path: str = "joystick.json") -> dict[str, Any
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
-    except Exception:
-        # If the file exists but is corrupted, overwrite with blank.
+    except Exception as e:
+        # If the file exists but is corrupted, try recovering from .bak and
+        # preserve a copy for debugging instead of silently nuking it.
         try:
-            shutil.copyfile(path, f"{path}.bak")
+            msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}"
+            print(f"[joystick_menu] Failed to load {path}: {msg}", file=sys.stderr, flush=True)
         except Exception:
             pass
+
+        bak_path = f"{path}.bak"
+        if os.path.exists(bak_path):
+            try:
+                with open(bak_path, "r", encoding="utf-8") as f:
+                    bak = json.load(f)
+                if isinstance(bak, dict):
+                    try:
+                        print(f"[joystick_menu] Restoring from {bak_path}", file=sys.stderr, flush=True)
+                    except Exception:
+                        pass
+                    _atomic_write_json(path, bak)
+                    return bak
+            except Exception:
+                pass
+
+        # Preserve the corrupt file for later inspection.
+        try:
+            ts = int(time.time())
+            corrupt_path = f"{path}.corrupt.{ts}"
+            if not os.path.exists(corrupt_path):
+                shutil.copyfile(path, corrupt_path)
+                print(f"[joystick_menu] Preserved corrupt config as {corrupt_path}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
         _atomic_write_json(path, {})
         return {}
 
@@ -95,11 +127,37 @@ def load_or_create_menu_spec(path: str = MENU_SPEC_PATH) -> dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             spec = json.load(f)
         return spec if isinstance(spec, dict) else _default_menu_spec()
-    except Exception:
+    except Exception as e:
         try:
-            shutil.copyfile(path, f"{path}.bak")
+            msg = f"{type(e).__name__}: {e}" if str(e) else f"{type(e).__name__}"
+            print(f"[joystick_menu] Failed to load {path}: {msg}", file=sys.stderr, flush=True)
         except Exception:
             pass
+
+        bak_path = f"{path}.bak"
+        if os.path.exists(bak_path):
+            try:
+                with open(bak_path, "r", encoding="utf-8") as f:
+                    bak = json.load(f)
+                if isinstance(bak, dict):
+                    try:
+                        print(f"[joystick_menu] Restoring from {bak_path}", file=sys.stderr, flush=True)
+                    except Exception:
+                        pass
+                    _atomic_write_json(path, bak)
+                    return bak
+            except Exception:
+                pass
+
+        try:
+            ts = int(time.time())
+            corrupt_path = f"{path}.corrupt.{ts}"
+            if not os.path.exists(corrupt_path):
+                shutil.copyfile(path, corrupt_path)
+                print(f"[joystick_menu] Preserved corrupt spec as {corrupt_path}", file=sys.stderr, flush=True)
+        except Exception:
+            pass
+
         spec = _default_menu_spec()
         _atomic_write_json(path, spec)
         return spec
@@ -330,6 +388,19 @@ def _draw_menu_nav_puzzle(
 def _get_menu_nav(cfg: dict[str, Any]) -> dict[str, Any]:
     nav = cfg.get("menu_nav", None)
     return nav if isinstance(nav, dict) else {}
+
+
+def _get_menu_scroll(cfg: dict[str, Any]) -> dict[str, Any]:
+        """Optional scroll bindings for long lists.
+
+        If present, cfg['menu_scroll'] may contain binding objects keyed by:
+            - scroll_up / scroll_down: line scroll
+            - page_up / page_down: page scroll
+
+        Binding objects use the same schema as menu_nav bindings.
+        """
+        sc = cfg.get("menu_scroll", None)
+        return sc if isinstance(sc, dict) else {}
 
 
 def _used_menu_nav_inputs(cfg: dict[str, Any]) -> tuple[set[tuple[int, int]], set[int], set[tuple[int, int, int]]]:
@@ -1043,6 +1114,7 @@ def run_ctypes_struct_editor(
 
     cfg = load_or_create_joystick_config("joystick.json")
     nav = _get_menu_nav(cfg)
+    sc = _get_menu_scroll(cfg)
     b_up = nav.get("up")
     b_down = nav.get("down")
     b_left = nav.get("left")
@@ -1090,6 +1162,7 @@ def run_ctypes_struct_editor(
         return float(0.66 - 0.07 * int(idx))
 
     max_visible = 10
+    scroll = scroll_model.ScrollModel(first_idx=0)
 
     while True:
         exit_now = False
@@ -1135,6 +1208,48 @@ def run_ctypes_struct_editor(
             sel = (sel + 1) % max(1, len(fields))
             lr_held_since = None
             lr_dir = 0
+
+        # Optional manual scrolling (does not change selection).
+        if _nav_edge(
+            sc.get("scroll_up"),
+            axes_now=axes_now,
+            axes_prev=axes_prev,
+            buttons_now=buttons_now,
+            buttons_prev=buttons_prev,
+            hats_now=hats_now,
+            hats_prev=hats_prev,
+        ):
+            scroll.scroll_lines(delta=-1, total=len(fields), max_visible=max_visible)
+        if _nav_edge(
+            sc.get("scroll_down"),
+            axes_now=axes_now,
+            axes_prev=axes_prev,
+            buttons_now=buttons_now,
+            buttons_prev=buttons_prev,
+            hats_now=hats_now,
+            hats_prev=hats_prev,
+        ):
+            scroll.scroll_lines(delta=+1, total=len(fields), max_visible=max_visible)
+        if _nav_edge(
+            sc.get("page_up"),
+            axes_now=axes_now,
+            axes_prev=axes_prev,
+            buttons_now=buttons_now,
+            buttons_prev=buttons_prev,
+            hats_now=hats_now,
+            hats_prev=hats_prev,
+        ):
+            scroll.scroll_pages(delta_pages=-1, total=len(fields), max_visible=max_visible)
+        if _nav_edge(
+            sc.get("page_down"),
+            axes_now=axes_now,
+            axes_prev=axes_prev,
+            buttons_now=buttons_now,
+            buttons_prev=buttons_prev,
+            hats_now=hats_now,
+            hats_prev=hats_prev,
+        ):
+            scroll.scroll_pages(delta_pages=+1, total=len(fields), max_visible=max_visible)
 
         if _nav_edge(
             b_cancel,
@@ -1211,13 +1326,9 @@ def run_ctypes_struct_editor(
             prefix = "> " if int(i) == int(sel) else "  "
             lines.append(f"{prefix}{_fmt_name(fname)}: {_fmt_value(fname, ftype)}")
 
-        first_idx = 0
-        if int(len(lines)) > int(max_visible):
-            half = int(max_visible // 2)
-            first_idx = int(sel) - int(half)
-            first_idx = max(0, min(int(first_idx), int(len(lines) - max_visible)))
-        visible_sel = int(sel) - int(first_idx)
-        lines_vis = lines[int(first_idx) : int(first_idx) + int(max_visible)] if int(len(lines)) > int(max_visible) else lines
+        scroll.ensure_visible(sel=int(sel), total=len(lines), max_visible=max_visible, center=False)
+        first_idx, last_idx, visible_sel = scroll.window(total=len(lines), sel=int(sel), max_visible=max_visible)
+        lines_vis = lines[int(first_idx) : int(last_idx)]
 
         ret_y_des = _sel_y(visible_sel)
         ret_y += (float(ret_y_des) - float(ret_y)) * 0.35
@@ -1897,6 +2008,209 @@ def run_main_menu(
     menu_button: int | None,
     menu_context: dict[str, Any] | None = None,
 ) -> str:
+    # Optional: use backend-derived channel0 (DirOR) for navigation.
+    sigk = None
+    ctrl_backend = None
+    try:
+        from c_physics import signal_kernel_api
+
+        _lib, api = signal_kernel_api.try_load_signal_kernel()
+        sigk = api
+        if sigk is not None:
+            try:
+                sigk.gp_sigk_reset()
+            except Exception:
+                pass
+            ctrl_backend = controller_backend.ControllerBackend(sigk)
+    except Exception:
+        sigk = None
+        ctrl_backend = None
+
+    # Keep ids small (<= 65535) because item_id is stored in 16 bits in the kernel signal_id.
+    KBD_AXIS_WASD_X = 0
+    KBD_AXIS_WASD_Y = 1
+    KBD_AXIS_ARROWS_X = 2
+    KBD_AXIS_ARROWS_Y = 3
+    HARD_HAT_AXIS_BASE = 50000
+
+    def _backend_nav_vec(*, joystick: pygame.joystick.Joystick) -> tuple[float, float] | None:
+        if sigk is None or ctrl_backend is None:
+            return None
+        try:
+            from c_physics.signal_kernel_ctypes import GP_InputEvent
+            from c_physics import signal_kernel_api
+
+            now_ns = int(time.monotonic_ns())
+
+            axes_now, _buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+
+            evs: list[GP_InputEvent] = []
+
+            # Joystick axes each frame.
+            try:
+                na = int(joystick.get_numaxes())
+            except Exception:
+                na = 0
+            for a in range(max(0, na)):
+                vv = float((axes_now or {}).get(int(a), 0.0))
+                evs.append(
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(a),
+                        v0=float(vv),
+                        v1=0.0,
+                        flags=0,
+                    )
+                )
+
+            # Hat axes (virtual joystick axis ids).
+            try:
+                nh = int(joystick.get_numhats())
+            except Exception:
+                nh = 0
+            for h in range(max(0, nh)):
+                hx, hy = (hats_now or {}).get(int(h), (0, 0))
+                evs.append(
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(HARD_HAT_AXIS_BASE + int(h) * 2 + 0),
+                        v0=float(int(hx)),
+                        v1=0.0,
+                        flags=0,
+                    )
+                )
+                evs.append(
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(HARD_HAT_AXIS_BASE + int(h) * 2 + 1),
+                        v0=float(int(hy)),
+                        v1=0.0,
+                        flags=0,
+                    )
+                )
+
+            # Keyboard direction axes (WASD + arrows).
+            try:
+                pressed = pygame.key.get_pressed()
+            except Exception:
+                pressed = None
+
+            def _is_down(k: int) -> int:
+                if pressed is None:
+                    return 0
+                try:
+                    return 1 if bool(pressed[int(k)]) else 0
+                except Exception:
+                    return 0
+
+            wasd_x = float(_is_down(pygame.K_d) - _is_down(pygame.K_a))
+            wasd_y = float(_is_down(pygame.K_w) - _is_down(pygame.K_s))
+            arrows_x = float(_is_down(pygame.K_RIGHT) - _is_down(pygame.K_LEFT))
+            arrows_y = float(_is_down(pygame.K_UP) - _is_down(pygame.K_DOWN))
+
+            evs.extend(
+                [
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(KBD_AXIS_WASD_X),
+                        v0=float(wasd_x),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(KBD_AXIS_WASD_Y),
+                        v0=float(wasd_y),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(KBD_AXIS_ARROWS_X),
+                        v0=float(arrows_x),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(KBD_AXIS_ARROWS_Y),
+                        v0=float(arrows_y),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                ]
+            )
+
+            # Mouse delta (dx/dy).
+            try:
+                mdx, mdy = pygame.mouse.get_rel()
+            except Exception:
+                mdx, mdy = 0, 0
+            evs.extend(
+                [
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_MOUSE),
+                        kind=int(signal_kernel_api.GP_EV_MOUSE_MOTION),
+                        id=0,
+                        v0=float(mdx),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_MOUSE),
+                        kind=int(signal_kernel_api.GP_EV_MOUSE_MOTION),
+                        id=1,
+                        v0=float(mdy),
+                        v1=0.0,
+                        flags=0,
+                    ),
+                ]
+            )
+
+            if evs:
+                arr_t = GP_InputEvent * len(evs)
+                sigk.gp_sigk_push_events(arr_t(*evs), int(len(evs)))
+
+            _overrides_1d, channels_2d = ctrl_backend.step(now_ns=now_ns)
+            if hasattr(sigk, "gp_sigk_clear_pulses"):
+                try:
+                    sigk.gp_sigk_clear_pulses()
+                except Exception:
+                    pass
+            if isinstance(channels_2d, dict) and 0 in channels_2d:
+                x, y = channels_2d.get(0, (0.0, 0.0))
+                return float(x), float(y)
+            return None
+        except Exception:
+            return None
+
+    def _vec_edges(v_now: tuple[float, float] | None, v_prev: tuple[float, float], *, thr: float = 0.65) -> tuple[bool, bool, bool, bool, tuple[float, float]]:
+        if v_now is None:
+            return False, False, False, False, (float(v_prev[0]), float(v_prev[1]))
+        x, y = float(v_now[0]), float(v_now[1])
+        px, py = float(v_prev[0]), float(v_prev[1])
+        up = (y > thr) and (py <= thr)
+        down = (y < -thr) and (py >= -thr)
+        left = (x < -thr) and (px >= -thr)
+        right = (x > thr) and (px <= thr)
+        return bool(up), bool(down), bool(left), bool(right), (x, y)
+
     def _ensure_flight_controls_profiles(cfg: dict) -> dict:
         """Ensure cfg["flight_controls"]["profiles"][profile][mode] skeleton exists."""
         if not isinstance(cfg.get("flight_controls", None), dict):
@@ -2010,6 +2324,7 @@ def run_main_menu(
         axes_prev: dict[int, float] = {}
         buttons_prev: set[int] = set()
         hats_prev: dict[int, tuple[int, int]] = {}
+        vec_prev = (0.0, 0.0)
 
         while True:
             for event in pygame.event.get():
@@ -2019,6 +2334,9 @@ def run_main_menu(
                     return None
 
             axes_now, buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+
+            v_now = _backend_nav_vec(joystick=joystick)
+            up_vec, down_vec, _left_vec, _right_vec, vec_prev = _vec_edges(v_now, vec_prev)
 
             up_edge = _nav_edge(
                 b_up,
@@ -2059,9 +2377,9 @@ def run_main_menu(
 
             if cancel_edge:
                 return None
-            if up_edge:
+            if up_edge or up_vec:
                 sel = (sel - 1) % max(1, len(options))
-            if down_edge:
+            if down_edge or down_vec:
                 sel = (sel + 1) % max(1, len(options))
             if ok_edge:
                 return str(options[int(sel)][0])
@@ -3153,6 +3471,7 @@ def run_main_menu(
 
         cfg = load_or_create_joystick_config("joystick.json")
         nav = _get_menu_nav(cfg)
+        sc = _get_menu_scroll(cfg)
         b_up = nav.get("up")
         b_down = nav.get("down")
         b_confirm = nav.get("confirm")
@@ -3163,9 +3482,12 @@ def run_main_menu(
 
         max_visible = 10
 
+        scroll = scroll_model.ScrollModel(first_idx=0)
+
         axes_prev: dict[int, float] = {}
         buttons_prev: set[int] = set()
         hats_prev: dict[int, tuple[int, int]] = {}
+        vec_prev = (0.0, 0.0)
 
         ret_x = 0.04
         ret_y = 0.66
@@ -3188,6 +3510,9 @@ def run_main_menu(
 
             axes_now, buttons_now, hats_now = _poll_joystick_snapshot(joystick)
 
+            v_now = _backend_nav_vec(joystick=joystick)
+            up_vec, down_vec, _left_vec, _right_vec, vec_prev = _vec_edges(v_now, vec_prev)
+
             node = _get_menu_node(spec, node_id)
             title = str(node.get("title") or node_id)
             menu_items = _node_items(node)
@@ -3206,7 +3531,7 @@ def run_main_menu(
                 buttons_prev=buttons_prev,
                 hats_now=hats_now,
                 hats_prev=hats_prev,
-            ):
+            ) or up_vec:
                 sel = (sel - 1) % max(1, len(labels))
                 anim._on_since = None
 
@@ -3218,9 +3543,51 @@ def run_main_menu(
                 buttons_prev=buttons_prev,
                 hats_now=hats_now,
                 hats_prev=hats_prev,
-            ):
+            ) or down_vec:
                 sel = (sel + 1) % max(1, len(labels))
                 anim._on_since = None
+
+            # Optional manual list scrolling (does not change selection).
+            if _nav_edge(
+                sc.get("scroll_up"),
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            ):
+                scroll.scroll_lines(delta=-1, total=len(labels), max_visible=max_visible)
+            if _nav_edge(
+                sc.get("scroll_down"),
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            ):
+                scroll.scroll_lines(delta=+1, total=len(labels), max_visible=max_visible)
+            if _nav_edge(
+                sc.get("page_up"),
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            ):
+                scroll.scroll_pages(delta_pages=-1, total=len(labels), max_visible=max_visible)
+            if _nav_edge(
+                sc.get("page_down"),
+                axes_now=axes_now,
+                axes_prev=axes_prev,
+                buttons_now=buttons_now,
+                buttons_prev=buttons_prev,
+                hats_now=hats_now,
+                hats_prev=hats_prev,
+            ):
+                scroll.scroll_pages(delta_pages=+1, total=len(labels), max_visible=max_visible)
 
             if _nav_edge(
                 b_cancel,
@@ -3234,19 +3601,16 @@ def run_main_menu(
                 if stack:
                     node_id = stack.pop()
                     sel = 0
+                    scroll.first_idx = 0
                     anim._on_since = None
                 else:
                     return "start"
 
             confirm_held = _nav_is_held(b_confirm, axes_now=axes_now, buttons_now=buttons_now, hats_now=hats_now)
 
-            first_idx = 0
-            if int(len(labels)) > int(max_visible):
-                half = int(max_visible // 2)
-                first_idx = int(sel) - int(half)
-                first_idx = max(0, min(int(first_idx), int(len(labels) - max_visible)))
-            visible_sel = int(sel) - int(first_idx)
-            labels_vis = labels[int(first_idx) : int(first_idx) + int(max_visible)] if int(len(labels)) > int(max_visible) else labels
+            scroll.ensure_visible(sel=int(sel), total=len(labels), max_visible=max_visible, center=False)
+            first_idx, last_idx, visible_sel = scroll.window(total=len(labels), sel=int(sel), max_visible=max_visible)
+            labels_vis = labels[int(first_idx) : int(last_idx)]
 
             ret_y_des = _sel_y(visible_sel)
             ret_y += (float(ret_y_des) - float(ret_y)) * 0.25
@@ -3267,6 +3631,7 @@ def run_main_menu(
                     stack.append(node_id)
                     node_id = submenu
                     sel = 0
+                    scroll.first_idx = 0
                     anim._on_since = None
                 else:
                     # Ctypes struct editor hook.
@@ -3337,6 +3702,7 @@ def run_main_menu(
                 # Reload nav bindings in case the user rebound anything.
                 cfg = load_or_create_joystick_config("joystick.json")
                 nav = _get_menu_nav(cfg)
+                sc = _get_menu_scroll(cfg)
                 b_up = nav.get("up")
                 b_down = nav.get("down")
                 b_confirm = nav.get("confirm")
@@ -3384,6 +3750,43 @@ def run_main_menu(
     handlers["controller_create_signal"] = lambda: _controller_create_signal()
     handlers["controller_map_channel"] = lambda: _controller_map_channel()
 
+    def _controller_workbench() -> None:
+        try:
+            import signal_workbench
+        except Exception:
+            return
+        signal_workbench.run_signal_workbench(
+            font=font,
+            width=int(width),
+            height=int(height),
+            joystick=joystick,
+            menu_button=menu_button,
+            load_or_create_joystick_config=load_or_create_joystick_config,
+            save_joystick_config=save_joystick_config,
+            get_menu_nav=_get_menu_nav,
+            get_menu_scroll=_get_menu_scroll,
+            nav_edge=_nav_edge,
+            poll_joystick_snapshot=_poll_joystick_snapshot,
+            draw_fullscreen_lines=_draw_fullscreen_lines,
+        )
+
+    def _controller_channel_mixer() -> None:
+        try:
+            import channel_mixer_menu
+        except Exception:
+            return
+        channel_mixer_menu.run_channel_mixer_menu(
+            font=font,
+            width=int(width),
+            height=int(height),
+            joystick=joystick,
+            menu_button=menu_button,
+            get_menu_nav=_get_menu_nav,
+            nav_edge=_nav_edge,
+            poll_joystick_snapshot=_poll_joystick_snapshot,
+            draw_fullscreen_lines=_draw_fullscreen_lines,
+        )
+
     def _controller_status() -> None:
         if joystick is None:
             return
@@ -3421,6 +3824,8 @@ def run_main_menu(
             clock.tick(60)
 
     handlers["controller_status"] = lambda: _controller_status()
+    handlers["controller_workbench"] = lambda: _controller_workbench()
+    handlers["controller_channel_mixer"] = lambda: _controller_channel_mixer()
 
     # Menus: bind menu navigation explicitly.
     handlers["bind_menu_navigation"] = lambda: ensure_menu_navigation_bindings(
