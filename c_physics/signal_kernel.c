@@ -2,6 +2,22 @@
 
 #include <string.h>
 
+#ifdef _WIN32
+  #include <windows.h>
+  static SRWLOCK g_sigk_lock = SRWLOCK_INIT;
+  #define SIGK_LOCK_R() AcquireSRWLockShared(&g_sigk_lock)
+  #define SIGK_UNLOCK_R() ReleaseSRWLockShared(&g_sigk_lock)
+  #define SIGK_LOCK_W() AcquireSRWLockExclusive(&g_sigk_lock)
+  #define SIGK_UNLOCK_W() ReleaseSRWLockExclusive(&g_sigk_lock)
+#else
+  #include <pthread.h>
+  static pthread_rwlock_t g_sigk_lock = PTHREAD_RWLOCK_INITIALIZER;
+  #define SIGK_LOCK_R() (void)pthread_rwlock_rdlock(&g_sigk_lock)
+  #define SIGK_UNLOCK_R() (void)pthread_rwlock_unlock(&g_sigk_lock)
+  #define SIGK_LOCK_W() (void)pthread_rwlock_wrlock(&g_sigk_lock)
+  #define SIGK_UNLOCK_W() (void)pthread_rwlock_unlock(&g_sigk_lock)
+#endif
+
 // A minimal signal-kernel implementation intended as a live test harness:
 // - Accepts input events (currently button/key semantics are meaningful)
 // - Maintains per-signal state: down/hold/double/toggle
@@ -82,7 +98,9 @@ static uint32_t compose_signal_id_u32(uint32_t device, uint32_t kind, uint32_t i
 }
 
 GP_EXPORT void gp_sigk_reset(void) {
+  SIGK_LOCK_W();
   memset(g_states, 0, sizeof(g_states));
+  SIGK_UNLOCK_W();
 }
 
 static void apply_button_like(SigK_State* st, uint64_t t_ns, int is_down, float value) {
@@ -131,6 +149,8 @@ static void apply_button_like(SigK_State* st, uint64_t t_ns, int is_down, float 
 GP_EXPORT void gp_sigk_push_events(const GP_InputEvent* ev, uint32_t count) {
   if (!ev || count == 0) return;
 
+  SIGK_LOCK_W();
+
   for (uint32_t i = 0; i < count; ++i) {
     const GP_InputEvent* e = &ev[i];
     const uint32_t sid = compose_signal_id_u32(e->device, (uint32_t)e->kind, (uint32_t)e->id);
@@ -147,12 +167,19 @@ GP_EXPORT void gp_sigk_push_events(const GP_InputEvent* ev, uint32_t count) {
       st->last_value = e->v0;
     }
   }
+
+  SIGK_UNLOCK_W();
 }
 
 GP_EXPORT int gp_sigk_peek(uint64_t now_ns, uint32_t signal_id, GP_SignalFrame* out) {
   if (!out) return 0;
+
+  SIGK_LOCK_R();
   SigK_State* st = get_state(signal_id, 0);
-  if (!st) return 0;
+  if (!st) {
+    SIGK_UNLOCK_R();
+    return 0;
+  }
 
   uint32_t flags = 0;
   float hold_s = 0.0f;
@@ -190,10 +217,13 @@ GP_EXPORT int gp_sigk_peek(uint64_t now_ns, uint32_t signal_id, GP_SignalFrame* 
   if (ms > 4294967295.0) ms = 4294967295.0;
   out->aux = (uint32_t)(ms + 0.5);
 
+  SIGK_UNLOCK_R();
+
   return 1;
 }
 
 GP_EXPORT void gp_sigk_clear_pulses(void) {
+  SIGK_LOCK_W();
   for (uint32_t i = 0; i < SIGK_MAX_SIGNALS; ++i) {
     SigK_State* st = &g_states[i];
     if (!st->in_use) continue;
@@ -202,16 +232,22 @@ GP_EXPORT void gp_sigk_clear_pulses(void) {
     // Clear it with pulses so it doesn't persist across frames.
     st->last_release_had_hold = 0u;
   }
+  SIGK_UNLOCK_W();
 }
 
 GP_EXPORT void gp_sigk_sigtobutton(uint64_t now_ns, uint32_t out_button_signal_id, float value, float epsilon) {
+  SIGK_LOCK_W();
   SigK_State* st = get_state(out_button_signal_id, 1);
-  if (!st) return;
+  if (!st) {
+    SIGK_UNLOCK_W();
+    return;
+  }
 
   // Interpret value > epsilon as pressed.
   const int down = (value > epsilon) ? 1 : 0;
   const float v = down ? 1.0f : 0.0f;
   apply_button_like(st, now_ns, down, v);
+  SIGK_UNLOCK_W();
 }
 
 // ---------------- Signal operator helpers (prototype) ----------------
@@ -252,6 +288,7 @@ GP_EXPORT int gp_sigk_peek_sel(uint64_t now_ns, uint32_t signal_id, uint32_t sel
   GP_SignalFrame tmp;
   if (!gp_sigk_peek(now_ns, signal_id, &tmp)) return 0;
 
+  SIGK_LOCK_R();
   SigK_State* st = get_state(signal_id, 0);
 
   float v = tmp.value;
@@ -319,6 +356,8 @@ GP_EXPORT int gp_sigk_peek_sel(uint64_t now_ns, uint32_t signal_id, uint32_t sel
       v = tmp.value;
       break;
   }
+
+  SIGK_UNLOCK_R();
 
   *out = tmp;
   out->value = v;

@@ -181,6 +181,8 @@ class ControllerBackend:
                 kind_code = int(signal_kernel_api.GP_EV_KEY)
             elif kind in ("mouse_motion", "motion"):
                 kind_code = int(signal_kernel_api.GP_EV_MOUSE_MOTION)
+            elif kind == "mouse_button":
+                kind_code = int(signal_kernel_api.GP_EV_MOUSE_BUTTON)
             else:
                 kind_code = int(signal_kernel_api.GP_EV_AXIS)
 

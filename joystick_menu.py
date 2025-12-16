@@ -5,7 +5,7 @@ import os
 import shutil
 import ctypes
 import time
-from typing import Any
+from typing import Any, Iterable
 import sys
 
 import pygame
@@ -17,6 +17,37 @@ import scroll_model
 
 
 MENU_SPEC_PATH = "menu.json"
+
+
+_CONTROLS_DIRTY = False
+
+
+def mark_controls_dirty() -> None:
+    global _CONTROLS_DIRTY
+    _CONTROLS_DIRTY = True
+
+
+def consume_controls_dirty() -> bool:
+    global _CONTROLS_DIRTY
+    v = bool(_CONTROLS_DIRTY)
+    _CONTROLS_DIRTY = False
+    return v
+
+
+# Binding UX tuning: use the same reticle-confirm timing everywhere.
+# The intention is to avoid accidental binds and make capture feel consistent.
+BIND_LOCK_DELAY_S = 0.20
+BIND_READY_DELAY_S = 0.45
+
+
+_BIND_RETICLE_ASSETS: reticle_sprite.ReticleAssets | None = None
+
+
+def _get_bind_reticle_assets(*, size_px: int = 64) -> reticle_sprite.ReticleAssets:
+    global _BIND_RETICLE_ASSETS
+    if _BIND_RETICLE_ASSETS is None:
+        _BIND_RETICLE_ASSETS = reticle_sprite.load_reticle_assets(size_px=int(size_px))
+    return _BIND_RETICLE_ASSETS
 
 
 def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
@@ -86,6 +117,411 @@ def save_joystick_config(cfg: dict[str, Any], path: str = "joystick.json") -> No
     if not isinstance(cfg, dict):
         cfg = {}
     _atomic_write_json(path, cfg)
+    try:
+        if os.path.basename(str(path)).lower() == "joystick.json":
+            mark_controls_dirty()
+    except Exception:
+        pass
+
+
+def _menu_bindings_block(cfg: dict[str, Any]) -> dict[str, Any]:
+    blk = cfg.get("menu_bindings")
+    return blk if isinstance(blk, dict) else {}
+
+
+def ensure_menu_bindings_block(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Ensure cfg['menu_bindings'] exists.
+
+    This block is used for bootstrapping menu input in a fresh config.
+    It primarily lives outside the compiled controller graph.
+    
+    However, we also opportunistically seed a minimal set of *compiled* controller
+    graph outputs for menu navigation (DirOR) and menu actions (Confirm/Cancel/Menu)
+    so a fresh config can operate menus without running a blocking bootstrap.
+    """
+    if not isinstance(cfg.get("menu_bindings"), dict):
+        cfg["menu_bindings"] = {}
+    blk = cfg["menu_bindings"]
+    # 2D channel index used for menu directional navigation (via controller graph).
+    if not isinstance(blk.get("nav_channel_2d"), int):
+        blk["nav_channel_2d"] = 1
+    # Optional keyboard keys for menu toggle/accept/back.
+    # Store as pygame keycodes (ints), or None if unbound.
+    if blk.get("toggle_key") is not None and not isinstance(blk.get("toggle_key"), int):
+        blk["toggle_key"] = None
+    if blk.get("accept_key") is not None and not isinstance(blk.get("accept_key"), int):
+        blk["accept_key"] = None
+    if blk.get("back_key") is not None and not isinstance(blk.get("back_key"), int):
+        blk["back_key"] = None
+
+    # Also seed controller-graph menu outputs if missing.
+    try:
+        cfg = input_graph.ensure_controller_graph(cfg)
+        fc = cfg.get("flight_controls") if isinstance(cfg.get("flight_controls"), dict) else None
+        ctrl = fc.get("controller") if isinstance(fc, dict) else None
+        if isinstance(ctrl, dict):
+            sigs = ctrl.get("signals") if isinstance(ctrl.get("signals"), dict) else None
+            chs = ctrl.get("channels") if isinstance(ctrl.get("channels"), dict) else None
+            if isinstance(sigs, dict) and isinstance(chs, dict):
+                # Stable channel indices for initial menu controls.
+                CH_MENU_CONFIRM = 6
+                CH_MENU_CANCEL = 7
+                CH_MENU_OPEN = 8
+                CH_MENU_RIGHT = 9
+                CH_MENU_LEFT = 10
+                CH_MENU_UP = 11
+                CH_MENU_DOWN = 12
+
+                def _ensure_signal(sid: str, node: dict[str, Any]) -> None:
+                    if sid not in sigs or not isinstance(sigs.get(sid), dict):
+                        sigs[str(sid)] = dict(node)
+
+                def _ensure_channel(ch_idx: int, sid: str) -> None:
+                    k = str(int(ch_idx))
+                    if k not in chs or not isinstance(chs.get(k), dict):
+                        chs[k] = {"source": "signal", "id": str(sid)}
+
+                def _in_joybtn(b: int) -> dict[str, Any]:
+                    return {"source": "input", "device": "joystick", "kind": "button", "id": int(b), "state": "D"}
+
+                def _in_key(kc: int) -> dict[str, Any]:
+                    return {"source": "input", "device": "keyboard", "kind": "key", "id": int(kc), "state": "D"}
+
+                def _in_mbtn(b: int) -> dict[str, Any]:
+                    return {"source": "input", "device": "mouse", "kind": "mouse_button", "id": int(b), "state": "D"}
+
+                def _ensure_or_signal(name: str, inputs: list[dict[str, Any]]) -> str:
+                    # Build an OR-like scalar by summing multiple button/key inputs.
+                    # Hook watches use threshold>0.5, so any single active source trips it.
+                    if str(name) in sigs and isinstance(sigs.get(str(name)), dict):
+                        return str(name)
+                    inputs2 = [it for it in inputs if isinstance(it, dict)]
+                    if not inputs2:
+                        _ensure_signal(str(name), {"op": "const", "dim": 1, "value": 0.0})
+                        return str(name)
+                    if len(inputs2) == 1:
+                        _ensure_signal(str(name), {"op": "passthrough", "dim": 1, "args": [inputs2[0]]})
+                        return str(name)
+                    prev = f"{name}__0"
+                    _ensure_signal(str(prev), {"op": "passthrough", "dim": 1, "args": [inputs2[0]]})
+                    for i in range(1, len(inputs2) - 1):
+                        sid_i = f"{name}__{i}"
+                        _ensure_signal(str(sid_i), {"op": "add", "dim": 1, "args": [{"source": "signal", "id": str(prev)}, inputs2[i]]})
+                        prev = str(sid_i)
+                    _ensure_signal(str(name), {"op": "add", "dim": 1, "args": [{"source": "signal", "id": str(prev)}, inputs2[-1]]})
+                    return str(name)
+
+                # Direction signals derived from DirOR (signed). Hook thresholds are v>=thr,
+                # so we invert negative directions via (0 - x/y) to make them positive.
+                _ensure_signal("MenuZero", {"op": "const", "dim": 1, "value": 0.0})
+                _ensure_signal(
+                    "MenuNavRight",
+                    {"op": "passthrough", "dim": 1, "args": [{"source": "signal", "id": "DirOR", "comp": "x"}]},
+                )
+                _ensure_signal(
+                    "MenuNavUp",
+                    {"op": "passthrough", "dim": 1, "args": [{"source": "signal", "id": "DirOR", "comp": "y"}]},
+                )
+                _ensure_signal(
+                    "MenuNavLeft",
+                    {"op": "sub", "dim": 1, "args": [{"source": "signal", "id": "MenuZero"}, {"source": "signal", "id": "DirOR", "comp": "x"}]},
+                )
+                _ensure_signal(
+                    "MenuNavDown",
+                    {"op": "sub", "dim": 1, "args": [{"source": "signal", "id": "MenuZero"}, {"source": "signal", "id": "DirOR", "comp": "y"}]},
+                )
+
+                # OR controls for the three menu actions.
+                menu_btn = 7
+                try:
+                    if isinstance(cfg.get("menu_button"), int):
+                        menu_btn = int(cfg.get("menu_button"))
+                except Exception:
+                    menu_btn = 7
+
+                _ensure_or_signal(
+                    "MenuConfirmOR",
+                    [
+                        _in_joybtn(0),
+                        _in_key(int(pygame.K_RETURN)),
+                        _in_key(int(getattr(pygame, "K_KP_ENTER", pygame.K_RETURN))),
+                        _in_key(int(pygame.K_SPACE)),
+                    ],
+                )
+                _ensure_or_signal(
+                    "MenuCancelOR",
+                    [
+                        _in_joybtn(1),
+                        _in_key(int(pygame.K_ESCAPE)),
+                        _in_mbtn(3),
+                    ],
+                )
+                _ensure_or_signal(
+                    "MenuOpenOR",
+                    [
+                        _in_joybtn(int(menu_btn)),
+                        _in_key(int(pygame.K_TAB)),
+                        _in_key(int(pygame.K_e)),
+                        _in_key(int(pygame.K_i)),
+                        _in_key(int(pygame.K_m)),
+                        _in_mbtn(2),
+                    ],
+                )
+
+                # Publish controller outputs as channels.
+                _ensure_channel(int(CH_MENU_CONFIRM), "MenuConfirmOR")
+                _ensure_channel(int(CH_MENU_CANCEL), "MenuCancelOR")
+                _ensure_channel(int(CH_MENU_OPEN), "MenuOpenOR")
+                _ensure_channel(int(CH_MENU_RIGHT), "MenuNavRight")
+                _ensure_channel(int(CH_MENU_LEFT), "MenuNavLeft")
+                _ensure_channel(int(CH_MENU_UP), "MenuNavUp")
+                _ensure_channel(int(CH_MENU_DOWN), "MenuNavDown")
+
+                # Seed controller hook bindings for semantic menu actions.
+                hb = ctrl.get("hook_bindings")
+                if not isinstance(hb, list):
+                    hb = []
+                    ctrl["hook_bindings"] = hb
+
+                existing_actions = {str(it.get("action")) for it in hb if isinstance(it, dict) and isinstance(it.get("action"), str)}
+
+                def _ensure_hook(action: str, ch: int, *, edge: str = "rise", thr: float = 0.5, hyst: float = 0.08) -> None:
+                    if str(action) in existing_actions:
+                        return
+                    hb.append(
+                        {
+                            "action": str(action),
+                            "source": "channel",
+                            "channel": int(ch),
+                            "comp": 0,
+                            "edge": str(edge),
+                            "threshold": float(thr),
+                            "hysteresis": float(hyst),
+                            "dispatch": "async",
+                        }
+                    )
+                    existing_actions.add(str(action))
+
+                _ensure_hook("menu_open", int(CH_MENU_OPEN), edge="rise", thr=0.5, hyst=0.05)
+                _ensure_hook("menu_confirm", int(CH_MENU_CONFIRM), edge="rise", thr=0.5, hyst=0.05)
+                _ensure_hook("menu_cancel", int(CH_MENU_CANCEL), edge="rise", thr=0.5, hyst=0.05)
+                _ensure_hook("menu_right", int(CH_MENU_RIGHT), edge="rise", thr=0.5, hyst=0.15)
+                _ensure_hook("menu_left", int(CH_MENU_LEFT), edge="rise", thr=0.5, hyst=0.15)
+                _ensure_hook("menu_up", int(CH_MENU_UP), edge="rise", thr=0.5, hyst=0.15)
+                _ensure_hook("menu_down", int(CH_MENU_DOWN), edge="rise", thr=0.5, hyst=0.15)
+    except Exception:
+        pass
+    return cfg
+
+
+def menu_bindings_complete(cfg: dict[str, Any]) -> bool:
+    """True if the user has a complete menu control set.
+
+    Requirements (fresh-start):
+    - Some way to toggle/open menu: either legacy menu_button, or menu_bindings.toggle_key.
+    - Accept/back: either legacy menu_nav confirm/cancel, or menu_bindings.accept_key/back_key.
+    - Directional nav: either legacy menu_nav up/down/left/right, or menu_bindings.nav_channel_2d.
+    """
+    # New path: controller-engine hook bindings can fully define the menu controls.
+    ctrl_actions: set[str] = set()
+    try:
+        fc = cfg.get("flight_controls") if isinstance(cfg.get("flight_controls"), dict) else None
+        ctrl = fc.get("controller") if isinstance(fc, dict) else None
+        hb = ctrl.get("hook_bindings") if isinstance(ctrl, dict) else None
+        if isinstance(hb, list):
+            for it in hb:
+                if isinstance(it, dict) and isinstance(it.get("action"), str):
+                    ctrl_actions.add(str(it.get("action")))
+    except Exception:
+        ctrl_actions = set()
+
+    # Toggle
+    has_toggle = False
+    if isinstance(cfg.get("menu_button"), int):
+        has_toggle = True
+    blk = _menu_bindings_block(cfg)
+    if isinstance(blk.get("toggle_key"), int):
+        has_toggle = True
+    if "menu_open" in ctrl_actions:
+        has_toggle = True
+
+    # Accept/back
+    nav = cfg.get("menu_nav") if isinstance(cfg.get("menu_nav"), dict) else {}
+    has_accept = isinstance(nav.get("confirm"), dict) or isinstance(blk.get("accept_key"), int)
+    has_back = isinstance(nav.get("cancel"), dict) or isinstance(blk.get("back_key"), int)
+    if "menu_confirm" in ctrl_actions:
+        has_accept = True
+    if "menu_cancel" in ctrl_actions:
+        has_back = True
+
+    # Directions
+    has_dirs = all(isinstance(nav.get(k), dict) for k in ("up", "down", "left", "right"))
+    if not has_dirs:
+        has_dirs = isinstance(blk.get("nav_channel_2d"), int)
+    if {"menu_up", "menu_down", "menu_left", "menu_right"}.issubset(ctrl_actions):
+        has_dirs = True
+
+    return bool(has_toggle and has_accept and has_back and has_dirs)
+
+
+def reset_action_bindings_keep_controller(*, cfg_path: str = "joystick.json") -> bool:
+    """Wipe action↔input mappings but retain joystick device/signal/channel settings.
+
+    Keeps:
+    - flight_controls.controller (signals/channels/device_prefs/features/state)
+
+    Clears:
+    - flight_controls camera/triggers/weapons/sets/profiles/toggles/state beyond controller
+    - legacy menu_nav + menu_button bindings
+
+    Adds:
+    - menu_bindings block (keyboard accept/back/toggle + nav_channel_2d)
+    """
+    cfg = load_or_create_joystick_config(str(cfg_path))
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    # Preserve controller block if present.
+    ctrl_blk: dict[str, Any] | None = None
+    fc = cfg.get("flight_controls") if isinstance(cfg.get("flight_controls"), dict) else None
+    if isinstance(fc, dict):
+        cb = fc.get("controller")
+        if isinstance(cb, dict):
+            # Deep copy through json round-trip to avoid retaining shared references.
+            try:
+                ctrl_blk = json.loads(json.dumps(cb))
+            except Exception:
+                ctrl_blk = dict(cb)
+
+    # Rebuild flight_controls with controller only.
+    cfg["flight_controls"] = {"controller": (ctrl_blk or {})}
+
+    # Clear legacy menu bindings.
+    cfg.pop("menu_nav", None)
+    cfg.pop("menu_scroll", None)
+    cfg.pop("menu_button", None)
+
+    # Fresh menu bindings scaffold (defaults show off 2D channel nav).
+    cfg = ensure_menu_bindings_block(cfg)
+    blk = cfg["menu_bindings"]
+    blk["nav_channel_2d"] = 1
+    blk["toggle_key"] = None
+    blk["accept_key"] = None
+    blk["back_key"] = None
+
+    save_joystick_config(cfg, str(cfg_path))
+    return True
+
+
+def _draw_reticle_capture_screen(
+    *,
+    font: pygame.font.Font,
+    label: str,
+    label_x: float,
+    label_y: float,
+    ret_x: float,
+    ret_y: float,
+    stage: reticle_sprite.ReticleStage,
+    assets: reticle_sprite.ReticleAssets,
+) -> None:
+    from OpenGL.GL import (
+        GL_DEPTH_TEST,
+        GL_BLEND,
+        GL_COLOR_BUFFER_BIT,
+        GL_ONE_MINUS_SRC_ALPHA,
+        GL_SRC_ALPHA,
+        GL_UNSIGNED_BYTE,
+        GL_RGBA,
+        glBlendFunc,
+        glClear,
+        glClearColor,
+        glDisable,
+        glDrawPixels,
+        glEnable,
+        glIsEnabled,
+        glLoadIdentity,
+        glMatrixMode,
+        glOrtho,
+        glPixelStorei,
+        glPopMatrix,
+        glPushMatrix,
+        glRasterPos2f,
+        GL_MODELVIEW,
+        GL_PROJECTION,
+        GL_UNPACK_ALIGNMENT,
+    )
+
+    depth_was_enabled = bool(glIsEnabled(GL_DEPTH_TEST))
+    if depth_was_enabled:
+        glDisable(GL_DEPTH_TEST)
+    glClearColor(0.0, 0.0, 0.0, 1.0)
+    glClear(GL_COLOR_BUFFER_BIT)
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, 1, 0, 1, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+
+    surf_lbl = _render_cell_text(font, str(label))
+    lbl_data = pygame.image.tostring(surf_lbl, "RGBA", True)
+    glRasterPos2f(float(label_x), float(label_y))
+    glDrawPixels(surf_lbl.get_width(), surf_lbl.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, lbl_data)
+
+    surf_ret = assets.surfaces.get(stage)
+    if surf_ret is not None:
+        r_data = pygame.image.tostring(surf_ret, "RGBA", True)
+        glRasterPos2f(float(ret_x), float(ret_y))
+        glDrawPixels(surf_ret.get_width(), surf_ret.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, r_data)
+
+    glDisable(GL_BLEND)
+    if depth_was_enabled:
+        glEnable(GL_DEPTH_TEST)
+    glPopMatrix()
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+
+
+def _reticle_confirm_frame(
+    *,
+    font: pygame.font.Font,
+    label: str,
+    assets: reticle_sprite.ReticleAssets,
+    anim: reticle_sprite.ReticleAnimator,
+    clock: pygame.time.Clock,
+    start: tuple[float, float],
+    target: tuple[float, float],
+    ret_x: float,
+    ret_y: float,
+    candidate_active: bool,
+    label_x: float = 0.40,
+    label_y: float = 0.52,
+    lerp: float = 0.20,
+) -> tuple[float, float, reticle_sprite.ReticleStage]:
+    desired = target if bool(candidate_active) else start
+    ret_x += (float(desired[0]) - float(ret_x)) * float(lerp)
+    ret_y += (float(desired[1]) - float(ret_y)) * float(lerp)
+    on_target = (abs(float(ret_x) - float(target[0])) <= 0.015) and (abs(float(ret_y) - float(target[1])) <= 0.020)
+    now_s = pygame.time.get_ticks() * 0.001
+    stage = anim.update(on_target=bool(on_target and candidate_active), now_s=float(now_s))
+    _draw_reticle_capture_screen(
+        font=font,
+        label=str(label),
+        label_x=float(label_x),
+        label_y=float(label_y),
+        ret_x=float(ret_x),
+        ret_y=float(ret_y),
+        stage=stage,
+        assets=assets,
+    )
+    pygame.display.flip()
+    clock.tick(60)
+    return float(ret_x), float(ret_y), stage
 
 
 def _default_menu_spec() -> dict[str, Any]:
@@ -497,7 +933,7 @@ def ensure_menu_navigation_bindings(
     # Reticle assets/animator for the puzzle (fast confirm).
     if not hasattr(ensure_menu_navigation_bindings, "_reticle_assets"):
         ensure_menu_navigation_bindings._reticle_assets = reticle_sprite.load_reticle_assets(size_px=64)
-        ensure_menu_navigation_bindings._reticle_anim = reticle_sprite.ReticleAnimator(lock_delay_s=0.20, ready_delay_s=0.45)
+        ensure_menu_navigation_bindings._reticle_anim = reticle_sprite.ReticleAnimator(lock_delay_s=float(BIND_LOCK_DELAY_S), ready_delay_s=float(BIND_READY_DELAY_S))
 
     assets = ensure_menu_navigation_bindings._reticle_assets
     anim = ensure_menu_navigation_bindings._reticle_anim
@@ -811,41 +1247,77 @@ def ensure_menu_navigation_bindings(
     return changed
 
 
-def _poll_joystick_snapshot(joystick: pygame.joystick.Joystick) -> tuple[dict[int, float], set[int], dict[int, tuple[int, int]]]:
+def _poll_joystick_snapshot(
+    joystick: pygame.joystick.Joystick,
+    *,
+    axes_ids: Iterable[int] | None = None,
+    button_ids: Iterable[int] | None = None,
+    hat_ids: Iterable[int] | None = None,
+) -> tuple[dict[int, float], set[int], dict[int, tuple[int, int]]]:
+    """Return (axes, buttons_down, hats).
+
+    If ids are provided, poll only those ids. This is critical for announce-mode:
+    callers can avoid consuming "everything" and instead poll only declared specs.
+    """
+
     axes: dict[int, float] = {}
     buttons: set[int] = set()
     hats: dict[int, tuple[int, int]] = {}
-    try:
-        n_axes = int(joystick.get_numaxes())
-        for a in range(max(0, n_axes)):
+
+    if axes_ids is None:
+        try:
+            n_axes = int(joystick.get_numaxes())
+            for a in range(max(0, n_axes)):
+                try:
+                    axes[int(a)] = float(joystick.get_axis(a))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        for a in axes_ids:
             try:
-                axes[int(a)] = float(joystick.get_axis(a))
+                axes[int(a)] = float(joystick.get_axis(int(a)))
             except Exception:
                 pass
-    except Exception:
-        pass
 
-    try:
-        n_buttons = int(joystick.get_numbuttons())
-        for b in range(max(0, n_buttons)):
+    if button_ids is None:
+        try:
+            n_buttons = int(joystick.get_numbuttons())
+            for b in range(max(0, n_buttons)):
+                try:
+                    if int(joystick.get_button(b)) != 0:
+                        buttons.add(int(b))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    else:
+        for b in button_ids:
             try:
-                if int(joystick.get_button(b)) != 0:
+                if int(joystick.get_button(int(b))) != 0:
                     buttons.add(int(b))
             except Exception:
                 pass
-    except Exception:
-        pass
 
-    try:
-        n_hats = int(joystick.get_numhats())
-        for h in range(max(0, n_hats)):
+    if hat_ids is None:
+        try:
+            n_hats = int(joystick.get_numhats())
+            for h in range(max(0, n_hats)):
+                try:
+                    v = joystick.get_hat(h)
+                    hats[int(h)] = (int(v[0]), int(v[1]))
+                except Exception:
+                    hats[int(h)] = (0, 0)
+        except Exception:
+            pass
+    else:
+        for h in hat_ids:
             try:
-                v = joystick.get_hat(h)
+                v = joystick.get_hat(int(h))
                 hats[int(h)] = (int(v[0]), int(v[1]))
             except Exception:
                 hats[int(h)] = (0, 0)
-    except Exception:
-        pass
 
     return axes, buttons, hats
 
@@ -2006,10 +2478,17 @@ def run_main_menu(
     height: int,
     joystick: pygame.joystick.Joystick | None,
     menu_button: int | None,
+    start_node: str = "main",
     menu_context: dict[str, Any] | None = None,
 ) -> str:
-    # Optional: use backend-derived channel0 (DirOR) for navigation.
+    # Optional: use controller-engine-derived channel0 (DirOR) for navigation.
+    # This uses the same C signal-kernel inputs as the rest of the program.
     sigk = None
+    ctl = None
+    ctl_meta = None
+    ctl_outputs: dict[int, Any] = {}
+    ctl_buf = None
+    ctl_ready = False
     ctrl_backend = None
     try:
         from c_physics import signal_kernel_api
@@ -2021,9 +2500,61 @@ def run_main_menu(
                 sigk.gp_sigk_reset()
             except Exception:
                 pass
-            ctrl_backend = controller_backend.ControllerBackend(sigk)
+
+            # Prefer the C controller engine if present.
+            try:
+                import ctypes
+
+                from c_physics import controller_engine_api
+                from c_physics.controller_engine_ctypes import GP_CtlMeta, GP_CtlOutputDesc
+
+                _lib2, ctl = controller_engine_api.try_load_controller_engine(search_dir="c_physics")
+                if ctl is not None:
+                    ok_load = int(ctl.gp_ctl_load_graph_file(b"controller_graph_final.bin"))
+                    if ok_load:
+                        # No initial passthrough here; menu nav should work off compiled channels.
+                        if hasattr(ctl, "gp_ctl_passthru_clear"):
+                            try:
+                                ctl.gp_ctl_passthru_clear()
+                            except Exception:
+                                pass
+
+                        meta = GP_CtlMeta()
+                        if int(ctl.gp_ctl_get_meta(ctypes.byref(meta))) == 1:
+                            n_out = int(meta.output_count)
+                            outs: dict[int, Any] = {}
+                            if n_out > 0:
+                                arr_t = GP_CtlOutputDesc * n_out
+                                arr = arr_t()
+                                got = int(ctl.gp_ctl_get_outputs(arr, int(n_out)))
+                                for i in range(max(0, got)):
+                                    d = arr[int(i)]
+                                    outs[int(d.channel)] = d
+                            buf = None
+                            if int(meta.total_floats) > 0:
+                                buf = (ctypes.c_float * int(meta.total_floats))()
+                            if buf is not None:
+                                ctl_meta = meta
+                                ctl_outputs = outs
+                                ctl_buf = buf
+                                ctl_ready = True
+            except Exception:
+                ctl = None
+                ctl_meta = None
+                ctl_outputs = {}
+                ctl_buf = None
+                ctl_ready = False
+
+            # Python fallback backend (still consumes the C signal kernel).
+            if not ctl_ready:
+                ctrl_backend = controller_backend.ControllerBackend(sigk)
     except Exception:
         sigk = None
+        ctl = None
+        ctl_meta = None
+        ctl_outputs = {}
+        ctl_buf = None
+        ctl_ready = False
         ctrl_backend = None
 
     # Keep ids small (<= 65535) because item_id is stored in 16 bits in the kernel signal_id.
@@ -2033,25 +2564,72 @@ def run_main_menu(
     KBD_AXIS_ARROWS_Y = 3
     HARD_HAT_AXIS_BASE = 50000
 
+    # Selected 2D channel used for menu navigation (updated from cfg["menu_bindings"]).
+    nav_channel_2d = 0
+
     def _backend_nav_vec(*, joystick: pygame.joystick.Joystick) -> tuple[float, float] | None:
         if sigk is None or ctrl_backend is None:
-            return None
+            # Allow controller engine to drive nav even if Python backend is unavailable.
+            if not (sigk is not None and ctl_ready and ctl is not None and ctl_meta is not None and ctl_buf is not None):
+                return None
         try:
             from c_physics.signal_kernel_ctypes import GP_InputEvent
             from c_physics import signal_kernel_api
 
+            # Input policy: (allow, deny) set model.
+            # allow is None => allow all (scan/listen). allow is set() => allow none (quiet announce).
+            try:
+                import input_interest
+
+                get_effective_set = input_interest.get_effective_set
+            except Exception:
+
+                def get_effective_set():  # type: ignore[no-redef]
+                    return (None, set())
+
             now_ns = int(time.monotonic_ns())
 
-            axes_now, _buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+            allow, deny = get_effective_set()
+            allow_all = allow is None
+            want_joy_axes_physical: set[int] | None = None
+            want_hat_axes: set[int] | None = None
+            want_hat_ids: set[int] | None = None
+            want_kbd_axes: set[int] | None = None
+            want_mouse_motion: set[int] | None = None
+
+            if not allow_all:
+                want_joy_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_AXIS)}
+                want_joy_axes_physical = {int(iid) for iid in want_joy_axes if 0 <= int(iid) < int(HARD_HAT_AXIS_BASE)}
+                want_hat_axes = {int(iid) for iid in want_joy_axes if int(iid) >= int(HARD_HAT_AXIS_BASE)}
+                want_hat_ids = {int((int(iid) - int(HARD_HAT_AXIS_BASE)) // 2) for iid in (want_hat_axes or set())}
+                want_kbd_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_KEYBOARD) and int(k) == int(signal_kernel_api.GP_EV_AXIS)}
+                want_mouse_motion = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_MOUSE) and int(k) == int(signal_kernel_api.GP_EV_MOUSE_MOTION)}
+
+            if allow_all:
+                axes_now, _buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+            else:
+                axes_now, _buttons_now, hats_now = _poll_joystick_snapshot(
+                    joystick,
+                    axes_ids=want_joy_axes_physical,
+                    button_ids=set(),
+                    hat_ids=want_hat_ids,
+                )
 
             evs: list[GP_InputEvent] = []
 
             # Joystick axes each frame.
-            try:
-                na = int(joystick.get_numaxes())
-            except Exception:
-                na = 0
-            for a in range(max(0, na)):
+            if allow_all:
+                try:
+                    na = int(joystick.get_numaxes())
+                except Exception:
+                    na = 0
+                axis_iter = [int(a) for a in range(max(0, na))]
+            else:
+                axis_iter = sorted(list(want_joy_axes_physical or set()))
+            for a in axis_iter:
+                spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(a))
+                if spec in deny:
+                    continue
                 vv = float((axes_now or {}).get(int(a), 0.0))
                 evs.append(
                     GP_InputEvent(
@@ -2066,40 +2644,53 @@ def run_main_menu(
                 )
 
             # Hat axes (virtual joystick axis ids).
-            try:
-                nh = int(joystick.get_numhats())
-            except Exception:
-                nh = 0
-            for h in range(max(0, nh)):
+            if allow_all:
+                try:
+                    nh = int(joystick.get_numhats())
+                except Exception:
+                    nh = 0
+                hat_iter = [int(h) for h in range(max(0, nh))]
+            else:
+                hat_iter = sorted(list(want_hat_ids or set()))
+
+            for h in hat_iter:
                 hx, hy = (hats_now or {}).get(int(h), (0, 0))
-                evs.append(
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                        kind=int(signal_kernel_api.GP_EV_AXIS),
-                        id=int(HARD_HAT_AXIS_BASE + int(h) * 2 + 0),
-                        v0=float(int(hx)),
-                        v1=0.0,
-                        flags=0,
+                hx_id = int(HARD_HAT_AXIS_BASE + int(h) * 2 + 0)
+                hy_id = int(HARD_HAT_AXIS_BASE + int(h) * 2 + 1)
+                specx = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(hx_id))
+                specy = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(hy_id))
+                if specx not in deny and (allow_all or int(hx_id) in (want_hat_axes or set())):
+                    evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                            kind=int(signal_kernel_api.GP_EV_AXIS),
+                            id=int(hx_id),
+                            v0=float(int(hx)),
+                            v1=0.0,
+                            flags=0,
+                        )
                     )
-                )
-                evs.append(
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                        kind=int(signal_kernel_api.GP_EV_AXIS),
-                        id=int(HARD_HAT_AXIS_BASE + int(h) * 2 + 1),
-                        v0=float(int(hy)),
-                        v1=0.0,
-                        flags=0,
+                if specy not in deny and (allow_all or int(hy_id) in (want_hat_axes or set())):
+                    evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                            kind=int(signal_kernel_api.GP_EV_AXIS),
+                            id=int(hy_id),
+                            v0=float(int(hy)),
+                            v1=0.0,
+                            flags=0,
+                        )
                     )
-                )
 
             # Keyboard direction axes (WASD + arrows).
-            try:
-                pressed = pygame.key.get_pressed()
-            except Exception:
-                pressed = None
+            pressed = None
+            if allow_all or (want_kbd_axes and len(want_kbd_axes)):
+                try:
+                    pressed = pygame.key.get_pressed()
+                except Exception:
+                    pressed = None
 
             def _is_down(k: int) -> int:
                 if pressed is None:
@@ -2114,8 +2705,9 @@ def run_main_menu(
             arrows_x = float(_is_down(pygame.K_RIGHT) - _is_down(pygame.K_LEFT))
             arrows_y = float(_is_down(pygame.K_UP) - _is_down(pygame.K_DOWN))
 
-            evs.extend(
-                [
+            spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS), int(KBD_AXIS_WASD_X))
+            if spec not in deny and (allow_all or int(KBD_AXIS_WASD_X) in (want_kbd_axes or set())):
+                evs.append(
                     GP_InputEvent(
                         t_mono_ns=now_ns,
                         device=int(signal_kernel_api.GP_DEV_KEYBOARD),
@@ -2124,7 +2716,11 @@ def run_main_menu(
                         v0=float(wasd_x),
                         v1=0.0,
                         flags=0,
-                    ),
+                    )
+                )
+            spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS), int(KBD_AXIS_WASD_Y))
+            if spec not in deny and (allow_all or int(KBD_AXIS_WASD_Y) in (want_kbd_axes or set())):
+                evs.append(
                     GP_InputEvent(
                         t_mono_ns=now_ns,
                         device=int(signal_kernel_api.GP_DEV_KEYBOARD),
@@ -2133,7 +2729,11 @@ def run_main_menu(
                         v0=float(wasd_y),
                         v1=0.0,
                         flags=0,
-                    ),
+                    )
+                )
+            spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS), int(KBD_AXIS_ARROWS_X))
+            if spec not in deny and (allow_all or int(KBD_AXIS_ARROWS_X) in (want_kbd_axes or set())):
+                evs.append(
                     GP_InputEvent(
                         t_mono_ns=now_ns,
                         device=int(signal_kernel_api.GP_DEV_KEYBOARD),
@@ -2142,7 +2742,11 @@ def run_main_menu(
                         v0=float(arrows_x),
                         v1=0.0,
                         flags=0,
-                    ),
+                    )
+                )
+            spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS), int(KBD_AXIS_ARROWS_Y))
+            if spec not in deny and (allow_all or int(KBD_AXIS_ARROWS_Y) in (want_kbd_axes or set())):
+                evs.append(
                     GP_InputEvent(
                         t_mono_ns=now_ns,
                         device=int(signal_kernel_api.GP_DEV_KEYBOARD),
@@ -2151,17 +2755,19 @@ def run_main_menu(
                         v0=float(arrows_y),
                         v1=0.0,
                         flags=0,
-                    ),
-                ]
-            )
+                    )
+                )
 
             # Mouse delta (dx/dy).
-            try:
-                mdx, mdy = pygame.mouse.get_rel()
-            except Exception:
-                mdx, mdy = 0, 0
-            evs.extend(
-                [
+            mdx, mdy = 0, 0
+            if allow_all or (want_mouse_motion and len(want_mouse_motion)):
+                try:
+                    mdx, mdy = pygame.mouse.get_rel()
+                except Exception:
+                    mdx, mdy = 0, 0
+            spec = (int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_MOTION), 0)
+            if spec not in deny and (allow_all or 0 in (want_mouse_motion or set())):
+                evs.append(
                     GP_InputEvent(
                         t_mono_ns=now_ns,
                         device=int(signal_kernel_api.GP_DEV_MOUSE),
@@ -2170,7 +2776,11 @@ def run_main_menu(
                         v0=float(mdx),
                         v1=0.0,
                         flags=0,
-                    ),
+                    )
+                )
+            spec = (int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_MOTION), 1)
+            if spec not in deny and (allow_all or 1 in (want_mouse_motion or set())):
+                evs.append(
                     GP_InputEvent(
                         t_mono_ns=now_ns,
                         device=int(signal_kernel_api.GP_DEV_MOUSE),
@@ -2179,23 +2789,45 @@ def run_main_menu(
                         v0=float(mdy),
                         v1=0.0,
                         flags=0,
-                    ),
-                ]
-            )
+                    )
+                )
 
             if evs:
                 arr_t = GP_InputEvent * len(evs)
                 sigk.gp_sigk_push_events(arr_t(*evs), int(len(evs)))
 
-            _overrides_1d, channels_2d = ctrl_backend.step(now_ns=now_ns)
-            if hasattr(sigk, "gp_sigk_clear_pulses"):
+            # Prefer selected 2D channel from the C controller engine.
+            if ctl_ready and ctl is not None and ctl_meta is not None and ctl_buf is not None:
                 try:
-                    sigk.gp_sigk_clear_pulses()
+                    import ctypes
+
+                    # Step once on the calling thread (menu runs before the main tick thread).
+                    ctl.gp_ctl_step_once(int(now_ns))
+
+                    d0 = ctl_outputs.get(int(nav_channel_2d))
+                    if d0 is not None and int(getattr(d0, "dim", 0)) >= 2:
+                        seq = ctypes.c_uint64(0)
+                        t_ns = ctypes.c_uint64(0)
+                        if int(ctl.gp_ctl_peek_latest(ctl_buf, int(ctl_meta.total_floats), ctypes.byref(seq), ctypes.byref(t_ns))) == 1:
+                            off = int(getattr(d0, "offset", 0))
+                            stride = int(getattr(d0, "stride", 1)) if int(getattr(d0, "stride", 1)) > 0 else 1
+                            x = float(ctl_buf[off])
+                            y = float(ctl_buf[off + stride])
+                            return float(x), float(y)
                 except Exception:
                     pass
-            if isinstance(channels_2d, dict) and 0 in channels_2d:
-                x, y = channels_2d.get(0, (0.0, 0.0))
-                return float(x), float(y)
+
+            # Fallback: evaluate with the Python backend.
+            if ctrl_backend is not None:
+                _overrides_1d, channels_2d = ctrl_backend.step(now_ns=now_ns)
+                if hasattr(sigk, "gp_sigk_clear_pulses"):
+                    try:
+                        sigk.gp_sigk_clear_pulses()
+                    except Exception:
+                        pass
+                if isinstance(channels_2d, dict) and int(nav_channel_2d) in channels_2d:
+                    x, y = channels_2d.get(int(nav_channel_2d), (0.0, 0.0))
+                    return float(x), float(y)
             return None
         except Exception:
             return None
@@ -2631,6 +3263,249 @@ def run_main_menu(
         ctrl["state"]["last_feature"] = str(fid)
         save_joystick_config(cfg, "joystick.json")
 
+    def _controller_report_single_press() -> None:
+        """Read-only tool: capture one input actuation and report backend channel output.
+
+        Does not modify joystick.json; purely informational.
+        """
+        if joystick is None:
+            return
+
+        # Ensure we have an up-to-date final graph so the backend can evaluate channels.
+        try:
+            import controller_graph_compile
+
+            controller_graph_compile.try_build_final_graph(
+                joystick_path="joystick.json",
+                mixer_path="channel_mixer.json",
+                compiled_out_path="controller_graph_compiled.json",
+                final_out_path="controller_graph_final.json",
+            )
+        except Exception:
+            pass
+
+        # Load signal kernel + backend.
+        try:
+            from c_physics import signal_kernel_api
+            from c_physics.signal_kernel_ctypes import GP_InputEvent
+            import controller_backend
+        except Exception:
+            return
+
+        _sigk_lib, sigk = signal_kernel_api.try_load_signal_kernel()
+        if sigk is None:
+            return
+        try:
+            sigk.gp_sigk_reset()
+        except Exception:
+            pass
+
+        backend = controller_backend.ControllerBackend(sigk)
+
+        clock = pygame.time.Clock()
+        try:
+            joystick.init()
+        except Exception:
+            pass
+
+        # Baseline snapshot (stable reference for axis movement detection).
+        try:
+            init_axes, buttons_now0, init_hats = _poll_joystick_snapshot(joystick)
+            buttons_prev = set(buttons_now0)
+        except Exception:
+            init_axes, buttons_prev, init_hats = {}, set(), {}
+
+        # Rolling prev snapshot for edges.
+        axes_prev = dict(init_axes)
+        hats_prev = dict(init_hats)
+
+        # 1) Wait for a new actuation.
+        detected: dict[str, Any] | None = None
+        detected_ns: int = 0
+        while True:
+            try:
+                pygame.event.pump()
+            except Exception:
+                pass
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return
+                if menu_button is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button):
+                    return
+
+            now_ns = int(time.perf_counter_ns())
+            axes_now, buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+
+            # Button press edge.
+            new_presses = set(buttons_now) - set(buttons_prev)
+            if new_presses:
+                b = int(sorted(list(new_presses))[0])
+                if menu_button is None or int(b) != int(menu_button):
+                    detected = {"type": "button", "button": int(b)}
+                    detected_ns = int(now_ns)
+                    break
+
+            # Hat change (from neutral).
+            for h, xy in hats_now.items():
+                if tuple(xy) != (0, 0) and tuple(hats_prev.get(int(h), (0, 0))) == (0, 0):
+                    detected = {"type": "hat", "hat": int(h), "x": int(xy[0]), "y": int(xy[1])}
+                    detected_ns = int(now_ns)
+                    break
+            if detected is not None:
+                break
+
+            # Axis moved sufficiently from baseline.
+            for a, v in axes_now.items():
+                v0 = float(init_axes.get(int(a), 0.0))
+                if abs(float(v) - float(v0)) >= 0.35:
+                    detected = {"type": "axis", "axis": int(a)}
+                    detected_ns = int(now_ns)
+                    break
+            if detected is not None:
+                break
+
+            _draw_fullscreen_lines(
+                font,
+                int(width),
+                int(height),
+                [
+                    "DISCOVER FEATURE (report)",
+                    "actuate one control to sample backend output",
+                    "(this does not save anything)",
+                    "(menu button / Esc cancels)",
+                ],
+            )
+            pygame.display.flip()
+            clock.tick(60)
+
+            axes_prev, buttons_prev, hats_prev = axes_now, set(buttons_now), dict(hats_now)
+
+        if detected is None:
+            return
+
+        # 2) For a short window, feed kernel and measure channel changes.
+        window_ns = int(350_000_000)  # ~0.35s
+        base_overrides_1d: dict[int, float] = {}
+        base_overrides_2d: dict[int, tuple[float, float]] = {}
+        peak_delta: dict[int, float] = {}
+        last_overrides_1d: dict[int, float] = {}
+        last_overrides_2d: dict[int, tuple[float, float]] = {}
+        start_ns = int(detected_ns)
+
+        # Reset baseline for edges.
+        try:
+            axes_prev, buttons_now0, hats_prev = _poll_joystick_snapshot(joystick)
+            buttons_prev = set(buttons_now0)
+        except Exception:
+            axes_prev, buttons_prev, hats_prev = {}, set(), {}
+
+        while True:
+            now_ns = int(time.perf_counter_ns())
+            if int(now_ns) - int(start_ns) > int(window_ns):
+                break
+
+            try:
+                pygame.event.pump()
+            except Exception:
+                pass
+
+            axes_now, buttons_now, _hats_now = _poll_joystick_snapshot(joystick)
+
+            evs: list[GP_InputEvent] = []
+            # Button edges.
+            for b in range(max(0, int(getattr(joystick, "get_numbuttons", lambda: 0)() or 0))):
+                b = int(b)
+                was = b in buttons_prev
+                isd = b in buttons_now
+                if was == isd:
+                    continue
+                evs.append(
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                        kind=int(signal_kernel_api.GP_EV_BUTTON),
+                        id=int(b),
+                        v0=1.0 if isd else 0.0,
+                        v1=0.0,
+                        flags=0,
+                    )
+                )
+            # Axis values.
+            for a in range(max(0, int(getattr(joystick, "get_numaxes", lambda: 0)() or 0))):
+                vv = float(axes_now.get(int(a), 0.0))
+                evs.append(
+                    GP_InputEvent(
+                        t_mono_ns=now_ns,
+                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                        kind=int(signal_kernel_api.GP_EV_AXIS),
+                        id=int(a),
+                        v0=float(vv),
+                        v1=0.0,
+                        flags=0,
+                    )
+                )
+            if evs:
+                arr_t = GP_InputEvent * len(evs)
+                try:
+                    sigk.gp_sigk_push_events(arr_t(*evs), int(len(evs)))
+                except Exception:
+                    pass
+
+            overrides_1d, channels_2d = backend.step(now_ns=int(now_ns))
+            last_overrides_1d = dict(overrides_1d)
+            last_overrides_2d = dict(channels_2d)
+
+            if not base_overrides_1d and not base_overrides_2d:
+                base_overrides_1d = dict(overrides_1d)
+                base_overrides_2d = dict(channels_2d)
+
+            for k, v in overrides_1d.items():
+                base = float(base_overrides_1d.get(int(k), 0.0))
+                d = abs(float(v) - float(base))
+                peak_delta[int(k)] = float(max(float(peak_delta.get(int(k), 0.0)), float(d)))
+            for k, (x, y) in channels_2d.items():
+                bx, by = base_overrides_2d.get(int(k), (0.0, 0.0))
+                d = float(max(abs(float(x) - float(bx)), abs(float(y) - float(by))))
+                peak_delta[int(k)] = float(max(float(peak_delta.get(int(k), 0.0)), float(d)))
+
+            axes_prev, buttons_prev = axes_now, set(buttons_now)
+            clock.tick(120)
+
+        # 3) Display report.
+        lines: list[str] = []
+        lines.append(f"input: {detected}")
+        lines.append(f"backend: ok={backend.status.ok}  msg={backend.status.msg}")
+        if last_overrides_1d or last_overrides_2d:
+            parts: list[str] = []
+            for k, v in sorted(last_overrides_1d.items()):
+                parts.append(f"ch{int(k)}={float(v):+.3f}")
+            for k, (x, y) in sorted(last_overrides_2d.items()):
+                parts.append(f"ch{int(k)}=({float(x):+.2f},{float(y):+.2f})")
+            lines.append("channels (last): " + ", ".join(parts))
+        else:
+            lines.append("channels (last): (no overrides)")
+
+        if peak_delta:
+            act = [(k, d) for k, d in peak_delta.items() if float(d) >= 0.05]
+            act.sort(key=lambda kv: kv[1], reverse=True)
+            if act:
+                lines.append("peak delta (~0.35s): " + ", ".join(f"ch{int(k)}={float(d):.3f}" for k, d in act[:8]))
+        lines.append("(menu button / Esc exits)")
+
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                    return
+                if menu_button is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button):
+                    return
+            _draw_fullscreen_lines(font, int(width), int(height), ["DISCOVER FEATURE (report)"] + lines)
+            pygame.display.flip()
+            clock.tick(60)
+
     def _controller_create_signal() -> None:
         cfg = load_or_create_joystick_config("joystick.json")
         cfg = _ensure_controller_graph(cfg)
@@ -2805,10 +3680,8 @@ def run_main_menu(
         except Exception:
             pass
 
-        if not hasattr(_bind_axis, "_reticle_assets"):
-            _bind_axis._reticle_assets = reticle_sprite.load_reticle_assets(size_px=64)
-        assets = _bind_axis._reticle_assets
-        anim = reticle_sprite.ReticleAnimator(lock_delay_s=0.20, ready_delay_s=0.45)
+        assets = _get_bind_reticle_assets(size_px=64)
+        anim = reticle_sprite.ReticleAnimator(lock_delay_s=float(BIND_LOCK_DELAY_S), ready_delay_s=float(BIND_READY_DELAY_S))
 
         x_lbl = 0.40
         y_lbl = 0.52
@@ -2858,77 +3731,20 @@ def run_main_menu(
                 v = float(latest_axis.get(a, 0.0))
                 candidate_active = (abs(v) >= float(threshold)) and ((1 if v > 0.0 else -1) == s)
 
-            desired = target if candidate_active else start
-            ret_x += (float(desired[0]) - float(ret_x)) * 0.20
-            ret_y += (float(desired[1]) - float(ret_y)) * 0.20
-            on_target = (abs(float(ret_x) - float(target[0])) <= 0.015) and (abs(float(ret_y) - float(target[1])) <= 0.020)
-            now_s = pygame.time.get_ticks() * 0.001
-            stage = anim.update(on_target=bool(on_target and candidate_active), now_s=float(now_s))
-
-            from OpenGL.GL import (
-                GL_DEPTH_TEST,
-                GL_BLEND,
-                GL_COLOR_BUFFER_BIT,
-                GL_ONE_MINUS_SRC_ALPHA,
-                GL_SRC_ALPHA,
-                GL_UNSIGNED_BYTE,
-                GL_RGBA,
-                glBlendFunc,
-                glClear,
-                glClearColor,
-                glDisable,
-                glDrawPixels,
-                glEnable,
-                glIsEnabled,
-                glLoadIdentity,
-                glMatrixMode,
-                glOrtho,
-                glPixelStorei,
-                glPushMatrix,
-                glPopMatrix,
-                glRasterPos2f,
-                GL_MODELVIEW,
-                GL_PROJECTION,
-                GL_UNPACK_ALIGNMENT,
+            ret_x, ret_y, stage = _reticle_confirm_frame(
+                font=font,
+                label=str(label),
+                assets=assets,
+                anim=anim,
+                clock=clock,
+                start=(float(start[0]), float(start[1])),
+                target=(float(target[0]), float(target[1])),
+                ret_x=float(ret_x),
+                ret_y=float(ret_y),
+                candidate_active=bool(candidate_active),
+                label_x=float(x_lbl),
+                label_y=float(y_lbl),
             )
-
-            depth_was_enabled = bool(glIsEnabled(GL_DEPTH_TEST))
-            if depth_was_enabled:
-                glDisable(GL_DEPTH_TEST)
-            glClearColor(0.0, 0.0, 0.0, 1.0)
-            glClear(GL_COLOR_BUFFER_BIT)
-            glMatrixMode(GL_PROJECTION)
-            glPushMatrix()
-            glLoadIdentity()
-            glOrtho(0, 1, 0, 1, -1, 1)
-            glMatrixMode(GL_MODELVIEW)
-            glPushMatrix()
-            glLoadIdentity()
-            glEnable(GL_BLEND)
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-
-            surf_lbl = _render_cell_text(font, label)
-            lbl_data = pygame.image.tostring(surf_lbl, "RGBA", True)
-            glRasterPos2f(float(x_lbl), float(y_lbl))
-            glDrawPixels(surf_lbl.get_width(), surf_lbl.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, lbl_data)
-
-            surf_ret = assets.surfaces.get(stage)
-            if surf_ret is not None:
-                r_data = pygame.image.tostring(surf_ret, "RGBA", True)
-                glRasterPos2f(float(ret_x), float(ret_y))
-                glDrawPixels(surf_ret.get_width(), surf_ret.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, r_data)
-
-            glDisable(GL_BLEND)
-            if depth_was_enabled:
-                glEnable(GL_DEPTH_TEST)
-            glPopMatrix()
-            glMatrixMode(GL_PROJECTION)
-            glPopMatrix()
-            glMatrixMode(GL_MODELVIEW)
-
-            pygame.display.flip()
-            clock.tick(60)
 
             if candidate_active and stage == reticle_sprite.ReticleStage.READY:
                 return int(candidate.get("axis", -1))
@@ -3156,10 +3972,8 @@ def run_main_menu(
         except Exception:
             pass
 
-        if not hasattr(_bind_trigger_mapping, "_reticle_assets"):
-            _bind_trigger_mapping._reticle_assets = reticle_sprite.load_reticle_assets(size_px=64)
-        assets = _bind_trigger_mapping._reticle_assets
-        anim = reticle_sprite.ReticleAnimator(lock_delay_s=0.20, ready_delay_s=0.45)
+        assets = _get_bind_reticle_assets(size_px=64)
+        anim = reticle_sprite.ReticleAnimator(lock_delay_s=float(BIND_LOCK_DELAY_S), ready_delay_s=float(BIND_READY_DELAY_S))
 
         x_lbl = 0.40
         y_lbl = 0.52
@@ -3214,77 +4028,20 @@ def run_main_menu(
                 dv = (v - v0) * float(s)
                 candidate_active = dv >= float(delta_threshold)
 
-            desired = target if candidate_active else start
-            ret_x += (float(desired[0]) - float(ret_x)) * 0.20
-            ret_y += (float(desired[1]) - float(ret_y)) * 0.20
-            on_target = (abs(float(ret_x) - float(target[0])) <= 0.015) and (abs(float(ret_y) - float(target[1])) <= 0.020)
-            now_s = pygame.time.get_ticks() * 0.001
-            stage = anim.update(on_target=bool(on_target and candidate_active), now_s=float(now_s))
-
-            from OpenGL.GL import (
-                GL_DEPTH_TEST,
-                GL_BLEND,
-                GL_COLOR_BUFFER_BIT,
-                GL_ONE_MINUS_SRC_ALPHA,
-                GL_SRC_ALPHA,
-                GL_UNSIGNED_BYTE,
-                GL_RGBA,
-                glBlendFunc,
-                glClear,
-                glClearColor,
-                glDisable,
-                glDrawPixels,
-                glEnable,
-                glIsEnabled,
-                glLoadIdentity,
-                glMatrixMode,
-                glOrtho,
-                glPixelStorei,
-                glPushMatrix,
-                glPopMatrix,
-                glRasterPos2f,
-                GL_MODELVIEW,
-                GL_PROJECTION,
-                GL_UNPACK_ALIGNMENT,
+            ret_x, ret_y, stage = _reticle_confirm_frame(
+                font=font,
+                label=str(label),
+                assets=assets,
+                anim=anim,
+                clock=clock,
+                start=(float(start[0]), float(start[1])),
+                target=(float(target[0]), float(target[1])),
+                ret_x=float(ret_x),
+                ret_y=float(ret_y),
+                candidate_active=bool(candidate_active),
+                label_x=float(x_lbl),
+                label_y=float(y_lbl),
             )
-
-            depth_was_enabled = bool(glIsEnabled(GL_DEPTH_TEST))
-            if depth_was_enabled:
-                glDisable(GL_DEPTH_TEST)
-            glClearColor(0.0, 0.0, 0.0, 1.0)
-            glClear(GL_COLOR_BUFFER_BIT)
-            glMatrixMode(GL_PROJECTION)
-            glPushMatrix()
-            glLoadIdentity()
-            glOrtho(0, 1, 0, 1, -1, 1)
-            glMatrixMode(GL_MODELVIEW)
-            glPushMatrix()
-            glLoadIdentity()
-            glEnable(GL_BLEND)
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
-
-            surf_lbl = _render_cell_text(font, label)
-            lbl_data = pygame.image.tostring(surf_lbl, "RGBA", True)
-            glRasterPos2f(float(x_lbl), float(y_lbl))
-            glDrawPixels(surf_lbl.get_width(), surf_lbl.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, lbl_data)
-
-            surf_ret = assets.surfaces.get(stage)
-            if surf_ret is not None:
-                r_data = pygame.image.tostring(surf_ret, "RGBA", True)
-                glRasterPos2f(float(ret_x), float(ret_y))
-                glDrawPixels(surf_ret.get_width(), surf_ret.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, r_data)
-
-            glDisable(GL_BLEND)
-            if depth_was_enabled:
-                glEnable(GL_DEPTH_TEST)
-            glPopMatrix()
-            glMatrixMode(GL_PROJECTION)
-            glPopMatrix()
-            glMatrixMode(GL_MODELVIEW)
-
-            pygame.display.flip()
-            clock.tick(60)
 
             if candidate_active and stage == reticle_sprite.ReticleStage.READY:
                 a = int(candidate.get("axis", -1))
@@ -3353,6 +4110,19 @@ def run_main_menu(
         except Exception:
             pass
 
+        assets = _get_bind_reticle_assets(size_px=64)
+        anim = reticle_sprite.ReticleAnimator(lock_delay_s=float(BIND_LOCK_DELAY_S), ready_delay_s=float(BIND_READY_DELAY_S))
+
+        x_lbl = 0.40
+        y_lbl = 0.52
+        start = (x_lbl, y_lbl - 0.16)
+        target = (x_lbl, y_lbl)
+        ret_x, ret_y = float(start[0]), float(start[1])
+
+        candidate: dict[str, int] | None = None
+        candidate_active = False
+        candidate_init_axis: float = 0.0
+        
         while True:
             # Ensure joystick state is refreshed even if there are no events.
             try:
@@ -3378,12 +4148,6 @@ def run_main_menu(
                         polled_buttons.add(int(b))
                 except Exception:
                     pass
-            new_presses = polled_buttons - last_buttons
-            if new_presses:
-                # Pick the lowest index deterministically.
-                b = int(sorted(list(new_presses))[0])
-                if menu_button is None or b != int(menu_button):
-                    return {"type": "button", "button": int(b)}
 
             # Poll hats too (D-pad can be a hat on Xbox controllers).
             try:
@@ -3397,42 +4161,89 @@ def run_main_menu(
                     polled_hats[int(h)] = (int(v[0]), int(v[1]))
                 except Exception:
                     polled_hats[int(h)] = (0, 0)
-            for h, v in polled_hats.items():
-                if v != (0, 0) and last_hats.get(int(h), (0, 0)) == (0, 0):
-                    return {"type": "hat", "hat": int(h), "x": int(v[0]), "y": int(v[1])}
 
-            # Trigger-like axis delta detection (works for shared-axis triggers).
-            try:
-                n_axes = int(joystick.get_numaxes())
-            except Exception:
-                n_axes = 0
-            for a in range(max(0, n_axes)):
-                try:
-                    v = float(joystick.get_axis(int(a)))
-                except Exception:
-                    continue
-                v0 = float(init_axis.get(int(a), 0.0))
-                dv = float(v) - float(v0)
-                if abs(float(dv)) >= float(delta_threshold):
-                    sign = 1 if float(dv) > 0.0 else -1
-                    return {"type": "axis", "axis": int(a), "sign": int(sign)}
+            # Candidate selection (only if none chosen yet).
+            if candidate is None:
+                new_presses = polled_buttons - last_buttons
+                if new_presses:
+                    b = int(sorted(list(new_presses))[0])
+                    if menu_button is None or b != int(menu_button):
+                        candidate = {"type": "button", "button": int(b)}
+
+                if candidate is None:
+                    for h, v in polled_hats.items():
+                        if v != (0, 0) and last_hats.get(int(h), (0, 0)) == (0, 0):
+                            candidate = {"type": "hat", "hat": int(h), "x": int(v[0]), "y": int(v[1])}
+                            break
+
+                if candidate is None:
+                    # Trigger-like axis delta detection (works for shared-axis triggers).
+                    try:
+                        n_axes = int(joystick.get_numaxes())
+                    except Exception:
+                        n_axes = 0
+                    for a in range(max(0, n_axes)):
+                        try:
+                            v = float(joystick.get_axis(int(a)))
+                        except Exception:
+                            continue
+                        v0 = float(init_axis.get(int(a), 0.0))
+                        dv = float(v) - float(v0)
+                        if abs(float(dv)) >= float(delta_threshold):
+                            sign = 1 if float(dv) > 0.0 else -1
+                            candidate = {"type": "axis", "axis": int(a), "sign": int(sign)}
+                            candidate_init_axis = float(v0)
+                            break
+
+            # Candidate active tracking.
+            candidate_active = False
+            if candidate is not None:
+                t = str(candidate.get("type", ""))
+                if t == "button":
+                    btn = int(candidate.get("button", -1))
+                    candidate_active = int(btn) in polled_buttons
+                elif t == "hat":
+                    h = int(candidate.get("hat", -1))
+                    cx = int(candidate.get("x", 0))
+                    cy = int(candidate.get("y", 0))
+                    candidate_active = polled_hats.get(int(h), (0, 0)) == (int(cx), int(cy))
+                elif t == "axis":
+                    a = int(candidate.get("axis", -1))
+                    s = int(candidate.get("sign", 0))
+                    try:
+                        v = float(joystick.get_axis(int(a)))
+                    except Exception:
+                        v = float(init_axis.get(int(a), 0.0))
+                    dv = (float(v) - float(candidate_init_axis)) * float(s)
+                    candidate_active = dv >= float(delta_threshold)
+
+            # Draw + confirm via the standardized reticle lock/ready sequence.
+            ret_x, ret_y, stage = _reticle_confirm_frame(
+                font=font,
+                label=f"bind {label}",
+                assets=assets,
+                anim=anim,
+                clock=clock,
+                start=(float(start[0]), float(start[1])),
+                target=(float(target[0]), float(target[1])),
+                ret_x=float(ret_x),
+                ret_y=float(ret_y),
+                candidate_active=bool(candidate_active),
+                label_x=float(x_lbl),
+                label_y=float(y_lbl),
+            )
+
+            if candidate is not None and candidate_active and stage == reticle_sprite.ReticleStage.READY:
+                return dict(candidate)
+
+            # If they released before confirmation, reset candidate.
+            if candidate is not None and not candidate_active:
+                candidate = None
+                anim._on_since = None
 
             # Advance previous snapshots so we detect *new* presses/hat moves.
             last_buttons = polled_buttons
             last_hats = polled_hats
-
-            _draw_fullscreen_lines(
-                font,
-                int(width),
-                int(height),
-                [
-                    f"bind {label}",
-                    "press a button or squeeze a trigger",
-                    "(menu button cancels)",
-                ],
-            )
-            pygame.display.flip()
-            clock.tick(60)
 
     def _write_flight_axis(*, section: str, key: str, axis: int) -> None:
         cfg = load_or_create_joystick_config("joystick.json")
@@ -3450,18 +4261,6 @@ def run_main_menu(
         start_node: str = "main",
         action_handlers: dict[str, Any] | None = None,
     ) -> str:
-        try:
-            ensure_menu_navigation_bindings(
-                cfg_path="joystick.json",
-                font=font,
-                width=int(width),
-                height=int(height),
-                joystick=joystick,
-                menu_button=menu_button,
-            )
-        except Exception:
-            pass
-
         if joystick is None:
             return "start"
 
@@ -3470,6 +4269,39 @@ def run_main_menu(
         stack: list[str] = []
 
         cfg = load_or_create_joystick_config("joystick.json")
+        cfg = ensure_menu_bindings_block(cfg)
+        blk0 = _menu_bindings_block(cfg)
+
+        nonlocal nav_channel_2d
+        try:
+            nav_channel_2d = int(blk0.get("nav_channel_2d") or 0)
+        except Exception:
+            nav_channel_2d = 0
+
+        toggle_key: int | None = int(blk0.get("toggle_key")) if isinstance(blk0.get("toggle_key"), int) else None
+        accept_key: int | None = int(blk0.get("accept_key")) if isinstance(blk0.get("accept_key"), int) else None
+        back_key: int | None = int(blk0.get("back_key")) if isinstance(blk0.get("back_key"), int) else None
+
+        # Fresh-start: if menu bindings are incomplete, open the binding-tasks tool first.
+        if not menu_bindings_complete(cfg):
+            try:
+                if isinstance(action_handlers, dict) and callable(action_handlers.get("menu_binding_tasks")):
+                    action_handlers["menu_binding_tasks"]()
+            except Exception:
+                pass
+            cfg = load_or_create_joystick_config("joystick.json")
+            cfg = ensure_menu_bindings_block(cfg)
+            blk0 = _menu_bindings_block(cfg)
+            try:
+                nav_channel_2d = int(blk0.get("nav_channel_2d") or 0)
+            except Exception:
+                nav_channel_2d = 0
+            toggle_key = int(blk0.get("toggle_key")) if isinstance(blk0.get("toggle_key"), int) else None
+            accept_key = int(blk0.get("accept_key")) if isinstance(blk0.get("accept_key"), int) else None
+            back_key = int(blk0.get("back_key")) if isinstance(blk0.get("back_key"), int) else None
+            if not menu_bindings_complete(cfg):
+                return "start"
+
         nav = _get_menu_nav(cfg)
         sc = _get_menu_scroll(cfg)
         b_up = nav.get("up")
@@ -3494,19 +4326,28 @@ def run_main_menu(
         start_x = 0.04
         target_x = 0.10
 
-        anim = reticle_sprite.ReticleAnimator(lock_delay_s=0.20, ready_delay_s=0.45)
+        anim = reticle_sprite.ReticleAnimator(lock_delay_s=float(BIND_LOCK_DELAY_S), ready_delay_s=float(BIND_READY_DELAY_S))
 
         def _sel_y(idx_visible: int) -> float:
             return float(0.66 - 0.07 * int(idx_visible))
 
         while True:
+            toggle_edge = False
+            back_edge = False
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     return "quit"
                 if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
                     return "quit"
+                if event.type == pygame.KEYDOWN:
+                    if toggle_key is not None and int(event.key) == int(toggle_key):
+                        toggle_edge = True
+                    if back_key is not None and int(event.key) == int(back_key):
+                        back_edge = True
                 if menu_button is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button):
                     return "start"
+            if toggle_edge:
+                return "start"
 
             axes_now, buttons_now, hats_now = _poll_joystick_snapshot(joystick)
 
@@ -3589,7 +4430,7 @@ def run_main_menu(
             ):
                 scroll.scroll_pages(delta_pages=+1, total=len(labels), max_visible=max_visible)
 
-            if _nav_edge(
+            if back_edge or _nav_edge(
                 b_cancel,
                 axes_now=axes_now,
                 axes_prev=axes_prev,
@@ -3607,6 +4448,13 @@ def run_main_menu(
                     return "start"
 
             confirm_held = _nav_is_held(b_confirm, axes_now=axes_now, buttons_now=buttons_now, hats_now=hats_now)
+            if accept_key is not None:
+                try:
+                    kp = pygame.key.get_pressed()
+                    if kp is not None and bool(kp[int(accept_key)]):
+                        confirm_held = True
+                except Exception:
+                    pass
 
             scroll.ensure_visible(sel=int(sel), total=len(labels), max_visible=max_visible, center=False)
             first_idx, last_idx, visible_sel = scroll.window(total=len(labels), sel=int(sel), max_visible=max_visible)
@@ -3699,8 +4547,27 @@ def run_main_menu(
                     else:
                         anim._on_since = None
 
+                # If any handlers wrote joystick.json, let the caller soft-refresh without restarting.
+                try:
+                    if consume_controls_dirty():
+                        ctx = menu_context if isinstance(menu_context, dict) else {}
+                        cb = ctx.get("on_controls_changed")
+                        if callable(cb):
+                            cb()
+                except Exception:
+                    pass
+
                 # Reload nav bindings in case the user rebound anything.
                 cfg = load_or_create_joystick_config("joystick.json")
+                cfg = ensure_menu_bindings_block(cfg)
+                blk2 = _menu_bindings_block(cfg)
+                try:
+                    nav_channel_2d = int(blk2.get("nav_channel_2d") or 0)
+                except Exception:
+                    nav_channel_2d = 0
+                toggle_key = int(blk2.get("toggle_key")) if isinstance(blk2.get("toggle_key"), int) else None
+                accept_key = int(blk2.get("accept_key")) if isinstance(blk2.get("accept_key"), int) else None
+                back_key = int(blk2.get("back_key")) if isinstance(blk2.get("back_key"), int) else None
                 nav = _get_menu_nav(cfg)
                 sc = _get_menu_scroll(cfg)
                 b_up = nav.get("up")
@@ -3727,11 +4594,23 @@ def run_main_menu(
     if joystick is None:
         return "start"
 
+    def _run_in_scan(fn) -> Any:
+        try:
+            import input_interest
+
+            with input_interest.scan_mode():
+                return fn()
+        except Exception:
+            return fn()
+
     def _mk_bind_handler(label: str, *, section: str, key: str, threshold: float) -> Any:
         def _h() -> None:
-            a = _bind_axis(label, joystick=joystick, threshold=float(threshold))
-            if a is not None and int(a) >= 0:
-                _write_flight_axis(section=section, key=key, axis=int(a))
+            def _do() -> None:
+                a = _bind_axis(label, joystick=joystick, threshold=float(threshold))
+                if a is not None and int(a) >= 0:
+                    _write_flight_axis(section=section, key=key, axis=int(a))
+
+            _run_in_scan(_do)
         return _h
 
     handlers: dict[str, Any] = {
@@ -3742,33 +4621,52 @@ def run_main_menu(
     }
 
     # Controller graph menu actions.
-    handlers["controller_discover_feature"] = lambda: (
-        (lambda f: _controller_add_feature(f) if isinstance(f, dict) else None)(
-            _discover_feature(label="discover feature")
-        )
-    )
+    # DISCOVER FEATURE is repurposed as a read-only report tool (no config writes).
+    handlers["controller_discover_feature"] = lambda: _controller_report_single_press()
     handlers["controller_create_signal"] = lambda: _controller_create_signal()
     handlers["controller_map_channel"] = lambda: _controller_map_channel()
 
-    def _controller_workbench() -> None:
+    def _controller_view_channel() -> None:
         try:
-            import signal_workbench
+            import channel_viewer
         except Exception:
             return
-        signal_workbench.run_signal_workbench(
+        channel_viewer.run_channel_viewer(
             font=font,
             width=int(width),
             height=int(height),
             joystick=joystick,
             menu_button=menu_button,
             load_or_create_joystick_config=load_or_create_joystick_config,
-            save_joystick_config=save_joystick_config,
             get_menu_nav=_get_menu_nav,
             get_menu_scroll=_get_menu_scroll,
             nav_edge=_nav_edge,
             poll_joystick_snapshot=_poll_joystick_snapshot,
-            draw_fullscreen_lines=_draw_fullscreen_lines,
         )
+
+    def _controller_workbench() -> None:
+        try:
+            import signal_workbench
+        except Exception:
+            return
+
+        def _do() -> None:
+            signal_workbench.run_signal_workbench(
+                font=font,
+                width=int(width),
+                height=int(height),
+                joystick=joystick,
+                menu_button=menu_button,
+                load_or_create_joystick_config=load_or_create_joystick_config,
+                save_joystick_config=save_joystick_config,
+                get_menu_nav=_get_menu_nav,
+                get_menu_scroll=_get_menu_scroll,
+                nav_edge=_nav_edge,
+                poll_joystick_snapshot=_poll_joystick_snapshot,
+                draw_fullscreen_lines=_draw_fullscreen_lines,
+            )
+
+        _do()
 
     def _controller_channel_mixer() -> None:
         try:
@@ -3826,37 +4724,473 @@ def run_main_menu(
     handlers["controller_status"] = lambda: _controller_status()
     handlers["controller_workbench"] = lambda: _controller_workbench()
     handlers["controller_channel_mixer"] = lambda: _controller_channel_mixer()
+    handlers["controller_view_channel"] = lambda: _controller_view_channel()
+
+    def _menu_binding_tasks() -> None:
+        if joystick is None:
+            return
+
+        try:
+            import ui_tables
+        except Exception:
+            return
+
+        from OpenGL.GL import (
+            GL_BLEND,
+            GL_COLOR_BUFFER_BIT,
+            GL_DEPTH_TEST,
+            GL_MODELVIEW,
+            GL_ONE_MINUS_SRC_ALPHA,
+            GL_PROJECTION,
+            GL_SRC_ALPHA,
+            GL_TRIANGLES,
+            GL_UNPACK_ALIGNMENT,
+            GL_UNSIGNED_BYTE,
+            GL_RGBA,
+            glBegin,
+            glBlendFunc,
+            glClear,
+            glClearColor,
+            glColor4f,
+            glDisable,
+            glDrawPixels,
+            glEnable,
+            glEnd,
+            glIsEnabled,
+            glLoadIdentity,
+            glMatrixMode,
+            glOrtho,
+            glPixelStorei,
+            glPopMatrix,
+            glPushMatrix,
+            glRasterPos2f,
+            glVertex2f,
+        )
+
+        def _px_to_nx(x: int) -> float:
+            return float(int(x)) / float(max(1, int(width)))
+
+        def _px_to_ny(y: int) -> float:
+            return float(max(0, int(height) - int(y))) / float(max(1, int(height)))
+
+        def _draw_rect_px(x: int, y: int, w: int, h: int, rgba: tuple[float, float, float, float]) -> None:
+            x0 = _px_to_nx(int(x))
+            x1 = _px_to_nx(int(x + w))
+            y0 = _px_to_ny(int(y + h))
+            y1 = _px_to_ny(int(y))
+            r, g, b, a = rgba
+            glColor4f(float(r), float(g), float(b), float(a))
+            glBegin(GL_TRIANGLES)
+            glVertex2f(x0, y0)
+            glVertex2f(x1, y0)
+            glVertex2f(x1, y1)
+            glVertex2f(x0, y0)
+            glVertex2f(x1, y1)
+            glVertex2f(x0, y1)
+            glEnd()
+
+        def _draw_text_px(x: int, y: int, text: str, color: tuple[int, int, int] = (255, 255, 255)) -> None:
+            s = str(text)
+            if not s:
+                return
+            try:
+                surf = font.render(s, True, color)
+                surf = surf.convert_alpha()
+            except Exception:
+                return
+            data = pygame.image.tostring(surf, "RGBA", True)
+            glRasterPos2f(_px_to_nx(int(x)), _px_to_ny(int(y)))
+            glDrawPixels(surf.get_width(), surf.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, data)
+
+        def _available_2d_channels() -> list[int]:
+            out: list[int] = []
+            try:
+                for ch, d in (ctl_outputs or {}).items():
+                    if int(getattr(d, "dim", 0)) >= 2:
+                        out.append(int(ch))
+            except Exception:
+                out = []
+            if not out:
+                out = [0]
+            out = sorted(list(set(int(x) for x in out)))
+            return out
+
+        def _fmt_key(k: int | None) -> str:
+            if k is None:
+                return "<UNBOUND>"
+            try:
+                return str(pygame.key.name(int(k))).upper()
+            except Exception:
+                return str(int(k))
+
+        def _fmt_legacy_binding(b: dict[str, Any] | None) -> str:
+            if not isinstance(b, dict):
+                return "<UNBOUND>"
+            t = b.get("type")
+            if t == "button":
+                bb = b.get("button")
+                return f"JOY BTN {int(bb)}" if isinstance(bb, int) else "<UNBOUND>"
+            if t == "axis":
+                aa = b.get("axis")
+                ss = b.get("sign")
+                if isinstance(aa, int) and isinstance(ss, int):
+                    return f"JOY AXIS {int(aa)} {'+' if int(ss) > 0 else '-'}"
+                return "<UNBOUND>"
+            if t == "hat":
+                hh = b.get("hat")
+                xx = b.get("x")
+                yy = b.get("y")
+                if isinstance(hh, int) and isinstance(xx, int) and isinstance(yy, int):
+                    return f"JOY HAT {int(hh)} ({int(xx)},{int(yy)})"
+                return "<UNBOUND>"
+            return "<UNBOUND>"
+
+        def _capture_key(*, title: str) -> int | None:
+            clock = pygame.time.Clock()
+            key: int | None = None
+            held_since: float | None = None
+            while True:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        return None
+                    if event.type == pygame.KEYDOWN:
+                        if int(event.key) in (pygame.K_ESCAPE, pygame.K_q):
+                            return None
+                        key = int(event.key)
+                        held_since = float(pygame.time.get_ticks()) * 0.001
+
+                if key is not None:
+                    try:
+                        kp = pygame.key.get_pressed()
+                    except Exception:
+                        kp = None
+                    if kp is None or not bool(kp[int(key)]):
+                        key = None
+                        held_since = None
+                    else:
+                        now_s = float(pygame.time.get_ticks()) * 0.001
+                        if held_since is not None and (now_s - float(held_since)) >= float(BIND_READY_DELAY_S):
+                            return int(key)
+
+                _draw_fullscreen_lines(font, int(width), int(height), [
+                    "BIND KEY (HOLD TO COMMIT)",
+                    str(title),
+                    "hold a key to commit", 
+                    "ESC cancels",
+                ])
+                pygame.display.flip()
+                clock.tick(60)
+
+        def _save_menu_bindings(*, nav_ch: int | None = None, toggle: int | None = None, accept: int | None = None, back: int | None = None) -> None:
+            cfg = load_or_create_joystick_config("joystick.json")
+            cfg = ensure_menu_bindings_block(cfg)
+            blk = cfg["menu_bindings"]
+            if nav_ch is not None:
+                blk["nav_channel_2d"] = int(nav_ch)
+            if toggle is not None:
+                blk["toggle_key"] = int(toggle)
+            if accept is not None:
+                blk["accept_key"] = int(accept)
+            if back is not None:
+                blk["back_key"] = int(back)
+            save_joystick_config(cfg, "joystick.json")
+
+        # Table state
+        clock = pygame.time.Clock()
+        dropdown_open = False
+        dropdown_x0 = 0
+        dropdown_y0 = 0
+        dropdown_w = 0
+        dropdown_row_h = 0
+
+        while True:
+            # Load current bindings.
+            cfg = load_or_create_joystick_config("joystick.json")
+            cfg = ensure_menu_bindings_block(cfg)
+            blk = _menu_bindings_block(cfg)
+            cur_nav = int(blk.get("nav_channel_2d") or 0) if isinstance(blk.get("nav_channel_2d"), int) else 0
+            cur_toggle = int(blk.get("toggle_key")) if isinstance(blk.get("toggle_key"), int) else None
+            cur_accept = int(blk.get("accept_key")) if isinstance(blk.get("accept_key"), int) else None
+            cur_back = int(blk.get("back_key")) if isinstance(blk.get("back_key"), int) else None
+
+            # Keep menu-nav channel selection consistent while this screen is open.
+            nonlocal nav_channel_2d
+            nav_channel_2d = int(cur_nav)
+
+            # Poll joystick snapshot for legacy binding status.
+            axes_now, buttons_now, hats_now = _poll_joystick_snapshot(joystick)
+            legacy_menu_btn = cfg.get("menu_button")
+            legacy_nav = _get_menu_nav(cfg)
+            legacy_confirm = legacy_nav.get("confirm") if isinstance(legacy_nav, dict) else None
+            legacy_cancel = legacy_nav.get("cancel") if isinstance(legacy_nav, dict) else None
+
+            # Feed kernel so channel outputs update (uses nav_channel_2d).
+            v_now = _backend_nav_vec(joystick=joystick)
+            vx, vy = (0.0, 0.0)
+            if isinstance(v_now, tuple) and len(v_now) >= 2:
+                vx, vy = float(v_now[0]), float(v_now[1])
+
+            try:
+                kp = pygame.key.get_pressed()
+            except Exception:
+                kp = None
+
+            def _is_key_down(k: int | None) -> bool:
+                if kp is None or k is None:
+                    return False
+                try:
+                    return bool(kp[int(k)])
+                except Exception:
+                    return False
+
+            def _toggle_used() -> bool:
+                if cur_toggle is not None:
+                    return _is_key_down(cur_toggle)
+                if isinstance(legacy_menu_btn, int):
+                    return int(legacy_menu_btn) in buttons_now
+                return False
+
+            def _accept_used() -> bool:
+                if cur_accept is not None:
+                    return _is_key_down(cur_accept)
+                return _nav_is_held(legacy_confirm if isinstance(legacy_confirm, dict) else None, axes_now=axes_now, buttons_now=buttons_now, hats_now=hats_now)
+
+            def _back_used() -> bool:
+                if cur_back is not None:
+                    return _is_key_down(cur_back)
+                return _nav_is_held(legacy_cancel if isinstance(legacy_cancel, dict) else None, axes_now=axes_now, buttons_now=buttons_now, hats_now=hats_now)
+
+            def _toggle_disp() -> str:
+                if cur_toggle is not None:
+                    return _fmt_key(cur_toggle)
+                if isinstance(legacy_menu_btn, int):
+                    return f"JOY BTN {int(legacy_menu_btn)}"
+                return "<UNBOUND>"
+
+            def _accept_disp() -> str:
+                if cur_accept is not None:
+                    return _fmt_key(cur_accept)
+                return _fmt_legacy_binding(legacy_confirm if isinstance(legacy_confirm, dict) else None)
+
+            def _back_disp() -> str:
+                if cur_back is not None:
+                    return _fmt_key(cur_back)
+                return _fmt_legacy_binding(legacy_cancel if isinstance(legacy_cancel, dict) else None)
+
+            # Rows
+            rows = [
+                {"kind": "key", "label": "TOGGLE MENU", "field": "toggle_key", "disp": _toggle_disp(), "used": _toggle_used()},
+                {"kind": "key", "label": "ACCEPT", "field": "accept_key", "disp": _accept_disp(), "used": _accept_used()},
+                {"kind": "key", "label": "BACK", "field": "back_key", "disp": _back_disp(), "used": _back_used()},
+                {"kind": "chan2d", "label": "NAV CHANNEL (2D)", "field": "nav_channel_2d", "value": cur_nav, "used": (abs(float(vx)) > 0.65 or abs(float(vy)) > 0.65)},
+            ]
+
+            # Input
+            mx, my = pygame.mouse.get_pos()
+            mouse_clicked = False
+            click_pos = (0, 0)
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return
+                if event.type == pygame.KEYDOWN and int(event.key) in (pygame.K_ESCAPE, pygame.K_q):
+                    return
+                if event.type == pygame.MOUSEBUTTONDOWN and int(event.button) == 1:
+                    mouse_clicked = True
+                    click_pos = (int(event.pos[0]), int(event.pos[1]))
+
+            # Render
+            depth_was_enabled = bool(glIsEnabled(GL_DEPTH_TEST))
+            if depth_was_enabled:
+                glDisable(GL_DEPTH_TEST)
+
+            glClearColor(0.0, 0.0, 0.0, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT)
+
+            glMatrixMode(GL_PROJECTION)
+            glPushMatrix()
+            glLoadIdentity()
+            glOrtho(0, 1, 0, 1, -1, 1)
+            glMatrixMode(GL_MODELVIEW)
+            glPushMatrix()
+            glLoadIdentity()
+
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+
+            pad = 12
+            header_h = max(18, int(font.get_linesize()) + 2)
+            row_h = max(18, int(font.get_linesize()) + 6)
+            geom = ui_tables.TableGeom(x0=0, y0=0, w=int(width), h=int(height), pad=int(pad), header_h=int(header_h), row_h=int(row_h))
+
+            _draw_text_px(pad, pad + header_h, "MENU BINDING TASKS")
+            _draw_text_px(pad, pad + header_h + int(row_h * 0.9), "click a row to bind / select")
+
+            col_label_w = int(width * 0.55)
+            col_value_w = int(width * 0.25)
+            col_used_w = int(width - pad * 2 - col_label_w - col_value_w)
+
+            x_label = pad
+            x_value = pad + col_label_w
+            x_used = pad + col_label_w + col_value_w
+
+            # Header row
+            y_hdr = pad + header_h + 2
+            _draw_text_px(x_label, y_hdr, "control")
+            _draw_text_px(x_value, y_hdr, "binding")
+            _draw_text_px(x_used, y_hdr, "used")
+
+            hit_row: int | None = None
+            hit_kind: str | None = None
+
+            for idx, row, y, _mv in ui_tables.iter_visible_rows(rows=rows, sel_idx=0, g=geom, scroll=scroll_model.ScrollModel(first_idx=0), center=False):
+                y0 = int(y - row_h + 2)
+                _draw_rect_px(2, int(y0), int(width - 4), int(row_h), (0.06, 0.06, 0.06, 1.0))
+                _draw_rect_px(2, int(y0), int(width - 4), 1, (0.25, 0.25, 0.25, 1.0))
+                _draw_text_px(x_label, int(y), str(row.get("label", "")))
+                if str(row.get("kind")) == "key":
+                    _draw_text_px(x_value, int(y), str(row.get("disp") or "<UNBOUND>"))
+                else:
+                    _draw_text_px(x_value, int(y), f"CH {int(row.get('value') or 0)}")
+
+                used = bool(row.get("used"))
+                led_col = (0.2, 0.9, 0.2, 1.0) if used else (0.2, 0.2, 0.2, 1.0)
+                _draw_rect_px(x_used, int(y0 + 4), 18, 18, led_col)
+
+                if mouse_clicked:
+                    cx, cy = int(click_pos[0]), int(click_pos[1])
+                    if int(y0) <= cy <= int(y0 + row_h) and 2 <= cx <= int(width - 2):
+                        hit_row = int(idx)
+                        hit_kind = str(row.get("kind"))
+
+            # DONE button
+            done_w = 160
+            done_h = 36
+            done_x = int(width - done_w - 16)
+            done_y = int(height - done_h - 16)
+            _draw_rect_px(done_x, done_y, done_w, done_h, (0.10, 0.10, 0.10, 1.0))
+            _draw_rect_px(done_x, done_y, done_w, 1, (0.35, 0.35, 0.35, 1.0))
+            _draw_text_px(done_x + 16, done_y + 24, "DONE")
+
+            if mouse_clicked:
+                cx, cy = int(click_pos[0]), int(click_pos[1])
+                if done_x <= cx <= done_x + done_w and done_y <= cy <= done_y + done_h:
+                    glDisable(GL_BLEND)
+                    if depth_was_enabled:
+                        glEnable(GL_DEPTH_TEST)
+                    glPopMatrix()
+                    glMatrixMode(GL_PROJECTION)
+                    glPopMatrix()
+                    glMatrixMode(GL_MODELVIEW)
+                    return
+
+            # Dropdown for channels (simple list near clicked row)
+            if dropdown_open:
+                chans = _available_2d_channels()
+                box_h = int(len(chans) * dropdown_row_h)
+                _draw_rect_px(dropdown_x0, dropdown_y0, dropdown_w, box_h, (0.08, 0.08, 0.08, 1.0))
+                for i, ch in enumerate(chans):
+                    yy = int(dropdown_y0 + i * dropdown_row_h)
+                    _draw_text_px(dropdown_x0 + 8, yy + int(dropdown_row_h * 0.7), f"CH {int(ch)}")
+                if mouse_clicked:
+                    cx, cy = int(click_pos[0]), int(click_pos[1])
+                    if dropdown_x0 <= cx <= dropdown_x0 + dropdown_w and dropdown_y0 <= cy <= dropdown_y0 + box_h:
+                        i = int((cy - dropdown_y0) / max(1, dropdown_row_h))
+                        if 0 <= i < len(chans):
+                            _save_menu_bindings(nav_ch=int(chans[int(i)]))
+                    dropdown_open = False
+
+            # Apply click actions (after draw so we can place dropdown relative to layout)
+            if mouse_clicked and hit_row is not None:
+                row = rows[int(hit_row)]
+                if str(hit_kind) == "key":
+                    k = _capture_key(title=str(row.get("label", "")))
+                    if k is not None:
+                        field = str(row.get("field"))
+                        if field == "toggle_key":
+                            _save_menu_bindings(toggle=int(k))
+                        elif field == "accept_key":
+                            _save_menu_bindings(accept=int(k))
+                        elif field == "back_key":
+                            _save_menu_bindings(back=int(k))
+                elif str(hit_kind) == "chan2d":
+                    dropdown_open = True
+                    dropdown_w = int(width * 0.22)
+                    dropdown_row_h = int(row_h)
+                    dropdown_x0 = int(width * 0.60)
+                    dropdown_y0 = int(height * 0.18)
+
+            glDisable(GL_BLEND)
+            if depth_was_enabled:
+                glEnable(GL_DEPTH_TEST)
+            glPopMatrix()
+            glMatrixMode(GL_PROJECTION)
+            glPopMatrix()
+            glMatrixMode(GL_MODELVIEW)
+
+            pygame.display.flip()
+            clock.tick(60)
+
+    handlers["menu_binding_tasks"] = lambda: _run_in_scan(_menu_binding_tasks)
+
+    def _reset_action_bindings_keep_controller() -> None:
+        reset_action_bindings_keep_controller(cfg_path="joystick.json")
+        _draw_fullscreen_lines(font, int(width), int(height), [
+            "RESET COMPLETE",
+            "action bindings wiped",
+            "controller graph preserved",
+            "press ESC to return",
+        ])
+        pygame.display.flip()
+        clock = pygame.time.Clock()
+        while True:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return
+                if event.type == pygame.KEYDOWN and int(event.key) in (pygame.K_ESCAPE, pygame.K_q):
+                    return
+            clock.tick(60)
+
+    handlers["reset_action_bindings_keep_controller"] = lambda: _reset_action_bindings_keep_controller()
 
     # Menus: bind menu navigation explicitly.
-    handlers["bind_menu_navigation"] = lambda: ensure_menu_navigation_bindings(
-        cfg_path="joystick.json",
-        font=font,
-        width=int(width),
-        height=int(height),
-        joystick=joystick,
-        menu_button=menu_button,
-    )
-
-    handlers["bind_menu_button"] = lambda: ensure_menu_button_binding(
-        cfg_path="joystick.json",
-        font=font,
-        width=int(width),
-        height=int(height),
-        joystick=joystick,
-        force=True,
-    )
-
-    def _bind_menu_key(k: str) -> None:
-        ensure_menu_navigation_bindings(
+    handlers["bind_menu_navigation"] = lambda: _run_in_scan(
+        lambda: ensure_menu_navigation_bindings(
             cfg_path="joystick.json",
             font=font,
             width=int(width),
             height=int(height),
             joystick=joystick,
             menu_button=menu_button,
-            keys=[str(k)],
+        )
+    )
+
+    handlers["bind_menu_button"] = lambda: _run_in_scan(
+        lambda: ensure_menu_button_binding(
+            cfg_path="joystick.json",
+            font=font,
+            width=int(width),
+            height=int(height),
+            joystick=joystick,
             force=True,
         )
+    )
+
+    def _bind_menu_key(k: str) -> None:
+        def _do() -> None:
+            ensure_menu_navigation_bindings(
+                cfg_path="joystick.json",
+                font=font,
+                width=int(width),
+                height=int(height),
+                joystick=joystick,
+                menu_button=menu_button,
+                keys=[str(k)],
+                force=True,
+            )
+
+        _run_in_scan(_do)
 
     handlers["bind_menu_up"] = lambda: _bind_menu_key("up")
     handlers["bind_menu_down"] = lambda: _bind_menu_key("down")
@@ -3867,38 +5201,53 @@ def run_main_menu(
 
     # Control-set bindings.
     def _bind_set_axis1d(*, label: str, set_name: str, group: str, key: str) -> None:
-        m = _bind_axis_calibrated(label, joystick=joystick, threshold=0.85)
-        if isinstance(m, dict):
-            _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+        def _do() -> None:
+            m = _bind_axis_calibrated(label, joystick=joystick, threshold=0.85)
+            if isinstance(m, dict):
+                _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+
+        _run_in_scan(_do)
 
     def _bind_set_axis2d(*, label: str, set_name: str, group: str, key: str) -> None:
-        m = _bind_axis_calibrated(label, joystick=joystick, threshold=0.85)
-        if not isinstance(m, dict):
-            return
-        if str(m.get("type", "")) == "axis2d":
-            out = m
-        else:
-            out = {
-                "type": "axis2d",
-                "x": {"axis": int(m.get("axis", -1)), "calib": dict(m.get("calib", {}) if isinstance(m.get("calib", {}), dict) else {})},
-                "y": {"axis": -1, "calib": {"min": 0.0, "max": 0.0}},
-            }
-        _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=out)
+        def _do() -> None:
+            m = _bind_axis_calibrated(label, joystick=joystick, threshold=0.85)
+            if not isinstance(m, dict):
+                return
+            if str(m.get("type", "")) == "axis2d":
+                out = m
+            else:
+                out = {
+                    "type": "axis2d",
+                    "x": {"axis": int(m.get("axis", -1)), "calib": dict(m.get("calib", {}) if isinstance(m.get("calib", {}), dict) else {})},
+                    "y": {"axis": -1, "calib": {"min": 0.0, "max": 0.0}},
+                }
+            _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=out)
+
+        _run_in_scan(_do)
 
     def _bind_set_buttonish(*, label: str, set_name: str, group: str, key: str) -> None:
-        m = _bind_buttonish(label, joystick=joystick)
-        if isinstance(m, dict):
-            _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+        def _do() -> None:
+            m = _bind_buttonish(label, joystick=joystick)
+            if isinstance(m, dict):
+                _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+
+        _run_in_scan(_do)
 
     def _bind_set_trigger(*, label: str, set_name: str, key: str) -> None:
-        m = _bind_trigger_mapping(label, joystick=joystick, delta_threshold=0.30, wake_deadzone=0.05)
-        if isinstance(m, dict) and isinstance(m.get("axis"), int) and isinstance(m.get("sign"), int):
-            _write_set_trigger_mapping(set_name=str(set_name), key=str(key), mapping=m)
+        def _do() -> None:
+            m = _bind_trigger_mapping(label, joystick=joystick, delta_threshold=0.30, wake_deadzone=0.05)
+            if isinstance(m, dict) and isinstance(m.get("axis"), int) and isinstance(m.get("sign"), int):
+                _write_set_trigger_mapping(set_name=str(set_name), key=str(key), mapping=m)
+
+        _run_in_scan(_do)
 
     def _bind_set_firelike(*, label: str, set_name: str, group: str, key: str) -> None:
-        m = _bind_fire_mapping(str(label), joystick=joystick, delta_threshold=0.30)
-        if isinstance(m, dict):
-            _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+        def _do() -> None:
+            m = _bind_fire_mapping(str(label), joystick=joystick, delta_threshold=0.30)
+            if isinstance(m, dict):
+                _write_set_mapping(set_name=str(set_name), group=str(group), key=str(key), mapping=m)
+
+        _run_in_scan(_do)
 
     def _install_set_handlers(prefix: str, set_name: str) -> None:
         # Craft surfaces.
@@ -3937,7 +5286,7 @@ def run_main_menu(
     # Note: legacy global weapon/camera/hud/throttle handlers removed from the menu,
     # but older configs are still read as fallback by the runtime.
 
-    return _run_menu_from_json(spec_path=MENU_SPEC_PATH, start_node="main", action_handlers=handlers)
+    return _run_menu_from_json(spec_path=MENU_SPEC_PATH, start_node=str(start_node), action_handlers=handlers)
 
 
 def run_controls_menu(

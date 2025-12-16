@@ -45,9 +45,8 @@
       "items": [
         { "label": "SIGNAL WORKBENCH", "action": "controller_workbench" },
         { "label": "CHANNEL MIXER", "action": "controller_channel_mixer" },
-        { "label": "JOYSTICK STATUS", "action": "controller_status" },
         { "label": "DISCOVER FEATURE", "action": "controller_discover_feature" },
-        { "label": "CREATE SIGNAL", "action": "controller_create_signal" },
+        { "label": "VIEW CHANNEL", "action": "controller_view_channel" },
         { "label": "MAP CHANNEL", "action": "controller_map_channel" },
         { "label": "BACK", "action": "back" }
       ]
@@ -55,14 +54,8 @@
     "controls_menus": {
       "title": "MENUS",
       "items": [
-        { "label": "BIND MENU BUTTON", "action": "bind_menu_button" },
-        { "label": "BIND MENU UP", "action": "bind_menu_up" },
-        { "label": "BIND MENU DOWN", "action": "bind_menu_down" },
-        { "label": "BIND MENU LEFT", "action": "bind_menu_left" },
-        { "label": "BIND MENU RIGHT", "action": "bind_menu_right" },
-        { "label": "BIND MENU CONFIRM", "action": "bind_menu_confirm" },
-        { "label": "BIND MENU BACK", "action": "bind_menu_back" },
-        { "label": "BIND MENU NAVIGATION", "action": "bind_menu_navigation" },
+        { "label": "BINDING TASKS", "action": "menu_binding_tasks" },
+        { "label": "RESET ACTION BINDINGS (KEEP CONTROLLER)", "action": "reset_action_bindings_keep_controller" },
         { "label": "BACK", "action": "back" }
       ]
     },

@@ -6,6 +6,7 @@ project(geodesic_physics C)
 add_library(geodesic_physics SHARED
     geodesic_physics.c
     signal_kernel.c
+    controller_engine.c
     weapon_sim.c
     flight_sim.c
 )
@@ -25,5 +26,6 @@ if (MSVC)
     target_compile_options(geodesic_physics PRIVATE /W4)
 else()
     target_compile_options(geodesic_physics PRIVATE -Wall -Wextra -Wpedantic)
-    target_link_libraries(geodesic_physics PRIVATE m)
+    find_package(Threads REQUIRED)
+    target_link_libraries(geodesic_physics PRIVATE m Threads::Threads)
 endif()

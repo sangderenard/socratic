@@ -8,6 +8,18 @@
       "dim": 2,
       "sid": "sig2"
     },
+    "10": {
+      "dim": 1,
+      "sid": "MenuNavLeft"
+    },
+    "11": {
+      "dim": 1,
+      "sid": "MenuNavUp"
+    },
+    "12": {
+      "dim": 1,
+      "sid": "MenuNavDown"
+    },
     "2": {
       "dim": 2,
       "sid": "sig3"
@@ -23,6 +35,22 @@
     "5": {
       "dim": 2,
       "sid": "hat_flight"
+    },
+    "6": {
+      "dim": 1,
+      "sid": "MenuConfirmOR"
+    },
+    "7": {
+      "dim": 1,
+      "sid": "MenuCancelOR"
+    },
+    "8": {
+      "dim": 1,
+      "sid": "MenuOpenOR"
+    },
+    "9": {
+      "dim": 1,
+      "sid": "MenuNavRight"
     }
   },
   "final_channels": {
@@ -35,6 +63,21 @@
       "dim": 2,
       "from": "1",
       "sid": "sig2"
+    },
+    "10": {
+      "dim": 1,
+      "from": "10",
+      "sid": "MenuNavLeft"
+    },
+    "11": {
+      "dim": 1,
+      "from": "11",
+      "sid": "MenuNavUp"
+    },
+    "12": {
+      "dim": 1,
+      "from": "12",
+      "sid": "MenuNavDown"
     },
     "2": {
       "dim": 2,
@@ -55,10 +98,30 @@
       "dim": 2,
       "from": "5",
       "sid": "hat_flight"
+    },
+    "6": {
+      "dim": 1,
+      "from": "6",
+      "sid": "MenuConfirmOR"
+    },
+    "7": {
+      "dim": 1,
+      "from": "7",
+      "sid": "MenuCancelOR"
+    },
+    "8": {
+      "dim": 1,
+      "from": "8",
+      "sid": "MenuOpenOR"
+    },
+    "9": {
+      "dim": 1,
+      "from": "9",
+      "sid": "MenuNavRight"
     }
   },
-  "final_generated_utc_ms": 1765775305172,
-  "generated_utc_ms": 1765775305167,
+  "final_generated_utc_ms": 1765891859396,
+  "generated_utc_ms": 1765891859389,
   "inputs": [
     {
       "cap_max": 0.999969482421875,
@@ -76,7 +139,7 @@
     {
       "cap_max": 1.0,
       "cap_min": -0.999969482421875,
-      "deadzone": 0.0,
+      "deadzone": 0.004516670481422141,
       "device": "joystick",
       "id": 1,
       "iid": 1,
@@ -183,6 +246,123 @@
       "kind": "mouse_motion",
       "sigsel": 0,
       "state": "axis"
+    },
+    {
+      "device": "joystick",
+      "id": 1,
+      "iid": 12,
+      "invert": false,
+      "kind": "button",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 27,
+      "iid": 13,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "mouse",
+      "id": 3,
+      "iid": 14,
+      "invert": false,
+      "kind": "mouse_button",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "joystick",
+      "id": 0,
+      "iid": 15,
+      "invert": false,
+      "kind": "button",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 13,
+      "iid": 16,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 1073741912,
+      "iid": 17,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 32,
+      "iid": 18,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "joystick",
+      "id": 7,
+      "iid": 19,
+      "invert": false,
+      "kind": "button",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 9,
+      "iid": 20,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 101,
+      "iid": 21,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 105,
+      "iid": 22,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "keyboard",
+      "id": 109,
+      "iid": 23,
+      "invert": false,
+      "kind": "key",
+      "sigsel": 2,
+      "state": "D"
+    },
+    {
+      "device": "mouse",
+      "id": 2,
+      "iid": 24,
+      "invert": false,
+      "kind": "mouse_button",
+      "sigsel": 2,
+      "state": "D"
     }
   ],
   "mixer": {
@@ -192,7 +372,14 @@
       "2",
       "3",
       "4",
-      "5"
+      "5",
+      "6",
+      "7",
+      "8",
+      "9",
+      "10",
+      "11",
+      "12"
     ],
     "routes": {}
   },
@@ -255,16 +442,274 @@
     {
       "args": [
         {
-          "iid": 4,
-          "ref": "input"
-        },
-        {
-          "iid": 5,
+          "iid": 12,
           "ref": "input"
         }
       ],
-      "dim": 2,
+      "dim": 1,
       "nid": 1,
+      "op": "passthrough"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 1,
+          "ref": "node"
+        },
+        {
+          "iid": 13,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 2,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 2,
+          "ref": "node"
+        },
+        {
+          "iid": 14,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 3,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "iid": 15,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 4,
+      "op": "passthrough"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 4,
+          "ref": "node"
+        },
+        {
+          "iid": 16,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 5,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 5,
+          "ref": "node"
+        },
+        {
+          "iid": 17,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 6,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 6,
+          "ref": "node"
+        },
+        {
+          "iid": 18,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 7,
+      "op": "add"
+    },
+    {
+      "args": [],
+      "dim": 1,
+      "nid": 8,
+      "op": "const",
+      "value": 0.0
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 8,
+          "ref": "node"
+        },
+        {
+          "comp": "y",
+          "nid": 0,
+          "ref": "node"
+        }
+      ],
+      "dim": 1,
+      "nid": 9,
+      "op": "sub"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 8,
+          "ref": "node"
+        },
+        {
+          "comp": "x",
+          "nid": 0,
+          "ref": "node"
+        }
+      ],
+      "dim": 1,
+      "nid": 10,
+      "op": "sub"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 0,
+          "ref": "node"
+        }
+      ],
+      "dim": 1,
+      "nid": 11,
+      "op": "passthrough"
+    },
+    {
+      "args": [
+        {
+          "comp": "y",
+          "nid": 0,
+          "ref": "node"
+        }
+      ],
+      "dim": 1,
+      "nid": 12,
+      "op": "passthrough"
+    },
+    {
+      "args": [
+        {
+          "iid": 19,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 13,
+      "op": "passthrough"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 13,
+          "ref": "node"
+        },
+        {
+          "iid": 20,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 14,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 14,
+          "ref": "node"
+        },
+        {
+          "iid": 21,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 15,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 15,
+          "ref": "node"
+        },
+        {
+          "iid": 22,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 16,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 16,
+          "ref": "node"
+        },
+        {
+          "iid": 23,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 17,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "comp": "x",
+          "nid": 17,
+          "ref": "node"
+        },
+        {
+          "iid": 24,
+          "ref": "input"
+        }
+      ],
+      "dim": 1,
+      "nid": 18,
+      "op": "add"
+    },
+    {
+      "args": [
+        {
+          "iid": 4,
+          "ref": "input"
+        },
+        {
+          "iid": 5,
+          "ref": "input"
+        }
+      ],
+      "dim": 2,
+      "nid": 19,
       "op": "2dflightstick"
     },
     {
@@ -279,7 +724,7 @@
         }
       ],
       "dim": 2,
-      "nid": 2,
+      "nid": 20,
       "op": "2dseek"
     },
     {
@@ -294,7 +739,7 @@
         }
       ],
       "dim": 2,
-      "nid": 3,
+      "nid": 21,
       "op": "2dseek"
     },
     {
@@ -309,7 +754,7 @@
         }
       ],
       "dim": 2,
-      "nid": 4,
+      "nid": 22,
       "op": "2dflightstick"
     },
     {
@@ -324,7 +769,7 @@
         }
       ],
       "dim": 2,
-      "nid": 5,
+      "nid": 23,
       "op": "2dseek"
     },
     {
@@ -339,8 +784,19 @@
         }
       ],
       "dim": 2,
-      "nid": 6,
+      "nid": 24,
       "op": "2dflightstick"
+    },
+    {
+      "args": [
+        {
+          "ref": "imm",
+          "value": 0.0
+        }
+      ],
+      "dim": 1,
+      "nid": 25,
+      "op": "raw"
     }
   ],
   "signals": {
@@ -348,29 +804,105 @@
       "dim": 2,
       "nid": 0
     },
+    "MenuCancelOR": {
+      "dim": 1,
+      "nid": 3
+    },
+    "MenuCancelOR__0": {
+      "dim": 1,
+      "nid": 1
+    },
+    "MenuCancelOR__1": {
+      "dim": 1,
+      "nid": 2
+    },
+    "MenuConfirmOR": {
+      "dim": 1,
+      "nid": 7
+    },
+    "MenuConfirmOR__0": {
+      "dim": 1,
+      "nid": 4
+    },
+    "MenuConfirmOR__1": {
+      "dim": 1,
+      "nid": 5
+    },
+    "MenuConfirmOR__2": {
+      "dim": 1,
+      "nid": 6
+    },
+    "MenuNavDown": {
+      "dim": 1,
+      "nid": 9
+    },
+    "MenuNavLeft": {
+      "dim": 1,
+      "nid": 10
+    },
+    "MenuNavRight": {
+      "dim": 1,
+      "nid": 11
+    },
+    "MenuNavUp": {
+      "dim": 1,
+      "nid": 12
+    },
+    "MenuOpenOR": {
+      "dim": 1,
+      "nid": 18
+    },
+    "MenuOpenOR__0": {
+      "dim": 1,
+      "nid": 13
+    },
+    "MenuOpenOR__1": {
+      "dim": 1,
+      "nid": 14
+    },
+    "MenuOpenOR__2": {
+      "dim": 1,
+      "nid": 15
+    },
+    "MenuOpenOR__3": {
+      "dim": 1,
+      "nid": 16
+    },
+    "MenuOpenOR__4": {
+      "dim": 1,
+      "nid": 17
+    },
+    "MenuZero": {
+      "dim": 1,
+      "nid": 8
+    },
     "hat_flight": {
       "dim": 2,
-      "nid": 1
+      "nid": 19
     },
     "hat_view": {
       "dim": 2,
-      "nid": 2
+      "nid": 20
     },
     "sig1": {
       "dim": 2,
-      "nid": 3
+      "nid": 21
     },
     "sig2": {
       "dim": 2,
-      "nid": 4
+      "nid": 22
     },
     "sig3": {
       "dim": 2,
-      "nid": 5
+      "nid": 23
     },
     "sig4": {
       "dim": 2,
-      "nid": 6
+      "nid": 24
+    },
+    "sig5": {
+      "dim": 1,
+      "nid": 25
     }
   },
   "version": 1

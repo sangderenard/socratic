@@ -20,6 +20,10 @@ extern "C" {
 // Kept separate to remain stable while the kernel implementation evolves.
 #include "signal_kernel_abi.h"
 
+// ---------------- Controller engine ABI (prototype) ----------------
+// Compiled controller graph executor + output rings.
+#include "controller_engine_abi.h"
+
 GP_EXPORT void gp_sigk_reset(void);
 GP_EXPORT void gp_sigk_push_events(const GP_InputEvent* ev, uint32_t count);
 GP_EXPORT int gp_sigk_peek(uint64_t now_ns, uint32_t signal_id, GP_SignalFrame* out);
@@ -28,6 +32,82 @@ GP_EXPORT void gp_sigk_clear_pulses(void);
 // Convert a scalar signal into a button-like state machine.
 // Treats value > epsilon as down, else up. Output is stored under out_button_signal_id.
 GP_EXPORT void gp_sigk_sigtobutton(uint64_t now_ns, uint32_t out_button_signal_id, float value, float epsilon);
+
+// ---------------- Controller engine exports (prototype) ----------------
+
+// Reset/free any loaded controller graph, stop threads, release buffers.
+GP_EXPORT void gp_ctl_reset(void);
+
+// Load a compiled controller graph blob from disk.
+// Returns 1 on success, 0 on failure.
+GP_EXPORT int gp_ctl_load_graph_file(const char* path_utf8);
+
+// Start/stop a fixed-rate controller thread that evaluates the loaded graph.
+// Returns 1 on success.
+GP_EXPORT int gp_ctl_start(uint32_t tick_hz, uint32_t ring_capacity);
+GP_EXPORT void gp_ctl_stop(void);
+GP_EXPORT int gp_ctl_is_running(void);
+
+// Step exactly one controller tick (no thread required). Returns 1 on success.
+GP_EXPORT int gp_ctl_step_once(uint64_t now_ns);
+
+// Query output layout and meta.
+// gp_ctl_get_outputs returns the number of outputs written to out_arr (up to cap).
+GP_EXPORT int gp_ctl_get_meta(GP_CtlMeta* out_meta);
+GP_EXPORT uint32_t gp_ctl_get_outputs(GP_CtlOutputDesc* out_arr, uint32_t cap);
+
+// Output ring access.
+// - gp_ctl_get_write_seq: atomically read the latest published seq
+// - gp_ctl_peek_seq: copy a specific seq if still present in ring
+// - gp_ctl_peek_latest: convenience for latest seq
+GP_EXPORT uint64_t gp_ctl_get_write_seq(void);
+GP_EXPORT int gp_ctl_peek_seq(uint64_t seq, float* out_values, uint32_t cap_values, uint64_t* out_t_ns);
+GP_EXPORT int gp_ctl_peek_latest(float* out_values, uint32_t cap_values, uint64_t* out_seq, uint64_t* out_t_ns);
+
+// ---------------- Controller hook dispatch (prototype) ----------------
+
+// Clear all registered hook watches.
+GP_EXPORT void gp_ctl_hooks_clear(void);
+
+// Add a hook watch. Returns 1 on success.
+GP_EXPORT int gp_ctl_hooks_add(const GP_CtlHookWatch* w);
+
+// Hook queue meta and accessors.
+GP_EXPORT int gp_ctl_hookq_get_meta(GP_CtlHookQMeta* out_meta);
+GP_EXPORT uint64_t gp_ctl_hookq_get_write_seq(void);
+GP_EXPORT int gp_ctl_hookq_peek_seq(uint64_t seq, GP_CtlHookEvent* out_ev);
+GP_EXPORT int gp_ctl_hookq_peek_latest(GP_CtlHookEvent* out_ev, uint64_t* out_seq);
+
+// Block until the hook queue advances beyond last_seen_seq, or timeout.
+// Returns 1 if out_seq is newer than last_seen_seq, else 0.
+GP_EXPORT int gp_ctl_hookq_wait(uint64_t last_seen_seq, uint32_t timeout_ms, uint64_t* out_seq);
+
+// ---------------- Passthrough outputs ----------------
+// Appends scalar outputs to the packed output vector, identified by a stable
+// numeric channel. Intended for deterministic "default" input channels.
+// Must be configured while the controller engine is stopped.
+GP_EXPORT void gp_ctl_passthru_clear(void);
+GP_EXPORT int gp_ctl_passthru_add(const GP_CtlPassthruDesc* desc);
+
+// ---------------- Signal wheel (history + sticky flags) ----------------
+// Signal wheel provides per-signal sample history (overwrite) plus sticky activity flags.
+// The hook runner typically calls gp_ctl_wheel_wait() + gp_ctl_wheel_drain_hot().
+
+GP_EXPORT int gp_ctl_wheel_get_meta(GP_WheelMeta* out_meta);
+GP_EXPORT uint64_t gp_ctl_wheel_get_tick_seq(void);
+
+// Block until the wheel tick counter advances beyond last_tick_seq, or timeout.
+// Returns 1 if out_tick_seq is newer than last_tick_seq, else 0.
+GP_EXPORT int gp_ctl_wheel_wait(uint64_t last_tick_seq, uint32_t timeout_ms, uint64_t* out_tick_seq);
+
+// Copy the latest sample for a signal index.
+GP_EXPORT int gp_ctl_wheel_peek_latest(uint32_t signal_idx, GP_WheelSample* out_sample, uint64_t* out_write_seq);
+
+// Copy a specific sample by write_seq if still present in history.
+GP_EXPORT int gp_ctl_wheel_peek_seq(uint32_t signal_idx, uint64_t write_seq, GP_WheelSample* out_sample);
+
+// Collect indices with HOT since last drain and clear sticky flags for those indices.
+GP_EXPORT int gp_ctl_wheel_drain_hot(uint32_t* out_indices, uint32_t max_indices, uint32_t* out_count);
 
 // ---------------- Signal operator helpers (prototype) ----------------
 // These are small math/logic kernels intended to be used by the upcoming

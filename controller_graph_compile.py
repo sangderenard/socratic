@@ -19,12 +19,26 @@ from dataclasses import dataclass
 from typing import Any, Literal
 import json
 import os
+import struct
 import sys
 import traceback
 import time
 
 
 GraphValueType = Literal["f1", "f2"]
+
+
+# Keep aligned with c_physics/controller_engine_abi.h op codes.
+_CTL_OP: dict[str, int] = {
+    "passthrough": 0,
+    "const": 1,
+    "add": 2,
+    "sub": 3,
+    "kernel": 4,
+    "2dseek": 10,
+    "2dflightstick": 11,
+    "2dsumclamp": 12,
+}
 
 
 # Keep these numeric codes aligned with c_physics/signal_kernel_abi.h (GP_SIGSEL_*).
@@ -145,7 +159,7 @@ def _op_required_args(op: str) -> int:
     if op in ("2dsumclamp",):
         # variadic: uses args as (x0,y0,x1,y1,...) pairs; minimum one pair
         return 2
-    # kernel and default passthrough
+    # kernel and default graph passthrough (compiled op=passthrough)
     return 1
 
 
@@ -164,7 +178,7 @@ def _as_float(v: Any, default: float = 0.0) -> float:
 class InputKey:
     # Normalized unique key for an input source.
     device: str
-    kind: str  # axis|button
+    kind: str  # axis|button|key|mouse_motion|mouse_button
     id: int
     state: str
 
@@ -187,7 +201,7 @@ def _parse_arg_spec(spec: dict[str, Any]) -> tuple[str, Any]:
             if kind not in ("key", "axis"):
                 raise ValueError(f"unsupported input spec: {spec}")
         elif dev == "mouse":
-            if kind not in ("mouse_motion",):
+            if kind not in ("mouse_motion", "mouse_button"):
                 raise ValueError(f"unsupported input spec: {spec}")
         else:
             raise ValueError(f"unsupported input device: {spec}")
@@ -437,6 +451,214 @@ def _atomic_write_json(path: str, data: dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except Exception:
+            pass
+    os.replace(tmp, path)
+
+
+def _compose_signal_id(device_code: int, kind_code: int, item_id: int) -> int:
+    return ((int(device_code) & 0xFF) << 24) | ((int(kind_code) & 0xFF) << 16) | (int(item_id) & 0xFFFF)
+
+
+def _write_controller_blob(final_graph: dict[str, Any], *, out_path: str) -> None:
+    """Write GP_CTL_BLOB_VERSION==1 binary.
+
+    This is the artifact intended for the C-side controller engine. It contains:
+    - input table (kernel signal_id + selector + calibration)
+    - nodes (topologically ordered)
+    - args (flattened)
+    - final outputs (channel -> producing node)
+    """
+
+    inputs = final_graph.get("inputs")
+    nodes = final_graph.get("nodes")
+    signals = final_graph.get("signals")
+    final_channels = final_graph.get("final_channels")
+    if not isinstance(inputs, list) or not isinstance(nodes, list) or not isinstance(signals, dict) or not isinstance(final_channels, dict):
+        raise ValueError("invalid final graph schema (blob)")
+
+    # Build outputs (resolved to node ids).
+    outputs: list[tuple[int, int, int]] = []  # (channel, dim, nid)
+    for out_ch, spec in final_channels.items():
+        try:
+            ch = int(out_ch)
+        except Exception:
+            continue
+        if not isinstance(spec, dict):
+            continue
+        sid = str(spec.get("sid", ""))
+        if not sid:
+            continue
+        s = signals.get(sid)
+        if not isinstance(s, dict):
+            continue
+        try:
+            nid = int(s.get("nid"))
+        except Exception:
+            continue
+        try:
+            dim = int(spec.get("dim", s.get("dim", 1)))
+        except Exception:
+            dim = 1
+        dim = 2 if dim == 2 else 1
+        outputs.append((int(ch), int(dim), int(nid)))
+    outputs.sort(key=lambda t: int(t[0]))
+
+    # Flatten args.
+    args_flat: list[tuple[int, int, int, float]] = []  # (ref, comp, index, imm)
+    nodes_bin: list[tuple[int, int, int, int, int, float, int, int]] = []
+    # nid, op, dim, argc, args_offset, value, signal_id, sigsel
+
+    for n in nodes:
+        if not isinstance(n, dict):
+            continue
+        try:
+            nid = int(n.get("nid"))
+        except Exception:
+            continue
+        op_s = str(n.get("op", "passthrough"))
+        op = int(_CTL_OP.get(op_s, 0))
+        try:
+            dim = int(n.get("dim", 1))
+        except Exception:
+            dim = 1
+        dim = 2 if dim == 2 else 1
+
+        args = n.get("args")
+        if not isinstance(args, list):
+            args = []
+        args_offset = int(len(args_flat))
+
+        for a in args:
+            if not isinstance(a, dict):
+                # treat as imm 0
+                args_flat.append((2, 0, 0, 0.0))
+                continue
+            ref = str(a.get("ref", ""))
+            if ref == "input":
+                try:
+                    iid = int(a.get("iid"))
+                except Exception:
+                    iid = 0
+                args_flat.append((0, 0, int(iid), 0.0))
+            elif ref == "node":
+                try:
+                    nid2 = int(a.get("nid"))
+                except Exception:
+                    nid2 = 0
+                comp_s = str(a.get("comp", "x")).lower().strip()
+                comp = 1 if comp_s == "y" else 0
+                args_flat.append((1, int(comp), int(nid2), 0.0))
+            elif ref == "imm":
+                args_flat.append((2, 0, 0, float(_as_float(a.get("value", 0.0), 0.0))))
+            else:
+                args_flat.append((2, 0, 0, 0.0))
+
+        argc = int(len(args))
+        value = float(_as_float(n.get("value", 0.0), 0.0)) if op_s == "const" else 0.0
+        signal_id = int(n.get("signal_id", 0)) if op_s == "kernel" else 0
+        sigsel = int(n.get("sigsel", 0)) if op_s == "kernel" else 0
+
+        nodes_bin.append((int(nid), int(op), int(dim), int(argc), int(args_offset), float(value), int(signal_id), int(sigsel)))
+
+    # Inputs: convert to kernel signal ids and include calibration.
+    inputs_bin: list[tuple[int, int, int, int, float, float, float, float]] = []
+    # iid, signal_id, sigsel, flags, cap_min, cap_max, trim, deadzone
+    for inp in inputs:
+        if not isinstance(inp, dict):
+            continue
+        try:
+            iid = int(inp.get("iid"))
+        except Exception:
+            continue
+        dev = str(inp.get("device", ""))
+        kind = str(inp.get("kind", ""))
+        try:
+            item_id = int(inp.get("id", 0))
+        except Exception:
+            item_id = 0
+        try:
+            sigsel = int(inp.get("sigsel", 0))
+        except Exception:
+            sigsel = 0
+        invert = bool(inp.get("invert", False))
+
+        if dev == "joystick":
+            dev_code = 3
+        elif dev == "keyboard":
+            dev_code = 1
+        elif dev == "mouse":
+            dev_code = 2
+        else:
+            dev_code = 3
+
+        if kind == "axis":
+            kind_code = 1
+        elif kind == "button":
+            kind_code = 2
+        elif kind == "hat":
+            kind_code = 3
+        elif kind == "key":
+            kind_code = 4
+        elif kind in ("mouse_motion", "motion"):
+            kind_code = 5
+        elif kind == "mouse_button":
+            kind_code = 6
+        else:
+            kind_code = 1
+
+        signal_id = int(_compose_signal_id(int(dev_code), int(kind_code), int(item_id)))
+        flags = 1 if invert else 0
+
+        cap_min = float(_as_float(inp.get("cap_min", 0.0), 0.0))
+        cap_max = float(_as_float(inp.get("cap_max", 0.0), 0.0))
+        trim = float(_as_float(inp.get("trim", 0.0), 0.0))
+        deadzone = float(_as_float(inp.get("deadzone", 0.0), 0.0))
+
+        inputs_bin.append((int(iid), int(signal_id), int(sigsel), int(flags), cap_min, cap_max, trim, deadzone))
+
+    # Sort inputs by iid so iid can be used as direct index.
+    inputs_bin.sort(key=lambda t: int(t[0]))
+
+    # Pack.
+    hdr = struct.pack(
+        "<8I",
+        0x4C544347,  # 'GCTL'
+        1,
+        int(len(inputs_bin)),
+        int(len(nodes_bin)),
+        int(len(args_flat)),
+        int(len(outputs)),
+        0,
+        0,
+    )
+
+    inp_pack = struct.Struct("<IIIIffff")
+    node_pack = struct.Struct("<IHHIIfII")
+    arg_pack = struct.Struct("<BBHif")
+    out_pack = struct.Struct("<IHHII")
+
+    buf = bytearray()
+    buf += hdr
+    for it in inputs_bin:
+        buf += inp_pack.pack(*it)
+    for nt in nodes_bin:
+        buf += node_pack.pack(*nt)
+    for at in args_flat:
+        buf += arg_pack.pack(int(at[0]), int(at[1]), 0, int(at[2]), float(at[3]))
+    for ch, dim, nid in outputs:
+        buf += out_pack.pack(int(ch), int(dim), 1, 0, int(nid))
+
+    _atomic_write_bytes(str(out_path), bytes(buf))
+
+
 def _load_mixer_routes(mixer_path: str) -> dict[str, str] | None:
     if not mixer_path:
         return None
@@ -467,6 +689,7 @@ def try_build_final_graph(
     mixer_path: str = "channel_mixer.json",
     compiled_out_path: str = "controller_graph_compiled.json",
     final_out_path: str = "controller_graph_final.json",
+    final_bin_out_path: str = "controller_graph_final.bin",
 ) -> tuple[bool, str, dict[str, Any] | None, dict[str, Any] | None]:
     """Stage-1 compile + stage-2 mixer finalize.
 
@@ -479,6 +702,15 @@ def try_build_final_graph(
         if not isinstance(cfg, dict):
             return False, "joystick config is not a JSON object", None, None
 
+        # Ensure fresh configs still compile into a usable menu control set.
+        # (This is a best-effort seed; it does not persist back to joystick.json.)
+        try:
+            import joystick_menu
+
+            cfg = joystick_menu.ensure_menu_bindings_block(cfg)
+        except Exception:
+            pass
+
         compiled = compile_controller_graph(cfg)
         if compiled_out_path:
             _atomic_write_json(str(compiled_out_path), compiled)
@@ -487,6 +719,13 @@ def try_build_final_graph(
         final_graph = finalize_compiled_graph(compiled, mixer_routes=mixer_routes)
         if final_out_path:
             _atomic_write_json(str(final_out_path), final_graph)
+
+        # Best-effort: emit C-friendly binary blob.
+        if final_bin_out_path:
+            try:
+                _write_controller_blob(final_graph, out_path=str(final_bin_out_path))
+            except Exception:
+                pass
 
         return True, "ACTIVE (compile ok)", compiled, final_graph
     except Exception as e:

@@ -103,6 +103,15 @@ def run_signal_workbench(
     Menu-nav cancel/menu-button/esc still exit.
     """
 
+    try:
+        import input_interest
+    except Exception:
+        input_interest = None
+
+    # Workbench controls input_interest mode/allowlist; we do not poll-first
+    # and then ask "should we push?". We derive a set of specs and only
+    # poll/push from that set (or ALL during scan/listen).
+
     state = WorkbenchState()
     if state.collapsed_sigs is None:
         state.collapsed_sigs = set()
@@ -116,6 +125,78 @@ def run_signal_workbench(
         state.calib_sessions = {}
     clock = pygame.time.Clock()
 
+    # Workbench defaults to scan-mode, but can live-toggle to announce.
+    if not hasattr(state, "input_mode"):
+        state.input_mode = "scan"  # type: ignore[attr-defined]
+    if input_interest is not None:
+        try:
+            input_interest.set_mode(str(getattr(state, "input_mode", "scan")))
+        except Exception:
+            pass
+
+    def _try_load_final_graph_kernel_inputs(path: str) -> set[tuple[int, int, int]] | None:
+        try:
+            import json
+            import os
+
+            if not os.path.exists(str(path)):
+                return None
+            with open(str(path), "r", encoding="utf-8") as f:
+                doc = json.load(f)
+            ins = doc.get("inputs") if isinstance(doc, dict) else None
+            if not isinstance(ins, list):
+                return None
+
+            out: set[tuple[int, int, int]] = set()
+            for it in ins:
+                if not isinstance(it, dict):
+                    continue
+                dev = str(it.get("device", ""))
+                kind = str(it.get("kind", ""))
+                try:
+                    item_id = int(it.get("id", 0))
+                except Exception:
+                    item_id = 0
+
+                if dev in ("joystick", "joy"):
+                    dev_code = int(signal_kernel_api.GP_DEV_JOYSTICK)
+                elif dev in ("keyboard", "kbd"):
+                    dev_code = int(signal_kernel_api.GP_DEV_KEYBOARD)
+                elif dev in ("mouse",):
+                    dev_code = int(signal_kernel_api.GP_DEV_MOUSE)
+                else:
+                    continue
+
+                if kind in ("axis",):
+                    kind_code = int(signal_kernel_api.GP_EV_AXIS)
+                elif kind in ("button",):
+                    kind_code = int(signal_kernel_api.GP_EV_BUTTON)
+                elif kind in ("key",):
+                    kind_code = int(signal_kernel_api.GP_EV_KEY)
+                elif kind in ("mouse_motion", "motion"):
+                    kind_code = int(signal_kernel_api.GP_EV_MOUSE_MOTION)
+                elif kind in ("mouse_button", "mbutton"):
+                    kind_code = int(signal_kernel_api.GP_EV_MOUSE_BUTTON)
+                else:
+                    continue
+
+                out.add((int(dev_code), int(kind_code), int(item_id)))
+
+            return out
+        except Exception:
+            return None
+
+    # Derive announce allowlist from the compiled final graph (if present).
+    # Missing/invalid graph => empty allowlist (quiet announce-mode).
+    announce_interest = _try_load_final_graph_kernel_inputs("controller_graph_final.json")
+    if not isinstance(announce_interest, set):
+        announce_interest = set()
+    if input_interest is not None:
+        try:
+            input_interest.set_announce_interest(announce_interest)
+        except Exception:
+            pass
+
     def _rebuild_graphs(now_ns: int) -> None:
         ok, msg, _compiled, _final = controller_graph_compile.try_build_final_graph(
             joystick_path="joystick.json",
@@ -126,6 +207,17 @@ def run_signal_workbench(
         state.compile_ok = bool(ok)
         state.compile_msg = str(msg)
         state.compile_last_ns = int(now_ns)
+
+        # Refresh announce-mode allowlist after a successful rebuild.
+        nonlocal announce_interest
+        announce_interest = _try_load_final_graph_kernel_inputs("controller_graph_final.json")
+        if not isinstance(announce_interest, set):
+            announce_interest = set()
+        if input_interest is not None:
+            try:
+                input_interest.set_announce_interest(announce_interest)
+            except Exception:
+                pass
 
     left_scroll = scroll_model.ScrollModel(first_idx=0)
     right_scroll = scroll_model.ScrollModel(first_idx=0)
@@ -621,7 +713,7 @@ def run_signal_workbench(
             if n % 2 == 1:
                 n += 1
             return int(n)
-        # default: one input passthrough
+        # default: one input for compiled graph nodes (op=passthrough)
         return 1
 
     def _bind_row_to_signal_arg(
@@ -1335,6 +1427,8 @@ def run_signal_workbench(
     axes_prev: dict[int, float] = {}
     buttons_prev: set[int] = set()
     hats_prev: dict[int, tuple[int, int]] = {}
+    keys_prev: set[int] = set()
+    mouse_buttons_prev: set[int] = set()
 
     def _build_left_rows(cfg: dict[str, Any]) -> list[tuple[str, object]]:
         rows: list[tuple[str, object]] = []
@@ -2319,6 +2413,27 @@ def run_signal_workbench(
 
         # Footer/status
         _draw_text_px(pad, height - pad - 2, "ESC/Q/menu-btn: exit")
+
+        mode_txt = str(getattr(state, "input_mode", "scan")).strip().lower() or "scan"
+        mode_lbl = "SCAN" if mode_txt == "scan" else "ANNOUNCE"
+        interest_lbl = "ALL" if announce_interest is None else str(len(announce_interest))
+        mx0 = int(pad)
+        my0 = int(height - pad - 56)
+        _draw_text_px(mx0, my0, f"MODE: {mode_lbl}  (click to toggle)   announce-interest: {interest_lbl}")
+        try:
+            w_mode, _h_mode = font.size(f"MODE: {mode_lbl}  (click to toggle)   announce-interest: {interest_lbl}")
+        except Exception:
+            w_mode = 260
+        hitboxes_out.append(
+            HitBox(
+                x0=int(mx0 - 4),
+                y0=int(my0 - max(16, int(font.get_linesize()))),
+                x1=int(mx0 + int(w_mode) + 6),
+                y1=int(my0 + 6),
+                payload={"kind": "mode_toggle"},
+            )
+        )
+
         if state.compile_ok:
             _draw_text_px(pad, height - pad - 38, "COMPILE: ACTIVE", (120, 255, 120))
         else:
@@ -2426,16 +2541,64 @@ def run_signal_workbench(
                 except Exception:
                     pending_wheel += 0
 
+        # Effective input spec set for this frame.
+        try:
+            if input_interest is not None:
+                allow, deny = input_interest.get_effective_set()
+            else:
+                allow, deny = (None, set())
+        except Exception:
+            allow, deny = (None, set())
+
+        deny = set(deny or set())
+        if allow is not None:
+            allow = set(allow) - deny
+
+        # Joystick snapshot (poll only requested ids in announce-mode).
         if joystick is not None:
-            axes_now, buttons_now, hats_now = poll_joystick_snapshot(joystick)
+            try:
+                if allow is None:
+                    axes_now, buttons_now, hats_now = poll_joystick_snapshot(joystick)
+                else:
+                    HARD_HAT_AXIS_BASE = 50000
+                    HARD_HAT_BTN_BASE = 51000
+                    joy_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_AXIS)}
+                    joy_btns = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_BUTTON)}
+                    phys_axes = sorted([int(a) for a in joy_axes if 0 <= int(a) < int(HARD_HAT_AXIS_BASE)])
+                    phys_btns = sorted([int(b) for b in joy_btns if 0 <= int(b) < int(HARD_HAT_BTN_BASE)])
+                    hat_ids: set[int] = set()
+                    for ax_id in joy_axes:
+                        if int(ax_id) >= int(HARD_HAT_AXIS_BASE) and int(ax_id) < int(HARD_HAT_BTN_BASE):
+                            hat_ids.add(int((int(ax_id) - int(HARD_HAT_AXIS_BASE)) // 2))
+                    for bid in joy_btns:
+                        if int(bid) >= int(HARD_HAT_BTN_BASE):
+                            hat_ids.add(int((int(bid) - int(HARD_HAT_BTN_BASE)) // 8))
+                    axes_now, buttons_now, hats_now = poll_joystick_snapshot(
+                        joystick,
+                        axes_ids=phys_axes,
+                        button_ids=phys_btns,
+                        hat_ids=sorted(hat_ids) if hat_ids else [],
+                    )
+            except Exception:
+                axes_now, buttons_now, hats_now = {}, set(), {}
         else:
             axes_now, buttons_now, hats_now = {}, set(), {}
 
-        # Keyboard and mouse "axis" sources (for DirOR-safe-mode and future binds).
-        try:
-            pressed = pygame.key.get_pressed()
-        except Exception:
-            pressed = None
+        # Keyboard sources (poll only if allowed).
+        pressed = None
+        want_kbd_axes = None
+        want_kbd_keys = None
+        if allow is None:
+            want_kbd_axes = None
+            want_kbd_keys = None
+        else:
+            want_kbd_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_KEYBOARD) and int(k) == int(signal_kernel_api.GP_EV_AXIS)}
+            want_kbd_keys = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_KEYBOARD) and int(k) == int(signal_kernel_api.GP_EV_KEY)}
+        if allow is None or (want_kbd_axes and len(want_kbd_axes)) or (want_kbd_keys and len(want_kbd_keys)):
+            try:
+                pressed = pygame.key.get_pressed()
+            except Exception:
+                pressed = None
 
         def _is_down(k: int) -> int:
             if pressed is None:
@@ -2452,10 +2615,14 @@ def run_signal_workbench(
             b = _is_down(pygame.K_w) - _is_down(pygame.K_s)
             c = _is_down(pygame.K_RIGHT) - _is_down(pygame.K_LEFT)
             d = _is_down(pygame.K_UP) - _is_down(pygame.K_DOWN)
-            kbd_axes_now[0] = float(a)
-            kbd_axes_now[1] = float(b)
-            kbd_axes_now[2] = float(c)
-            kbd_axes_now[3] = float(d)
+            if allow is None or (want_kbd_axes and 0 in want_kbd_axes):
+                kbd_axes_now[0] = float(a)
+            if allow is None or (want_kbd_axes and 1 in want_kbd_axes):
+                kbd_axes_now[1] = float(b)
+            if allow is None or (want_kbd_axes and 2 in want_kbd_axes):
+                kbd_axes_now[2] = float(c)
+            if allow is None or (want_kbd_axes and 3 in want_kbd_axes):
+                kbd_axes_now[3] = float(d)
 
         # Mouse motion axes (dx,dy) from kernel-peeked values if available.
         mouse_axes_now: dict[int, float] = {}
@@ -2701,17 +2868,43 @@ def run_signal_workbench(
                 if int(delta_pages):
                     right_scroll.scroll_pages(delta_pages=int(delta_pages), total=int(sigs2_total), max_visible=int(max_right_rows))
 
-        # Feed C kernel with snapshot-derived edges for joystick buttons (so flags/timers work).
+        # Feed C kernel with snapshot-derived edges/values.
         if _sigk is not None and joystick is not None:
-            try:
-                nb = int(joystick.get_numbuttons())
-            except Exception:
-                nb = 0
+            allow_all = allow is None
+            want_joy_buttons: set[int] | None = None
+            want_joy_axes: set[int] | None = None
+            want_hat_btns: set[int] | None = None
+            want_hat_axes: set[int] | None = None
+            want_mouse_motion: set[int] | None = None
+            want_mouse_buttons: set[int] | None = None
+            want_kbd_keys_eff: set[int] | None = None
+
+            if not allow_all:
+                want_joy_buttons = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_BUTTON)}
+                want_joy_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_AXIS)}
+                want_hat_btns = {int(iid) for iid in (want_joy_buttons or set()) if int(iid) >= int(HARD_HAT_BTN_BASE)}
+                want_hat_axes = {int(iid) for iid in (want_joy_axes or set()) if int(iid) >= int(HARD_HAT_AXIS_BASE)}
+                want_mouse_motion = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_MOUSE) and int(k) == int(signal_kernel_api.GP_EV_MOUSE_MOTION)}
+                want_mouse_buttons = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_MOUSE) and int(k) == int(signal_kernel_api.GP_EV_MOUSE_BUTTON)}
+                want_kbd_keys_eff = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_KEYBOARD) and int(k) == int(signal_kernel_api.GP_EV_KEY)}
+
+            # Joystick physical button edges.
             evs: list[GP_InputEvent] = []
-            for b in range(max(0, nb)):
-                b = int(b)
-                was_down = b in buttons_prev
-                is_down = b in buttons_now
+            if allow_all:
+                try:
+                    nb = int(joystick.get_numbuttons())
+                except Exception:
+                    nb = 0
+                button_iter = [int(b) for b in range(max(0, nb))]
+            else:
+                button_iter = sorted([int(b) for b in (want_joy_buttons or set()) if int(b) >= 0 and int(b) < int(HARD_HAT_BTN_BASE)])
+
+            for b in button_iter:
+                spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), int(b))
+                if spec in deny:
+                    continue
+                was_down = int(b) in buttons_prev
+                is_down = int(b) in buttons_now
                 if was_down == is_down:
                     continue
                 evs.append(
@@ -2743,41 +2936,55 @@ def run_signal_workbench(
                 if cur_dir == prev_dir:
                     continue
                 if prev_dir is not None:
-                    hat_btn_evs.append(
-                        GP_InputEvent(
-                            t_mono_ns=now_ns,
-                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                            kind=int(signal_kernel_api.GP_EV_BUTTON),
-                            id=int(_hard_hat_btn_id(int(h), int(prev_dir))),
-                            v0=0.0,
-                            v1=0.0,
-                            flags=0,
+                    prev_id = int(_hard_hat_btn_id(int(h), int(prev_dir)))
+                    spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), int(prev_id))
+                    if spec not in deny and (allow_all or int(prev_id) in (want_hat_btns or set())):
+                        hat_btn_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                id=int(prev_id),
+                                v0=0.0,
+                                v1=0.0,
+                                flags=0,
+                            )
                         )
-                    )
                 if cur_dir is not None:
-                    hat_btn_evs.append(
-                        GP_InputEvent(
-                            t_mono_ns=now_ns,
-                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                            kind=int(signal_kernel_api.GP_EV_BUTTON),
-                            id=int(_hard_hat_btn_id(int(h), int(cur_dir))),
-                            v0=1.0,
-                            v1=0.0,
-                            flags=0,
+                    cur_id = int(_hard_hat_btn_id(int(h), int(cur_dir)))
+                    spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), int(cur_id))
+                    if spec not in deny and (allow_all or int(cur_id) in (want_hat_btns or set())):
+                        hat_btn_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                id=int(cur_id),
+                                v0=1.0,
+                                v1=0.0,
+                                flags=0,
+                            )
                         )
-                    )
             if hat_btn_evs:
                 arr3_t = GP_InputEvent * len(hat_btn_evs)
                 _sigk.gp_sigk_push_events(arr3_t(*hat_btn_evs), int(len(hat_btn_evs)))
 
-            # Push instantaneous axis values each frame so axis-bound signals have values.
-            try:
-                na = int(joystick.get_numaxes())
-            except Exception:
-                na = 0
-            if na > 0:
+            # Joystick physical axes (per-frame).
+            if allow_all:
+                try:
+                    na = int(joystick.get_numaxes())
+                except Exception:
+                    na = 0
+                axis_iter = [int(a) for a in range(max(0, int(na)))]
+            else:
+                axis_iter = sorted([int(a) for a in (want_joy_axes or set()) if 0 <= int(a) < int(HARD_HAT_AXIS_BASE)])
+
+            if axis_iter:
                 a_evs: list[GP_InputEvent] = []
-                for a in range(max(0, int(na))):
+                for a in axis_iter:
+                    spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(a))
+                    if spec in deny:
+                        continue
                     vv = float(axes_now.get(int(a), 0.0))
                     a_evs.append(
                         GP_InputEvent(
@@ -2794,10 +3001,13 @@ def run_signal_workbench(
                     arr2_t = GP_InputEvent * len(a_evs)
                     _sigk.gp_sigk_push_events(arr2_t(*a_evs), int(len(a_evs)))
 
-            # Push keyboard axes each frame (WASD + arrows).
+            # Keyboard axes (from kbd_axes_now, already restricted above).
             try:
                 k_evs: list[GP_InputEvent] = []
                 for kid, kval in (kbd_axes_now or {}).items():
+                    spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS), int(kid))
+                    if spec in deny:
+                        continue
                     k_evs.append(
                         GP_InputEvent(
                             t_mono_ns=now_ns,
@@ -2815,10 +3025,87 @@ def run_signal_workbench(
             except Exception:
                 pass
 
-            # Push mouse motion axes each frame (dx/dy).
+            # Keyboard key edges.
+            try:
+                if pressed is not None:
+                    if allow_all:
+                        keys_down: set[int] = set()
+                        try:
+                            for i, v in enumerate(pressed):
+                                if v:
+                                    keys_down.add(int(i))
+                        except Exception:
+                            keys_down = set()
+                        changed = (keys_down - keys_prev) | (keys_prev - keys_down)
+                        if changed:
+                            kkey_evs: list[GP_InputEvent] = []
+                            for keycode in sorted(changed):
+                                spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_KEY), int(keycode))
+                                if spec in deny:
+                                    continue
+                                is_down = int(keycode) in keys_down
+                                kkey_evs.append(
+                                    GP_InputEvent(
+                                        t_mono_ns=now_ns,
+                                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                                        kind=int(signal_kernel_api.GP_EV_KEY),
+                                        id=int(keycode),
+                                        v0=1.0 if is_down else 0.0,
+                                        v1=0.0,
+                                        flags=0,
+                                    )
+                                )
+                            if kkey_evs:
+                                arrkk_t = GP_InputEvent * len(kkey_evs)
+                                _sigk.gp_sigk_push_events(arrkk_t(*kkey_evs), int(len(kkey_evs)))
+                        keys_prev = set(keys_down)
+                    else:
+                        want_keys = sorted(set(want_kbd_keys_eff or set()))
+                        if want_keys:
+                            keys_down = set(keys_prev)
+                            kkey_evs: list[GP_InputEvent] = []
+                            for keycode in want_keys:
+                                spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_KEY), int(keycode))
+                                if spec in deny:
+                                    continue
+                                try:
+                                    is_down = 1 if bool(pressed[int(keycode)]) else 0
+                                except Exception:
+                                    is_down = 0
+                                was_down = int(keycode) in keys_prev
+                                if was_down == bool(is_down):
+                                    continue
+                                if is_down:
+                                    keys_down.add(int(keycode))
+                                else:
+                                    keys_down.discard(int(keycode))
+                                kkey_evs.append(
+                                    GP_InputEvent(
+                                        t_mono_ns=now_ns,
+                                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                                        kind=int(signal_kernel_api.GP_EV_KEY),
+                                        id=int(keycode),
+                                        v0=1.0 if is_down else 0.0,
+                                        v1=0.0,
+                                        flags=0,
+                                    )
+                                )
+                            if kkey_evs:
+                                arrkk_t = GP_InputEvent * len(kkey_evs)
+                                _sigk.gp_sigk_push_events(arrkk_t(*kkey_evs), int(len(kkey_evs)))
+                            keys_prev = set(keys_down)
+            except Exception:
+                pass
+
+            # Mouse motion axes (dx/dy).
             try:
                 m_evs: list[GP_InputEvent] = []
                 for mid, mval in (mouse_axes_now or {}).items():
+                    spec = (int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_MOTION), int(mid))
+                    if spec in deny:
+                        continue
+                    if (not allow_all) and int(mid) not in (want_mouse_motion or set()):
+                        continue
                     m_evs.append(
                         GP_InputEvent(
                             t_mono_ns=now_ns,
@@ -2836,7 +3123,64 @@ def run_signal_workbench(
             except Exception:
                 pass
 
-            # Push hat axes each frame as virtual joystick axes (x/y are already trinary).
+            # Mouse button edges.
+            try:
+                mpressed = None
+                if allow_all or (want_mouse_buttons and len(want_mouse_buttons)):
+                    try:
+                        mpressed = pygame.mouse.get_pressed()
+                    except Exception:
+                        mpressed = None
+                if mpressed is not None:
+                    cur_down: set[int] = set()
+                    try:
+                        for i, v in enumerate(mpressed):
+                            if v:
+                                cur_down.add(int(i))
+                    except Exception:
+                        cur_down = set()
+
+                    if allow_all:
+                        changed = (cur_down - mouse_buttons_prev) | (mouse_buttons_prev - cur_down)
+                        want_bids = sorted(changed)
+                    else:
+                        # Only consider edges for declared ids.
+                        want_bids = sorted(set(want_mouse_buttons or set()))
+
+                    if want_bids:
+                        mb_evs: list[GP_InputEvent] = []
+                        for bid in want_bids:
+                            spec = (int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_BUTTON), int(bid))
+                            if spec in deny:
+                                continue
+                            is_down = int(bid) in cur_down
+                            was_down = int(bid) in mouse_buttons_prev
+                            if allow_all:
+                                if int(bid) not in (cur_down ^ mouse_buttons_prev):
+                                    # changed set already filtered, but keep safe.
+                                    pass
+                            else:
+                                if was_down == bool(is_down):
+                                    continue
+                            mb_evs.append(
+                                GP_InputEvent(
+                                    t_mono_ns=now_ns,
+                                    device=int(signal_kernel_api.GP_DEV_MOUSE),
+                                    kind=int(signal_kernel_api.GP_EV_MOUSE_BUTTON),
+                                    id=int(bid),
+                                    v0=1.0 if is_down else 0.0,
+                                    v1=0.0,
+                                    flags=0,
+                                )
+                            )
+                        if mb_evs:
+                            arrmb_t = GP_InputEvent * len(mb_evs)
+                            _sigk.gp_sigk_push_events(arrmb_t(*mb_evs), int(len(mb_evs)))
+                    mouse_buttons_prev = set(cur_down)
+            except Exception:
+                pass
+
+            # Hat axes each frame as virtual joystick axes.
             try:
                 nh2 = int(joystick.get_numhats())
             except Exception:
@@ -2845,28 +3189,34 @@ def run_signal_workbench(
                 h_evs: list[GP_InputEvent] = []
                 for h in range(max(0, int(nh2))):
                     hx, hy = hats_now.get(int(h), (0, 0))
-                    h_evs.append(
-                        GP_InputEvent(
-                            t_mono_ns=now_ns,
-                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                            kind=int(signal_kernel_api.GP_EV_AXIS),
-                            id=int(_hard_hat_axis_id(int(h), "x")),
-                            v0=float(int(hx)),
-                            v1=0.0,
-                            flags=0,
+                    ax_id = int(_hard_hat_axis_id(int(h), "x"))
+                    ay_id = int(_hard_hat_axis_id(int(h), "y"))
+                    specx = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(ax_id))
+                    specy = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(ay_id))
+                    if specx not in deny and (allow_all or int(ax_id) in (want_hat_axes or set())):
+                        h_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_AXIS),
+                                id=int(ax_id),
+                                v0=float(int(hx)),
+                                v1=0.0,
+                                flags=0,
+                            )
                         )
-                    )
-                    h_evs.append(
-                        GP_InputEvent(
-                            t_mono_ns=now_ns,
-                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                            kind=int(signal_kernel_api.GP_EV_AXIS),
-                            id=int(_hard_hat_axis_id(int(h), "y")),
-                            v0=float(int(hy)),
-                            v1=0.0,
-                            flags=0,
+                    if specy not in deny and (allow_all or int(ay_id) in (want_hat_axes or set())):
+                        h_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_AXIS),
+                                id=int(ay_id),
+                                v0=float(int(hy)),
+                                v1=0.0,
+                                flags=0,
+                            )
                         )
-                    )
                 if h_evs:
                     arrh_t = GP_InputEvent * len(h_evs)
                     _sigk.gp_sigk_push_events(arrh_t(*h_evs), int(len(h_evs)))
@@ -2876,6 +3226,12 @@ def run_signal_workbench(
 
             # Update virtual hat inputs derived from 2D signals (trinary axes + direction buttons).
             sig_hat_evs = _update_virtual_hats_from_signals(cfg, int(now_ns), axes_now=axes_now)
+            if sig_hat_evs and (not allow_all):
+                sig_hat_evs = [
+                    e
+                    for e in sig_hat_evs
+                    if (int(e.device), int(e.kind), int(e.id)) in (allow or set()) and (int(e.device), int(e.kind), int(e.id)) not in deny
+                ]
             if sig_hat_evs:
                 arrs_t = GP_InputEvent * len(sig_hat_evs)
                 _sigk.gp_sigk_push_events(arrs_t(*sig_hat_evs), int(len(sig_hat_evs)))
@@ -2899,6 +3255,30 @@ def run_signal_workbench(
             for hb in hitboxes:
                 if hb.contains(int(mx), int(my)):
                     p = hb.payload
+                    if p.get("kind") == "mode_toggle":
+                        cur = str(getattr(state, "input_mode", "scan")).strip().lower() or "scan"
+                        nxt = "announce" if cur == "scan" else "scan"
+                        state.input_mode = str(nxt)  # type: ignore[attr-defined]
+                        if input_interest is not None:
+                            try:
+                                input_interest.set_mode(str(nxt))
+                            except Exception:
+                                pass
+
+                        # Clear any stale kernel state/edges so ANNOUNCE reflects *current* interest gating.
+                        try:
+                            _sigk.gp_sigk_reset()
+                        except Exception:
+                            pass
+                        try:
+                            buttons_prev = set()
+                            hats_prev = {}
+                            keys_prev = set()
+                            mouse_buttons_prev = set()
+                        except Exception:
+                            pass
+                        pending_mouse_down = None
+                        break
                     if p.get("kind") in ("left_state", "left_axis"):
                         state.sel_row_kind = str(p.get("row_kind", ""))
                         row_id = p.get("row_id", 0)

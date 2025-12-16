@@ -102,6 +102,11 @@ def _get_set_binding(cfg: dict, *, set_name: str, group: str, key: str) -> dict 
 
 
 def _get_set_trigger_mapping(cfg: dict, *, set_name: str, key: str) -> dict | None:
+    """Return a trigger mapping dict from flight_controls.sets[set_name]['triggers'][key].
+
+    Falls back to legacy flight_controls['triggers'][key].
+    """
+
     try:
         fc = cfg.get("flight_controls")
         if not isinstance(fc, dict):
@@ -114,26 +119,12 @@ def _get_set_trigger_mapping(cfg: dict, *, set_name: str, key: str) -> dict | No
                 if isinstance(t, dict):
                     m = t.get(str(key))
                     return m if isinstance(m, dict) else None
-        # Legacy fallback.
-        t0 = fc.get("triggers")
-        if isinstance(t0, dict):
-            m = t0.get(str(key))
+
+        legacy = fc.get("triggers")
+        if isinstance(legacy, dict):
+            m = legacy.get(str(key))
             return m if isinstance(m, dict) else None
         return None
-    except Exception:
-        return None
-
-
-def _get_camera_binding(cfg: dict, key: str) -> dict | None:
-    try:
-        fc = cfg.get("flight_controls")
-        if not isinstance(fc, dict):
-            return None
-        cam = fc.get("camera")
-        if not isinstance(cam, dict):
-            return None
-        b = cam.get(str(key))
-        return b if isinstance(b, dict) else None
     except Exception:
         return None
 
@@ -3926,6 +3917,61 @@ def _apply_ship_projection_torch(pos3_unit: "torch.Tensor") -> tuple["torch.Tens
     return pos3_unit, vis
 
 
+def _try_load_final_graph_kernel_inputs(*, path: str) -> set[tuple[int, int, int]] | None:
+    """Return {(device, kind, item_id)} required by controller_graph_final.json.
+
+    Used to build the announce-mode allowlist for pushing raw device state into
+    the C signal kernel.
+    """
+
+    try:
+        if not path:
+            return None
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+
+        from c_physics import signal_kernel_api
+
+        dev_map = {
+            "joystick": int(signal_kernel_api.GP_DEV_JOYSTICK),
+            "keyboard": int(signal_kernel_api.GP_DEV_KEYBOARD),
+            "mouse": int(signal_kernel_api.GP_DEV_MOUSE),
+            "virtual": int(getattr(signal_kernel_api, "GP_DEV_VIRTUAL", 0)),
+        }
+        kind_map = {
+            "axis": int(signal_kernel_api.GP_EV_AXIS),
+            "button": int(signal_kernel_api.GP_EV_BUTTON),
+            "key": int(signal_kernel_api.GP_EV_KEY),
+            "mouse_motion": int(signal_kernel_api.GP_EV_MOUSE_MOTION),
+            "mouse_button": int(signal_kernel_api.GP_EV_MOUSE_BUTTON),
+        }
+
+        out: set[tuple[int, int, int]] = set()
+        inputs = data.get("inputs")
+        if not isinstance(inputs, list):
+            return out
+
+        for it in inputs:
+            if not isinstance(it, dict):
+                continue
+            dev_s = str(it.get("device") or "").strip().lower()
+            kind_s = str(it.get("kind") or "").strip().lower()
+            if dev_s not in dev_map or kind_s not in kind_map:
+                continue
+            try:
+                item_id = int(it.get("id"))
+            except Exception:
+                continue
+            out.add((int(dev_map[dev_s]), int(kind_map[kind_s]), int(item_id)))
+        return out
+    except Exception:
+        return None
+
+
 class _JoystickSideMenu:
     """Shared joystick side-menu used by both Python and C-physics paths.
 
@@ -3940,13 +3986,43 @@ class _JoystickSideMenu:
         self.joystick = joystick
         self.axis_state: Dict[int, float] = {}
 
+        # Non-blocking full-screen menu overlay (event-driven; no per-frame tick).
+        self._full_menu = None
+        try:
+            from menu_full_overlay import NonBlockingJsonMenu
+
+            self._full_menu = NonBlockingJsonMenu(menu_path="menu.json", start_node="main")
+        except Exception:
+            self._full_menu = None
+
         # Optional C signal kernel and controller backend evaluator.
         # This is the bridge step: gameplay can read controls from the backend even if
         # the graph executor is still Python-orchestrated.
         self._sigk = None
         self._ctrl_backend: controller_backend.ControllerBackend | None = None
+        self._ctl = None
+        self._ctl_meta = None
+        self._ctl_outputs: dict[int, Any] = {}
+        self._ctl_buf = None
+        self._ctl_ready: bool = False
+        self._hook_dispatcher = None
+        self._hook_handlers: dict[str, Any] = {}
+        self._zoom_in_down = False
+        self._zoom_out_down = False
         self._sigk_buttons_prev: set[int] = set()
         self._sigk_hats_prev: dict[int, tuple[int, int]] = {}
+        self._sigk_keys_prev: set[int] = set()
+        self._sigk_mouse_buttons_prev: set[int] = set()
+
+        # Announce-mode allowlists for pushing raw input into the signal kernel.
+        # When None, announce-mode behaves like scan-mode (compat/safe fallback).
+        self._ann_sigk_interest: set[tuple[int, int, int]] | None = None
+        self._ann_sigk_joy_buttons: set[int] | None = None
+        self._ann_sigk_joy_axes: set[int] | None = None
+        self._ann_sigk_keyboard_axes: set[int] | None = None
+        self._ann_sigk_keyboard_keys: set[int] | None = None
+        self._ann_sigk_mouse_motion: set[int] | None = None
+        self._ann_sigk_mouse_buttons: set[int] | None = None
 
         # Keyboard axes for safe-mode navigation (DirOR).
         # Keep ids small (<= 65535) because item_id is stored in 16 bits in the kernel signal_id.
@@ -3969,10 +4045,305 @@ class _JoystickSideMenu:
                     self._sigk.gp_sigk_reset()
                 except Exception:
                     pass
-                self._ctrl_backend = controller_backend.ControllerBackend(self._sigk)
+
+                # Prefer the C controller engine if present.
+                try:
+                    from c_physics import controller_engine_api
+                    from c_physics.controller_engine_ctypes import GP_CtlMeta, GP_CtlOutputDesc
+
+                    lib2, ctl = controller_engine_api.try_load_controller_engine(search_dir="c_physics")
+                    if ctl is not None:
+                        # Load compiled blob and start the fixed-rate evaluator.
+                        ok_load = int(ctl.gp_ctl_load_graph_file(b"controller_graph_final.bin"))
+                        if ok_load:
+                            bindings = None
+                            try:
+                                from controller_binding_hooks import HookBinding, HookBindingDispatcher, load_hook_bindings_from_cfg
+                                from c_physics import signal_kernel_api
+
+                                cfg = joystick_menu.load_or_create_joystick_config("joystick.json")
+                                try:
+                                    cfg = joystick_menu.ensure_menu_bindings_block(cfg)
+                                except Exception:
+                                    pass
+                                bindings = load_hook_bindings_from_cfg(cfg)
+
+                                # Add internal bindings that were previously hardwired to pygame events.
+                                # These are pass-through signal-kernel watches on joystick buttons.
+                                bindings.extend(
+                                    [
+                                        HookBinding(
+                                            action="flight_toggle",
+                                            source="signal",
+                                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                            kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                            item_id=int(self.flight_toggle_button),
+                                            sigsel=2,
+                                            edge="rise",
+                                            threshold=0.5,
+                                            hysteresis=0.05,
+                                        ),
+                                        HookBinding(
+                                            action="minimap_cycle",
+                                            source="signal",
+                                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                            kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                            item_id=int(self.minimap_cycle_button),
+                                            sigsel=2,
+                                            edge="rise",
+                                            threshold=0.5,
+                                            hysteresis=0.05,
+                                        ),
+                                    ]
+                                )
+                            except Exception:
+                                bindings = None
+
+                            # Important: do NOT auto-materialize controller-engine passthrough outputs.
+                            # "Passthrough" (direct signal->channel) is treated as a temporary/uncompiled
+                            # mapping and must be explicitly enabled by a dedicated live mode.
+                            # When a compiled graph is active, ensure any prior passthrough outputs are wiped.
+                            if hasattr(ctl, "gp_ctl_passthru_clear"):
+                                try:
+                                    ctl.gp_ctl_passthru_clear()
+                                except Exception:
+                                    pass
+
+                            # Configure announce-mode input interest for the C signal kernel.
+                            # This keeps the default runtime path quiet/efficient while still
+                            # allowing tools (binding/workbench) to switch into scan-mode.
+                            try:
+                                import input_interest
+
+                                interest: set[tuple[int, int, int]] = set()
+
+                                compiled = _try_load_final_graph_kernel_inputs(path="controller_graph_final.json")
+                                if isinstance(compiled, set):
+                                    interest |= set(compiled)
+
+                                for hb in (bindings or []):
+                                    try:
+                                        src = str(getattr(hb, "source", "signal") or "signal").strip().lower()
+                                    except Exception:
+                                        src = "signal"
+
+                                    if src == "signal":
+                                        try:
+                                            interest.add(
+                                                (
+                                                    int(getattr(hb, "device", 0)),
+                                                    int(getattr(hb, "kind", 0)),
+                                                    int(getattr(hb, "item_id", 0)),
+                                                )
+                                            )
+                                        except Exception:
+                                            pass
+
+                                input_interest.set_announce_interest(interest)
+                                self._ann_sigk_interest = set(interest)
+
+                                def _ids_for(dev: int, kind: int) -> set[int]:
+                                    return {int(iid) for (d, k, iid) in (self._ann_sigk_interest or set()) if int(d) == int(dev) and int(k) == int(kind)}
+
+                                self._ann_sigk_joy_buttons = _ids_for(int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON))
+                                self._ann_sigk_joy_axes = _ids_for(int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS))
+                                self._ann_sigk_keyboard_axes = _ids_for(int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS))
+                                self._ann_sigk_keyboard_keys = _ids_for(int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_KEY))
+                                self._ann_sigk_mouse_motion = _ids_for(int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_MOTION))
+                                self._ann_sigk_mouse_buttons = _ids_for(int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_BUTTON))
+                            except Exception:
+                                # Quiet fallback: if we cannot derive a declared allowlist,
+                                # default to polling nothing in announce-mode.
+                                try:
+                                    import input_interest
+
+                                    input_interest.set_announce_interest(set())
+                                except Exception:
+                                    pass
+                                self._ann_sigk_interest = None
+                                self._ann_sigk_joy_buttons = None
+                                self._ann_sigk_joy_axes = None
+                                self._ann_sigk_keyboard_axes = None
+                                self._ann_sigk_keyboard_keys = None
+                                self._ann_sigk_mouse_motion = None
+                                self._ann_sigk_mouse_buttons = None
+
+                            ctl.gp_ctl_start(240, 4096)
+                            meta = GP_CtlMeta()
+                            ctl.gp_ctl_get_meta(ctypes.byref(meta))
+                            n_out = int(meta.output_count)
+                            outs: dict[int, Any] = {}
+                            if n_out > 0:
+                                arr_t = GP_CtlOutputDesc * n_out
+                                arr = arr_t()
+                                got = int(ctl.gp_ctl_get_outputs(arr, int(n_out)))
+                                for i in range(int(got)):
+                                    d = arr[int(i)]
+                                    outs[int(d.channel)] = d
+                            buf = None
+                            if int(meta.total_floats) > 0:
+                                buf = (ctypes.c_float * int(meta.total_floats))()
+                            if buf is not None:
+                                self._ctl = ctl
+                                self._ctl_meta = meta
+                                self._ctl_outputs = outs
+                                self._ctl_buf = buf
+                                self._ctl_ready = True
+
+                                # Bindings-as-hooks dispatcher (parked Python waiter thread).
+                                try:
+                                    if bindings is None:
+                                        from controller_binding_hooks import HookBindingDispatcher
+
+                                        disp = HookBindingDispatcher(ctl)
+                                        disp.register([])
+                                    else:
+                                        from controller_binding_hooks import HookBindingDispatcher
+
+                                        disp = HookBindingDispatcher(ctl)
+                                        disp.register(bindings)
+
+                                    def _act_flight_toggle(_ev) -> None:
+                                        try:
+                                            self.flight_enabled = not bool(self.flight_enabled)
+                                            if self.flight_enabled:
+                                                self.flight_cam.reset_north_pole()
+                                        except Exception:
+                                            pass
+
+                                    def _act_minimap_cycle(_ev) -> None:
+                                        try:
+                                            now = float(time.monotonic())
+                                            if (now - float(self._last_minimap_cycle_time)) < float(self.selector_cooldown):
+                                                return
+                                            self._last_minimap_cycle_time = float(now)
+                                            if self.minimap_modes:
+                                                self.minimap_idx = int((int(self.minimap_idx) + 1) % int(len(self.minimap_modes)))
+                                        except Exception:
+                                            pass
+
+                                    def _act_targeting_toggle(_ev) -> None:
+                                        try:
+                                            self._targeting_active = not bool(self._targeting_active)
+                                        except Exception:
+                                            pass
+
+                                    def _act_camera_zoom_in(ev) -> None:
+                                        try:
+                                            fl = int(getattr(ev, "flags", 0))
+                                            if fl & 1:
+                                                self._zoom_in_down = True
+                                            if fl & 2:
+                                                self._zoom_in_down = False
+                                        except Exception:
+                                            pass
+
+                                    def _act_camera_zoom_out(ev) -> None:
+                                        try:
+                                            fl = int(getattr(ev, "flags", 0))
+                                            if fl & 1:
+                                                self._zoom_out_down = True
+                                            if fl & 2:
+                                                self._zoom_out_down = False
+                                        except Exception:
+                                            pass
+
+                                    def _act_weapons_fire_1(_ev) -> None:
+                                        # Placeholder: wire into weapon runtime if desired.
+                                        pass
+
+                                    def _act_weapons_fire_2(_ev) -> None:
+                                        pass
+
+                                    def _act_menu_open(_ev) -> None:
+                                        try:
+                                            if self._full_menu is not None:
+                                                self._full_menu.toggle()
+                                        except Exception:
+                                            pass
+
+                                    def _act_menu_confirm(_ev) -> None:
+                                        try:
+                                            if self._full_menu is not None:
+                                                self._full_menu.confirm()
+                                        except Exception:
+                                            pass
+
+                                    def _act_menu_cancel(_ev) -> None:
+                                        try:
+                                            if self._full_menu is not None:
+                                                self._full_menu.cancel()
+                                        except Exception:
+                                            pass
+
+                                    def _act_menu_up(_ev) -> None:
+                                        try:
+                                            if self._full_menu is not None:
+                                                self._full_menu.nav(-1)
+                                        except Exception:
+                                            pass
+
+                                    def _act_menu_down(_ev) -> None:
+                                        try:
+                                            if self._full_menu is not None:
+                                                self._full_menu.nav(1)
+                                        except Exception:
+                                            pass
+
+                                    def _act_menu_left(_ev) -> None:
+                                        try:
+                                            if self._full_menu is not None:
+                                                self._full_menu.cancel()
+                                        except Exception:
+                                            pass
+
+                                    def _act_menu_right(_ev) -> None:
+                                        try:
+                                            if self._full_menu is not None:
+                                                self._full_menu.confirm()
+                                        except Exception:
+                                            pass
+
+                                    self._hook_handlers = {
+                                        "flight_toggle": _act_flight_toggle,
+                                        "minimap_cycle": _act_minimap_cycle,
+                                        "targeting_toggle": _act_targeting_toggle,
+                                        "camera_zoom_in": _act_camera_zoom_in,
+                                        "camera_zoom_out": _act_camera_zoom_out,
+                                        "weapons_fire_1": _act_weapons_fire_1,
+                                        "weapons_fire_2": _act_weapons_fire_2,
+                                        "menu_open": _act_menu_open,
+                                        "menu_confirm": _act_menu_confirm,
+                                        "menu_cancel": _act_menu_cancel,
+                                        "menu_up": _act_menu_up,
+                                        "menu_down": _act_menu_down,
+                                        "menu_left": _act_menu_left,
+                                        "menu_right": _act_menu_right,
+                                    }
+
+                                    disp.start(handlers=self._hook_handlers, poll_timeout_ms=50)
+                                    self._hook_dispatcher = disp
+                                except Exception:
+                                    self._hook_dispatcher = None
+                                    self._hook_handlers = {}
+                except Exception:
+                    self._ctl = None
+                    self._ctl_meta = None
+                    self._ctl_outputs = {}
+                    self._ctl_buf = None
+                    self._ctl_ready = False
+
+                # Python fallback backend (still consumes the C signal kernel).
+                if not self._ctl_ready:
+                    self._ctrl_backend = controller_backend.ControllerBackend(self._sigk)
         except Exception:
             self._sigk = None
             self._ctrl_backend = None
+            self._ctl = None
+            self._ctl_meta = None
+            self._ctl_outputs = {}
+            self._ctl_buf = None
+            self._ctl_ready = False
 
         self.control_names = list(self.CONTROL_NAMES)
         self.projection_modes = list(self.PROJECTION_MODES)
@@ -4097,6 +4468,470 @@ class _JoystickSideMenu:
         self._prev_flaps_up = False
         self._prev_flaps_down = False
 
+    def _drain_hook_dispatch(self) -> None:
+        disp = getattr(self, "_hook_dispatcher", None)
+        if disp is None:
+            return
+        try:
+            disp.drain(handlers=getattr(self, "_hook_handlers", {}) or {})
+        except Exception:
+            pass
+
+    def full_menu_snapshot(self):
+        try:
+            if self._full_menu is None:
+                return None
+            return self._full_menu.snapshot()
+        except Exception:
+            return None
+
+    def full_menu_active(self) -> bool:
+        try:
+            if self._full_menu is None:
+                return False
+            return bool(self._full_menu.is_active())
+        except Exception:
+            return False
+
+    def full_menu_consume_action(self) -> str | None:
+        try:
+            if self._full_menu is None:
+                return None
+            if hasattr(self._full_menu, "consume_pending_action"):
+                return self._full_menu.consume_pending_action()
+            return None
+        except Exception:
+            return None
+
+    def dispatch_menu_action(self, action: str, *, font: pygame.font.Font, width: int, height: int, menu_button: int | None) -> bool:
+        """Dispatch a menu action string to an in-app tool.
+
+        This is intentionally pragmatic: it makes menu selections DO something
+        immediately (e.g., open Signal Workbench) without re-entering the old
+        blocking main menu.
+        """
+        a = str(action or "").strip()
+        if not a:
+            return False
+
+        if a == "controller_workbench":
+            try:
+                import signal_workbench
+
+                signal_workbench.run_signal_workbench(
+                    font=font,
+                    width=int(width),
+                    height=int(height),
+                    joystick=self.joystick,
+                    menu_button=menu_button,
+                    load_or_create_joystick_config=joystick_menu.load_or_create_joystick_config,
+                    save_joystick_config=joystick_menu.save_joystick_config,
+                    get_menu_nav=joystick_menu._get_menu_nav,
+                    get_menu_scroll=joystick_menu._get_menu_scroll,
+                    nav_edge=joystick_menu._nav_edge,
+                    poll_joystick_snapshot=joystick_menu._poll_joystick_snapshot,
+                    draw_fullscreen_lines=joystick_menu._draw_fullscreen_lines,
+                )
+                return True
+            except Exception:
+                return False
+
+        if a == "controller_channel_mixer":
+            try:
+                import channel_mixer_menu
+
+                channel_mixer_menu.run_channel_mixer_menu(
+                    font=font,
+                    width=int(width),
+                    height=int(height),
+                    joystick=self.joystick,
+                    menu_button=menu_button,
+                    get_menu_nav=joystick_menu._get_menu_nav,
+                    nav_edge=joystick_menu._nav_edge,
+                    poll_joystick_snapshot=joystick_menu._poll_joystick_snapshot,
+                    draw_fullscreen_lines=joystick_menu._draw_fullscreen_lines,
+                )
+                return True
+            except Exception:
+                return False
+
+        if a == "controller_view_channel":
+            try:
+                import channel_viewer
+
+                channel_viewer.run_channel_viewer(
+                    font=font,
+                    width=int(width),
+                    height=int(height),
+                    joystick=self.joystick,
+                    menu_button=menu_button,
+                    load_or_create_joystick_config=joystick_menu.load_or_create_joystick_config,
+                    get_menu_nav=joystick_menu._get_menu_nav,
+                    get_menu_scroll=joystick_menu._get_menu_scroll,
+                    nav_edge=joystick_menu._nav_edge,
+                    poll_joystick_snapshot=joystick_menu._poll_joystick_snapshot,
+                )
+                return True
+            except Exception:
+                return False
+
+        # Unknown actions are ignored here (they may be handled elsewhere).
+        return False
+
+    def soft_restart_controls(self) -> None:
+        """Rebuild + reload controller graph and hook bindings without restarting the app."""
+
+        # 1) Stop any hook pump threads first.
+        try:
+            disp = getattr(self, "_hook_dispatcher", None)
+            if disp is not None:
+                disp.stop()
+        except Exception:
+            pass
+        self._hook_dispatcher = None
+        self._hook_handlers = {}
+
+        # 2) Stop controller engine thread if present.
+        try:
+            if self._ctl is not None and hasattr(self._ctl, "gp_ctl_stop"):
+                self._ctl.gp_ctl_stop()
+        except Exception:
+            pass
+        try:
+            if self._ctl is not None and hasattr(self._ctl, "gp_ctl_reset"):
+                self._ctl.gp_ctl_reset()
+        except Exception:
+            pass
+
+        # 3) Recompile the final controller graph blob from the current joystick config.
+        try:
+            import controller_graph_compile
+
+            controller_graph_compile.try_build_final_graph(
+                joystick_path="joystick.json",
+                mixer_path="channel_mixer.json",
+                compiled_out_path="controller_graph_compiled.json",
+                final_out_path="controller_graph_final.json",
+                final_bin_out_path="controller_graph_final.bin",
+            )
+        except Exception:
+            pass
+
+        # 4) Ensure the signal kernel exists and reset it so stale values don't linger.
+        try:
+            if self._sigk is None:
+                from c_physics import signal_kernel_api
+
+                _lib, api = signal_kernel_api.try_load_signal_kernel()
+                self._sigk = api
+            if self._sigk is not None:
+                self._sigk.gp_sigk_reset()
+        except Exception:
+            pass
+
+        # 5) Ensure controller engine exists, reload graph, refresh hooks.
+        self._ctl_ready = False
+        self._ctl_meta = None
+        self._ctl_outputs = {}
+        self._ctl_buf = None
+
+        try:
+            import ctypes
+
+            from c_physics import controller_engine_api
+            from c_physics.controller_engine_ctypes import GP_CtlMeta, GP_CtlOutputDesc
+
+            if self._ctl is None:
+                _lib2, ctl = controller_engine_api.try_load_controller_engine(search_dir="c_physics")
+                self._ctl = ctl
+
+            ctl = self._ctl
+            if ctl is not None:
+                ok_load = int(ctl.gp_ctl_load_graph_file(b"controller_graph_final.bin"))
+                if ok_load:
+                    # When a compiled graph is active, wipe any prior temporary direct mappings.
+                    # (Controller-engine passthrough outputs must never be auto-materialized.)
+                    if hasattr(ctl, "gp_ctl_passthru_clear"):
+                        try:
+                            ctl.gp_ctl_passthru_clear()
+                        except Exception:
+                            pass
+
+                    bindings = None
+                    try:
+                        from controller_binding_hooks import HookBinding, load_hook_bindings_from_cfg
+                        from c_physics import signal_kernel_api
+
+                        cfg = joystick_menu.load_or_create_joystick_config("joystick.json")
+                        try:
+                            cfg = joystick_menu.ensure_menu_bindings_block(cfg)
+                        except Exception:
+                            pass
+                        bindings = load_hook_bindings_from_cfg(cfg)
+
+                        # Internal bindings that are handled via hook watches on the signal kernel.
+                        try:
+                            ftb = int(getattr(self, "flight_toggle_button", 1))
+                        except Exception:
+                            ftb = 1
+                        try:
+                            mcb = int(getattr(self, "minimap_cycle_button", 2))
+                        except Exception:
+                            mcb = 2
+
+                        bindings.extend(
+                            [
+                                HookBinding(
+                                    action="flight_toggle",
+                                    source="signal",
+                                    device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                    kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                    item_id=int(ftb),
+                                    sigsel=2,
+                                    edge="rise",
+                                    threshold=0.5,
+                                    hysteresis=0.05,
+                                ),
+                                HookBinding(
+                                    action="minimap_cycle",
+                                    source="signal",
+                                    device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                    kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                    item_id=int(mcb),
+                                    sigsel=2,
+                                    edge="rise",
+                                    threshold=0.5,
+                                    hysteresis=0.05,
+                                ),
+                            ]
+                        )
+                    except Exception:
+                        bindings = None
+
+                    # Refresh announce-mode input interest allowlist.
+                    try:
+                        import input_interest
+                        from c_physics import signal_kernel_api
+
+                        interest: set[tuple[int, int, int]] = set()
+
+                        compiled = _try_load_final_graph_kernel_inputs(path="controller_graph_final.json")
+                        if isinstance(compiled, set):
+                            interest |= set(compiled)
+
+                        for hb in (bindings or []):
+                            try:
+                                src = str(getattr(hb, "source", "signal") or "signal").strip().lower()
+                            except Exception:
+                                src = "signal"
+
+                            if src == "signal":
+                                try:
+                                    interest.add(
+                                        (
+                                            int(getattr(hb, "device", 0)),
+                                            int(getattr(hb, "kind", 0)),
+                                            int(getattr(hb, "item_id", 0)),
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+
+                        input_interest.set_announce_interest(interest)
+                        self._ann_sigk_interest = set(interest)
+
+                        def _ids_for(dev: int, kind: int) -> set[int]:
+                            return {int(iid) for (d, k, iid) in (self._ann_sigk_interest or set()) if int(d) == int(dev) and int(k) == int(kind)}
+
+                        self._ann_sigk_joy_buttons = _ids_for(int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON))
+                        self._ann_sigk_joy_axes = _ids_for(int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS))
+                        self._ann_sigk_keyboard_axes = _ids_for(int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS))
+                        self._ann_sigk_keyboard_keys = _ids_for(int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_KEY))
+                        self._ann_sigk_mouse_motion = _ids_for(int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_MOTION))
+                        self._ann_sigk_mouse_buttons = _ids_for(int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_BUTTON))
+                    except Exception:
+                        # Quiet fallback: if we cannot derive a declared allowlist,
+                        # default to polling nothing in announce-mode.
+                        try:
+                            import input_interest
+
+                            input_interest.set_announce_interest(set())
+                        except Exception:
+                            pass
+                        self._ann_sigk_interest = None
+                        self._ann_sigk_joy_buttons = None
+                        self._ann_sigk_joy_axes = None
+                        self._ann_sigk_keyboard_axes = None
+                        self._ann_sigk_keyboard_keys = None
+                        self._ann_sigk_mouse_motion = None
+                        self._ann_sigk_mouse_buttons = None
+
+                    # Start engine and refresh metadata.
+                    try:
+                        ctl.gp_ctl_start(240, 4096)
+                    except Exception:
+                        pass
+
+                    meta = GP_CtlMeta()
+                    if int(ctl.gp_ctl_get_meta(ctypes.byref(meta))) == 1:
+                        n_out = int(meta.output_count)
+                        outs: dict[int, Any] = {}
+                        if n_out > 0:
+                            arr_t = GP_CtlOutputDesc * n_out
+                            arr = arr_t()
+                            got = int(ctl.gp_ctl_get_outputs(arr, int(n_out)))
+                            for i in range(max(0, got)):
+                                d = arr[int(i)]
+                                outs[int(d.channel)] = d
+                        buf = None
+                        if int(meta.total_floats) > 0:
+                            buf = (ctypes.c_float * int(meta.total_floats))()
+                        if buf is not None:
+                            self._ctl_meta = meta
+                            self._ctl_outputs = outs
+                            self._ctl_buf = buf
+                            self._ctl_ready = True
+
+                    # Restart hook dispatcher (bindings-as-hooks).
+                    if self._ctl_ready:
+                        try:
+                            from controller_binding_hooks import HookBindingDispatcher
+
+                            def _act_flight_toggle(_ev) -> None:
+                                try:
+                                    self.flight_enabled = not bool(self.flight_enabled)
+                                    if self.flight_enabled:
+                                        self.flight_cam.reset_north_pole()
+                                except Exception:
+                                    pass
+
+                            def _act_minimap_cycle(_ev) -> None:
+                                try:
+                                    now = float(time.monotonic())
+                                    if (now - float(self._last_minimap_cycle_time)) < float(self.selector_cooldown):
+                                        return
+                                    self._last_minimap_cycle_time = float(now)
+                                    if self.minimap_modes:
+                                        self.minimap_idx = int((int(self.minimap_idx) + 1) % int(len(self.minimap_modes)))
+                                except Exception:
+                                    pass
+
+                            def _act_targeting_toggle(_ev) -> None:
+                                try:
+                                    self._targeting_active = not bool(self._targeting_active)
+                                except Exception:
+                                    pass
+
+                            def _act_camera_zoom_in(ev) -> None:
+                                try:
+                                    fl = int(getattr(ev, "flags", 0))
+                                    if fl & 1:
+                                        self._zoom_in_down = True
+                                    if fl & 2:
+                                        self._zoom_in_down = False
+                                except Exception:
+                                    pass
+
+                            def _act_camera_zoom_out(ev) -> None:
+                                try:
+                                    fl = int(getattr(ev, "flags", 0))
+                                    if fl & 1:
+                                        self._zoom_out_down = True
+                                    if fl & 2:
+                                        self._zoom_out_down = False
+                                except Exception:
+                                    pass
+
+                            def _act_weapons_fire_1(_ev) -> None:
+                                pass
+
+                            def _act_weapons_fire_2(_ev) -> None:
+                                pass
+
+                            def _act_menu_open(_ev) -> None:
+                                try:
+                                    if self._full_menu is not None:
+                                        self._full_menu.toggle()
+                                except Exception:
+                                    pass
+
+                            def _act_menu_confirm(_ev) -> None:
+                                try:
+                                    if self._full_menu is not None:
+                                        self._full_menu.confirm()
+                                except Exception:
+                                    pass
+
+                            def _act_menu_cancel(_ev) -> None:
+                                try:
+                                    if self._full_menu is not None:
+                                        self._full_menu.cancel()
+                                except Exception:
+                                    pass
+
+                            def _act_menu_up(_ev) -> None:
+                                try:
+                                    if self._full_menu is not None:
+                                        self._full_menu.nav(-1)
+                                except Exception:
+                                    pass
+
+                            def _act_menu_down(_ev) -> None:
+                                try:
+                                    if self._full_menu is not None:
+                                        self._full_menu.nav(1)
+                                except Exception:
+                                    pass
+
+                            def _act_menu_left(_ev) -> None:
+                                try:
+                                    if self._full_menu is not None:
+                                        self._full_menu.cancel()
+                                except Exception:
+                                    pass
+
+                            def _act_menu_right(_ev) -> None:
+                                try:
+                                    if self._full_menu is not None:
+                                        self._full_menu.confirm()
+                                except Exception:
+                                    pass
+
+                            self._hook_handlers = {
+                                "flight_toggle": _act_flight_toggle,
+                                "minimap_cycle": _act_minimap_cycle,
+                                "targeting_toggle": _act_targeting_toggle,
+                                "camera_zoom_in": _act_camera_zoom_in,
+                                "camera_zoom_out": _act_camera_zoom_out,
+                                "weapons_fire_1": _act_weapons_fire_1,
+                                "weapons_fire_2": _act_weapons_fire_2,
+                                "menu_open": _act_menu_open,
+                                "menu_confirm": _act_menu_confirm,
+                                "menu_cancel": _act_menu_cancel,
+                                "menu_up": _act_menu_up,
+                                "menu_down": _act_menu_down,
+                                "menu_left": _act_menu_left,
+                                "menu_right": _act_menu_right,
+                            }
+
+                            disp2 = HookBindingDispatcher(ctl)
+                            disp2.register(bindings or [])
+                            disp2.start(handlers=self._hook_handlers, poll_timeout_ms=50)
+                            self._hook_dispatcher = disp2
+                        except Exception:
+                            self._hook_dispatcher = None
+                            self._hook_handlers = {}
+        except Exception:
+            self._ctl_ready = False
+
+        # Fallback: ensure Python backend exists if the C controller engine is unavailable.
+        try:
+            if not self._ctl_ready and self._sigk is not None:
+                if self._ctrl_backend is None:
+                    self._ctrl_backend = controller_backend.ControllerBackend(self._sigk)
+        except Exception:
+            pass
+
     def apply_render_scale(self, scale: float) -> None:
         """Apply a new planet/world scale.
 
@@ -4165,6 +5000,8 @@ class _JoystickSideMenu:
         - Triggers control throttle forward/reverse over the surface.
         - Right stick changes view direction (yaw/pitch) without changing craft heading.
         """
+        # Hook-driven bindings (optional). Runs on main thread.
+        self._drain_hook_dispatch()
         if not self.flight_active(proj_mode):
             # Ship view default camera: above ground and within the atmosphere band.
             if _is_ship_proj_mode(proj_mode):
@@ -4209,15 +5046,6 @@ class _JoystickSideMenu:
                 u = vf
             return float(max(0.0, min(1.0, u)))
 
-        # Poll full joystick snapshot so we can evaluate button-like bindings and toggles.
-        axes_now: dict[int, float] = {}
-        buttons_now: set[int] = set()
-        hats_now: dict[int, tuple[int, int]] = {}
-        try:
-            axes_now, buttons_now, hats_now = joystick_menu._poll_joystick_snapshot(self.joystick)
-        except Exception:
-            axes_now, buttons_now, hats_now = {}, set(), {}
-
         # Backend funnel (step 1): push raw inputs into the C signal kernel.
         # This allows controller graphs/channels to be sourced from the backend.
         if self._sigk is not None:
@@ -4227,18 +5055,96 @@ class _JoystickSideMenu:
 
                 now_ns = int(time.monotonic_ns())
 
+                # Determine which input specs we are allowed to poll/push.
+                # NOTE: We do not poll first and then ask "should we push?".
+                # In announce-mode we only poll the declared allowlist specs.
+                try:
+                    import input_interest
+
+                    mode = str(input_interest.get_mode() or "announce")
+                    allow, deny = input_interest.get_effective_set()
+                except Exception:
+                    mode = "announce"
+                    allow, deny = set(), set()
+
+                deny = set(deny or set())
+                if allow is not None:
+                    allow = set(allow) - deny
+
+                # Poll joystick snapshot only for requested ids in announce-mode.
+                axes_now: dict[int, float] = {}
+                buttons_now: set[int] = set()
+                hats_now: dict[int, tuple[int, int]] = {}
+                try:
+                    if allow is None:
+                        axes_now, buttons_now, hats_now = joystick_menu._poll_joystick_snapshot(self.joystick)
+                    else:
+                        joy_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_AXIS)}
+                        joy_btns = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_BUTTON)}
+
+                        hard_hat_axis_base = int(getattr(self, "_HARD_HAT_AXIS_BASE", 50000))
+                        hard_hat_btn_base = int(getattr(self, "_HARD_HAT_BTN_BASE", 51000))
+
+                        phys_axes = {int(a) for a in joy_axes if int(a) >= 0 and int(a) < int(hard_hat_axis_base)}
+                        phys_btns = {int(b) for b in joy_btns if int(b) >= 0 and int(b) < int(hard_hat_btn_base)}
+
+                        hat_ids: set[int] = set()
+                        for ax_id in joy_axes:
+                            if int(ax_id) >= int(hard_hat_axis_base) and int(ax_id) < int(hard_hat_btn_base):
+                                hat_ids.add(int((int(ax_id) - int(hard_hat_axis_base)) // 2))
+                        for bid in joy_btns:
+                            if int(bid) >= int(hard_hat_btn_base):
+                                hat_ids.add(int((int(bid) - int(hard_hat_btn_base)) // 8))
+
+                        axes_now, buttons_now, hats_now = joystick_menu._poll_joystick_snapshot(
+                            self.joystick,
+                            axes_ids=sorted(phys_axes) if phys_axes else [],
+                            button_ids=sorted(phys_btns) if phys_btns else [],
+                            hat_ids=sorted(hat_ids) if hat_ids else [],
+                        )
+                except Exception:
+                    axes_now, buttons_now, hats_now = {}, set(), {}
+
                 # Button edges.
                 b_evs: list[GP_InputEvent] = []
-                try:
-                    nb = int(self.joystick.get_numbuttons())
-                except Exception:
-                    nb = 0
-                for b in range(max(0, nb)):
-                    was_down = int(b) in self._sigk_buttons_prev
-                    is_down = int(b) in (buttons_now or set())
-                    if was_down == is_down:
-                        continue
-                    b_evs.append(
+                if allow is None:
+                    try:
+                        nb = int(self.joystick.get_numbuttons())
+                    except Exception:
+                        nb = 0
+                    for b in range(max(0, nb)):
+                        spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), int(b))
+                        if spec in deny:
+                            continue
+                        was_down = int(b) in self._sigk_buttons_prev
+                        is_down = int(b) in (buttons_now or set())
+                        if was_down == is_down:
+                            continue
+                        b_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                id=int(b),
+                                v0=1.0 if is_down else 0.0,
+                                v1=0.0,
+                                flags=0,
+                            )
+                        )
+                else:
+                    want_buttons = sorted(
+                        {
+                            int(iid)
+                            for (d, k, iid) in allow
+                            if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_BUTTON) and int(iid) < int(getattr(self, "_HARD_HAT_BTN_BASE", 51000))
+                        }
+                    )
+                    for b in want_buttons:
+                        was_down = int(b) in self._sigk_buttons_prev
+                        is_down = int(b) in (buttons_now or set())
+                        if was_down == is_down:
+                            continue
+                        b_evs.append(
                         GP_InputEvent(
                             t_mono_ns=now_ns,
                             device=int(signal_kernel_api.GP_DEV_JOYSTICK),
@@ -4255,13 +5161,39 @@ class _JoystickSideMenu:
 
                 # Axes each frame.
                 a_evs: list[GP_InputEvent] = []
-                try:
-                    na = int(self.joystick.get_numaxes())
-                except Exception:
-                    na = 0
-                for a in range(max(0, na)):
-                    vv = float((axes_now or {}).get(int(a), 0.0))
-                    a_evs.append(
+                if allow is None:
+                    try:
+                        na = int(self.joystick.get_numaxes())
+                    except Exception:
+                        na = 0
+                    for a in range(max(0, na)):
+                        spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(a))
+                        if spec in deny:
+                            continue
+                        vv = float((axes_now or {}).get(int(a), 0.0))
+                        a_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_AXIS),
+                                id=int(a),
+                                v0=float(vv),
+                                v1=0.0,
+                                flags=0,
+                            )
+                        )
+                else:
+                    hard_hat_axis_base = int(getattr(self, "_HARD_HAT_AXIS_BASE", 50000))
+                    want_axes = sorted(
+                        {
+                            int(iid)
+                            for (d, k, iid) in allow
+                            if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_AXIS) and 0 <= int(iid) < int(hard_hat_axis_base)
+                        }
+                    )
+                    for a in want_axes:
+                        vv = float((axes_now or {}).get(int(a), 0.0))
+                        a_evs.append(
                         GP_InputEvent(
                             t_mono_ns=now_ns,
                             device=int(signal_kernel_api.GP_DEV_JOYSTICK),
@@ -4277,10 +5209,21 @@ class _JoystickSideMenu:
                     self._sigk.gp_sigk_push_events(arra_t(*a_evs), int(len(a_evs)))
 
                 # Keyboard direction axes (WASD + arrows) each frame.
-                try:
-                    pressed = pygame.key.get_pressed()
-                except Exception:
-                    pressed = None
+                pressed = None
+                want_kbd_axes: set[int] | None = None
+                want_kbd_keys: set[int] | None = None
+                if allow is None:
+                    want_kbd_axes = None
+                    want_kbd_keys = None
+                else:
+                    want_kbd_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_KEYBOARD) and int(k) == int(signal_kernel_api.GP_EV_AXIS)}
+                    want_kbd_keys = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_KEYBOARD) and int(k) == int(signal_kernel_api.GP_EV_KEY)}
+
+                if allow is None or (want_kbd_axes and len(want_kbd_axes)) or (want_kbd_keys and len(want_kbd_keys)):
+                    try:
+                        pressed = pygame.key.get_pressed()
+                    except Exception:
+                        pressed = None
 
                 def _is_down(k: int) -> int:
                     if pressed is None:
@@ -4295,74 +5238,215 @@ class _JoystickSideMenu:
                 arrows_x = float(_is_down(pygame.K_RIGHT) - _is_down(pygame.K_LEFT))
                 arrows_y = float(_is_down(pygame.K_UP) - _is_down(pygame.K_DOWN))
 
-                k_evs: list[GP_InputEvent] = [
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
-                        kind=int(signal_kernel_api.GP_EV_AXIS),
-                        id=int(self._KBD_AXIS_WASD_X),
-                        v0=float(wasd_x),
-                        v1=0.0,
-                        flags=0,
-                    ),
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
-                        kind=int(signal_kernel_api.GP_EV_AXIS),
-                        id=int(self._KBD_AXIS_WASD_Y),
-                        v0=float(wasd_y),
-                        v1=0.0,
-                        flags=0,
-                    ),
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
-                        kind=int(signal_kernel_api.GP_EV_AXIS),
-                        id=int(self._KBD_AXIS_ARROWS_X),
-                        v0=float(arrows_x),
-                        v1=0.0,
-                        flags=0,
-                    ),
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
-                        kind=int(signal_kernel_api.GP_EV_AXIS),
-                        id=int(self._KBD_AXIS_ARROWS_Y),
-                        v0=float(arrows_y),
-                        v1=0.0,
-                        flags=0,
-                    ),
+                k_evs: list[GP_InputEvent] = []
+                cand_axes = [
+                    (int(self._KBD_AXIS_WASD_X), float(wasd_x)),
+                    (int(self._KBD_AXIS_WASD_Y), float(wasd_y)),
+                    (int(self._KBD_AXIS_ARROWS_X), float(arrows_x)),
+                    (int(self._KBD_AXIS_ARROWS_Y), float(arrows_y)),
                 ]
-                arrk_t = GP_InputEvent * len(k_evs)
-                self._sigk.gp_sigk_push_events(arrk_t(*k_evs), int(len(k_evs)))
+                for kid, kval in cand_axes:
+                    spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_AXIS), int(kid))
+                    if allow is not None and int(kid) not in (want_kbd_axes or set()):
+                        continue
+                    if spec in deny:
+                        continue
+                    k_evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                            kind=int(signal_kernel_api.GP_EV_AXIS),
+                            id=int(kid),
+                            v0=float(kval),
+                            v1=0.0,
+                            flags=0,
+                        )
+                    )
+                if k_evs:
+                    arrk_t = GP_InputEvent * len(k_evs)
+                    self._sigk.gp_sigk_push_events(arrk_t(*k_evs), int(len(k_evs)))
+
+                # Keyboard keys (GP_EV_KEY) edges.
+                if pressed is not None:
+                    if allow is None:
+                        keys_down: set[int] = set()
+                        try:
+                            for i, v in enumerate(pressed):
+                                if v:
+                                    keys_down.add(int(i))
+                        except Exception:
+                            keys_down = set()
+                        changed = (keys_down - self._sigk_keys_prev) | (self._sigk_keys_prev - keys_down)
+                        kkey_evs: list[GP_InputEvent] = []
+                        for keycode in sorted(changed):
+                            spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_KEY), int(keycode))
+                            if spec in deny:
+                                continue
+                            is_down = int(keycode) in keys_down
+                            kkey_evs.append(
+                                GP_InputEvent(
+                                    t_mono_ns=now_ns,
+                                    device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                                    kind=int(signal_kernel_api.GP_EV_KEY),
+                                    id=int(keycode),
+                                    v0=1.0 if is_down else 0.0,
+                                    v1=0.0,
+                                    flags=0,
+                                )
+                            )
+                        if kkey_evs:
+                            arrkk_t = GP_InputEvent * len(kkey_evs)
+                            self._sigk.gp_sigk_push_events(arrkk_t(*kkey_evs), int(len(kkey_evs)))
+                        self._sigk_keys_prev = set(keys_down)
+                    else:
+                        want_keys = sorted(set(want_kbd_keys or set()))
+                        if want_keys:
+                            keys_down = set(self._sigk_keys_prev)
+                            kkey_evs: list[GP_InputEvent] = []
+                            for keycode in want_keys:
+                                spec = (int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_KEY), int(keycode))
+                                if spec in deny:
+                                    continue
+                                is_down = bool(_is_down(int(keycode)))
+                                was_down = int(keycode) in self._sigk_keys_prev
+                                if was_down == bool(is_down):
+                                    continue
+                                if is_down:
+                                    keys_down.add(int(keycode))
+                                else:
+                                    keys_down.discard(int(keycode))
+                                kkey_evs.append(
+                                    GP_InputEvent(
+                                        t_mono_ns=now_ns,
+                                        device=int(signal_kernel_api.GP_DEV_KEYBOARD),
+                                        kind=int(signal_kernel_api.GP_EV_KEY),
+                                        id=int(keycode),
+                                        v0=1.0 if is_down else 0.0,
+                                        v1=0.0,
+                                        flags=0,
+                                    )
+                                )
+                            if kkey_evs:
+                                arrkk_t = GP_InputEvent * len(kkey_evs)
+                                self._sigk.gp_sigk_push_events(arrkk_t(*kkey_evs), int(len(kkey_evs)))
+                            self._sigk_keys_prev = set(keys_down)
 
                 # Mouse delta each frame (dx/dy). Use two motion ids: 0=dx, 1=dy.
-                try:
-                    mdx, mdy = pygame.mouse.get_rel()
-                except Exception:
-                    mdx, mdy = 0, 0
-                m_evs: list[GP_InputEvent] = [
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_MOUSE),
-                        kind=int(signal_kernel_api.GP_EV_MOUSE_MOTION),
-                        id=0,
-                        v0=float(mdx),
-                        v1=0.0,
-                        flags=0,
-                    ),
-                    GP_InputEvent(
-                        t_mono_ns=now_ns,
-                        device=int(signal_kernel_api.GP_DEV_MOUSE),
-                        kind=int(signal_kernel_api.GP_EV_MOUSE_MOTION),
-                        id=1,
-                        v0=float(mdy),
-                        v1=0.0,
-                        flags=0,
-                    ),
-                ]
-                arrm_t = GP_InputEvent * len(m_evs)
-                self._sigk.gp_sigk_push_events(arrm_t(*m_evs), int(len(m_evs)))
+                want_mouse_motion: set[int] | None = None
+                if allow is None:
+                    want_mouse_motion = None
+                else:
+                    want_mouse_motion = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_MOUSE) and int(k) == int(signal_kernel_api.GP_EV_MOUSE_MOTION)}
+
+                mdx = mdy = 0
+                if allow is None or (want_mouse_motion and len(want_mouse_motion)):
+                    try:
+                        mdx, mdy = pygame.mouse.get_rel()
+                    except Exception:
+                        mdx, mdy = 0, 0
+
+                m_evs: list[GP_InputEvent] = []
+                for mid, mval in ((0, mdx), (1, mdy)):
+                    spec = (int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_MOTION), int(mid))
+                    if allow is not None and int(mid) not in (want_mouse_motion or set()):
+                        continue
+                    if spec in deny:
+                        continue
+                    m_evs.append(
+                        GP_InputEvent(
+                            t_mono_ns=now_ns,
+                            device=int(signal_kernel_api.GP_DEV_MOUSE),
+                            kind=int(signal_kernel_api.GP_EV_MOUSE_MOTION),
+                            id=int(mid),
+                            v0=float(mval),
+                            v1=0.0,
+                            flags=0,
+                        )
+                    )
+                if m_evs:
+                    arrm_t = GP_InputEvent * len(m_evs)
+                    self._sigk.gp_sigk_push_events(arrm_t(*m_evs), int(len(m_evs)))
+
+                # Mouse buttons (GP_EV_MOUSE_BUTTON) edges.
+                want_mouse_buttons: set[int] | None = None
+                if allow is None:
+                    want_mouse_buttons = None
+                else:
+                    want_mouse_buttons = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_MOUSE) and int(k) == int(signal_kernel_api.GP_EV_MOUSE_BUTTON)}
+
+                mpressed = None
+                if allow is None or (want_mouse_buttons and len(want_mouse_buttons)):
+                    try:
+                        mpressed = pygame.mouse.get_pressed()
+                    except Exception:
+                        mpressed = None
+
+                if mpressed is not None:
+                    if allow is None:
+                        cur_down: set[int] = set()
+                        try:
+                            for i, v in enumerate(mpressed):
+                                if v:
+                                    cur_down.add(int(i))
+                        except Exception:
+                            cur_down = set()
+                        changed = (cur_down - self._sigk_mouse_buttons_prev) | (self._sigk_mouse_buttons_prev - cur_down)
+                        mb_evs: list[GP_InputEvent] = []
+                        for bid in sorted(changed):
+                            spec = (int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_BUTTON), int(bid))
+                            if spec in deny:
+                                continue
+                            is_down = int(bid) in cur_down
+                            mb_evs.append(
+                                GP_InputEvent(
+                                    t_mono_ns=now_ns,
+                                    device=int(signal_kernel_api.GP_DEV_MOUSE),
+                                    kind=int(signal_kernel_api.GP_EV_MOUSE_BUTTON),
+                                    id=int(bid),
+                                    v0=1.0 if is_down else 0.0,
+                                    v1=0.0,
+                                    flags=0,
+                                )
+                            )
+                        if mb_evs:
+                            arrmb_t = GP_InputEvent * len(mb_evs)
+                            self._sigk.gp_sigk_push_events(arrmb_t(*mb_evs), int(len(mb_evs)))
+                        self._sigk_mouse_buttons_prev = set(cur_down)
+                    else:
+                        want = sorted(set(want_mouse_buttons or set()))
+                        if want:
+                            cur_down = set(self._sigk_mouse_buttons_prev)
+                            mb_evs: list[GP_InputEvent] = []
+                            for bid in want:
+                                spec = (int(signal_kernel_api.GP_DEV_MOUSE), int(signal_kernel_api.GP_EV_MOUSE_BUTTON), int(bid))
+                                if spec in deny:
+                                    continue
+                                try:
+                                    is_down = bool(mpressed[int(bid)])
+                                except Exception:
+                                    is_down = False
+                                was_down = int(bid) in self._sigk_mouse_buttons_prev
+                                if was_down == bool(is_down):
+                                    continue
+                                if is_down:
+                                    cur_down.add(int(bid))
+                                else:
+                                    cur_down.discard(int(bid))
+                                mb_evs.append(
+                                    GP_InputEvent(
+                                        t_mono_ns=now_ns,
+                                        device=int(signal_kernel_api.GP_DEV_MOUSE),
+                                        kind=int(signal_kernel_api.GP_EV_MOUSE_BUTTON),
+                                        id=int(bid),
+                                        v0=1.0 if is_down else 0.0,
+                                        v1=0.0,
+                                        flags=0,
+                                    )
+                                )
+                            if mb_evs:
+                                arrmb_t = GP_InputEvent * len(mb_evs)
+                                self._sigk.gp_sigk_push_events(arrmb_t(*mb_evs), int(len(mb_evs)))
+                            self._sigk_mouse_buttons_prev = set(cur_down)
 
                 # Hat axes + direction buttons as virtual joystick ids.
                 def _dir_idx_8(x: int, y: int) -> int | None:
@@ -4386,6 +5470,16 @@ class _JoystickSideMenu:
                     nh = int(self.joystick.get_numhats())
                 except Exception:
                     nh = 0
+
+                want_hat_axes: set[int] | None = None
+                want_hat_btns: set[int] | None = None
+                if allow is None:
+                    want_hat_axes = None
+                    want_hat_btns = None
+                else:
+                    want_hat_axes = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_AXIS) and int(iid) >= int(self._HARD_HAT_AXIS_BASE)}
+                    want_hat_btns = {int(iid) for (d, k, iid) in allow if int(d) == int(signal_kernel_api.GP_DEV_JOYSTICK) and int(k) == int(signal_kernel_api.GP_EV_BUTTON) and int(iid) >= int(self._HARD_HAT_BTN_BASE)}
+
                 for h in range(max(0, nh)):
                     hx, hy = (hats_now or {}).get(int(h), (0, 0))
                     phx, phy = self._sigk_hats_prev.get(int(h), (0, 0))
@@ -4394,52 +5488,73 @@ class _JoystickSideMenu:
 
                     if cur_dir != prev_dir:
                         if prev_dir is not None:
-                            hb_evs.append(
-                                GP_InputEvent(
-                                    t_mono_ns=now_ns,
-                                    device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                                    kind=int(signal_kernel_api.GP_EV_BUTTON),
-                                    id=int(_hard_hat_btn_id(int(h), int(prev_dir))),
-                                    v0=0.0,
-                                    v1=0.0,
-                                    flags=0,
+                            bid = int(_hard_hat_btn_id(int(h), int(prev_dir)))
+                            spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), int(bid))
+                            if spec in deny:
+                                pass
+                            elif allow is not None and int(bid) not in (want_hat_btns or set()):
+                                pass
+                            else:
+                                hb_evs.append(
+                                    GP_InputEvent(
+                                        t_mono_ns=now_ns,
+                                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                        kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                        id=int(bid),
+                                        v0=0.0,
+                                        v1=0.0,
+                                        flags=0,
+                                    )
                                 )
-                            )
                         if cur_dir is not None:
-                            hb_evs.append(
-                                GP_InputEvent(
-                                    t_mono_ns=now_ns,
-                                    device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                                    kind=int(signal_kernel_api.GP_EV_BUTTON),
-                                    id=int(_hard_hat_btn_id(int(h), int(cur_dir))),
-                                    v0=1.0,
-                                    v1=0.0,
-                                    flags=0,
+                            bid = int(_hard_hat_btn_id(int(h), int(cur_dir)))
+                            spec = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), int(bid))
+                            if spec in deny:
+                                pass
+                            elif allow is not None and int(bid) not in (want_hat_btns or set()):
+                                pass
+                            else:
+                                hb_evs.append(
+                                    GP_InputEvent(
+                                        t_mono_ns=now_ns,
+                                        device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                        kind=int(signal_kernel_api.GP_EV_BUTTON),
+                                        id=int(bid),
+                                        v0=1.0,
+                                        v1=0.0,
+                                        flags=0,
+                                    )
                                 )
-                            )
 
-                    h_evs.append(
-                        GP_InputEvent(
-                            t_mono_ns=now_ns,
-                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                            kind=int(signal_kernel_api.GP_EV_AXIS),
-                            id=int(_hard_hat_axis_id(int(h), "x")),
-                            v0=float(int(hx)),
-                            v1=0.0,
-                            flags=0,
+                    ax_id = int(_hard_hat_axis_id(int(h), "x"))
+                    specx = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(ax_id))
+                    if specx not in deny and (allow is None or int(ax_id) in (want_hat_axes or set())):
+                        h_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_AXIS),
+                                id=int(ax_id),
+                                v0=float(int(hx)),
+                                v1=0.0,
+                                flags=0,
+                            )
                         )
-                    )
-                    h_evs.append(
-                        GP_InputEvent(
-                            t_mono_ns=now_ns,
-                            device=int(signal_kernel_api.GP_DEV_JOYSTICK),
-                            kind=int(signal_kernel_api.GP_EV_AXIS),
-                            id=int(_hard_hat_axis_id(int(h), "y")),
-                            v0=float(int(hy)),
-                            v1=0.0,
-                            flags=0,
+
+                    ay_id = int(_hard_hat_axis_id(int(h), "y"))
+                    specy = (int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_AXIS), int(ay_id))
+                    if specy not in deny and (allow is None or int(ay_id) in (want_hat_axes or set())):
+                        h_evs.append(
+                            GP_InputEvent(
+                                t_mono_ns=now_ns,
+                                device=int(signal_kernel_api.GP_DEV_JOYSTICK),
+                                kind=int(signal_kernel_api.GP_EV_AXIS),
+                                id=int(ay_id),
+                                v0=float(int(hy)),
+                                v1=0.0,
+                                flags=0,
+                            )
                         )
-                    )
 
                 if hb_evs:
                     arrhb_t = GP_InputEvent * len(hb_evs)
@@ -4449,7 +5564,48 @@ class _JoystickSideMenu:
                     self._sigk.gp_sigk_push_events(arrh_t(*h_evs), int(len(h_evs)))
 
                 # Backend funnel (step 2): evaluate controller graph and publish channels.
-                if self._ctrl_backend is not None:
+                if bool(getattr(self, "_ctl_ready", False)) and getattr(self, "_ctl", None) is not None:
+                    try:
+                        ctl = self._ctl
+                        meta = self._ctl_meta
+                        buf = self._ctl_buf
+                        outs = self._ctl_outputs
+                        if ctl is not None and meta is not None and buf is not None:
+                            seq = ctypes.c_uint64(0)
+                            t_ns = ctypes.c_uint64(0)
+                            ok = int(ctl.gp_ctl_peek_latest(buf, int(meta.total_floats), ctypes.byref(seq), ctypes.byref(t_ns)))
+                            if ok:
+                                overrides_1d: dict[int, float] = {}
+                                channels_2d: dict[int, tuple[float, float]] = {}
+                                for ch, d in (outs or {}).items():
+                                    try:
+                                        dim = int(d.dim)
+                                        stride = int(d.stride)
+                                        off = int(d.offset)
+                                    except Exception:
+                                        continue
+                                    if dim == 2:
+                                        ix = int(off)
+                                        iy = int(off + stride)
+                                        if ix >= 0 and iy >= 0 and ix < int(meta.total_floats) and iy < int(meta.total_floats):
+                                            channels_2d[int(ch)] = (float(buf[ix]), float(buf[iy]))
+                                    else:
+                                        ix = int(off)
+                                        if ix >= 0 and ix < int(meta.total_floats):
+                                            overrides_1d[int(ch)] = float(buf[ix])
+
+                                if overrides_1d:
+                                    try:
+                                        self.flight_cam.controller_channels_override = overrides_1d
+                                    except Exception:
+                                        pass
+                                try:
+                                    self.flight_cam.controller_channels_2d = channels_2d
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                elif self._ctrl_backend is not None:
                     overrides_1d, channels_2d = self._ctrl_backend.step(now_ns=now_ns)
                     if overrides_1d:
                         try:
@@ -4469,6 +5625,21 @@ class _JoystickSideMenu:
 
                 self._sigk_buttons_prev = set(int(b) for b in (buttons_now or set()))
                 self._sigk_hats_prev = {int(k): (int(v[0]), int(v[1])) for k, v in (hats_now or {}).items()}
+            except Exception:
+                pass
+
+            # Dispatch full-screen menu actions (e.g., open Signal Workbench).
+            try:
+                if menu is not None:
+                    act = getattr(menu, "full_menu_consume_action", lambda: None)()
+                    if isinstance(act, str) and act.strip():
+                        getattr(menu, "dispatch_menu_action", lambda *_a, **_k: False)(
+                            act,
+                            font=font,
+                            width=int(width),
+                            height=int(height),
+                            menu_button=menu_button,
+                        )
             except Exception:
                 pass
 
@@ -4870,15 +6041,17 @@ class _JoystickSideMenu:
         if event.type == pygame.JOYAXISMOTION:
             self.axis_state[event.axis] = float(event.value)
         elif event.type == pygame.JOYBUTTONDOWN:
-            if event.button == int(self.flight_toggle_button):
-                self.flight_enabled = not self.flight_enabled
-                if self.flight_enabled:
-                    self.flight_cam.reset_north_pole()
-            if event.button == int(self.minimap_cycle_button):
-                now_t = pygame.time.get_ticks() * 0.001
-                if now_t - float(self._last_minimap_cycle_time) > float(self.selector_cooldown):
-                    self.minimap_idx = (self.minimap_idx + 1) % max(1, len(self.minimap_modes))
-                    self._last_minimap_cycle_time = now_t
+            # When hooks are active, these are dispatched by the async backend.
+            if not bool(getattr(self, "_hook_dispatcher", None)):
+                if event.button == int(self.flight_toggle_button):
+                    self.flight_enabled = not self.flight_enabled
+                    if self.flight_enabled:
+                        self.flight_cam.reset_north_pole()
+                if event.button == int(self.minimap_cycle_button):
+                    now_t = pygame.time.get_ticks() * 0.001
+                    if now_t - float(self._last_minimap_cycle_time) > float(self.selector_cooldown):
+                        self.minimap_idx = (self.minimap_idx + 1) % max(1, len(self.minimap_modes))
+                        self._last_minimap_cycle_time = now_t
             if event.button == 0:
                 self.adjust_locked = True
                 for name in self.control_names:
@@ -5837,24 +7010,34 @@ def _run_c_physics_only(
         except Exception:
             pass
 
-    # Ensure joystick.json exists and bind a menu button if missing.
+    # Ensure joystick.json exists. If menu bindings are incomplete, run the menu bootstrap.
     menu_button_c: int | None = None
     try:
-        menu_button_c, did_bind_c = joystick_menu.ensure_menu_button_binding(
-            cfg_path="joystick.json",
-            font=font,
-            width=int(width),
-            height=int(height),
-            joystick=joystick,
-        )
-        if did_bind_c and joystick is not None and menu_button_c is not None:
+        cfg_boot = joystick_menu.load_or_create_joystick_config("joystick.json")
+        try:
+            cfg_boot = joystick_menu.ensure_menu_bindings_block(cfg_boot)
+        except Exception:
+            pass
+        if isinstance(cfg_boot.get("menu_button"), int):
+            menu_button_c = int(cfg_boot.get("menu_button"))
+
+        if joystick is not None and not joystick_menu.menu_bindings_complete(cfg_boot):
+            def _on_controls_changed() -> None:
+                try:
+                    if menu is not None:
+                        menu.soft_restart_controls()
+                except Exception:
+                    pass
+
             action = joystick_menu.run_main_menu(
                 font=font,
                 width=int(width),
                 height=int(height),
                 joystick=joystick,
-                menu_button=int(menu_button_c),
+                menu_button=menu_button_c,
+                start_node="controls_menus",
                 menu_context={
+                    "on_controls_changed": _on_controls_changed,
                     "ctypes_structs": {
                                 "airplane_tuning": {
                                     "struct": airplane_tuning,
@@ -6204,6 +7387,14 @@ def _run_c_physics_only(
     # point sizes from the live C-state charge/mass, matching Python mode.
 
     try:
+        full_menu_presenter = None
+        try:
+            from menu_full_overlay import MenuBufferPresenter
+
+            full_menu_presenter = MenuBufferPresenter(font=font, width=int(width), height=int(height))
+        except Exception:
+            full_menu_presenter = None
+
         running = True
         t0 = time.perf_counter()
         last_render_t = t0
@@ -6219,77 +7410,6 @@ def _run_c_physics_only(
                     running = False
                 elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
-                elif menu_button_c is not None and event.type == pygame.JOYBUTTONDOWN and int(event.button) == int(menu_button_c):
-                    # Menu button opens the full menu. PIP is always-on.
-                    try:
-                        action = joystick_menu.run_main_menu(
-                            font=font,
-                            width=int(width),
-                            height=int(height),
-                            joystick=joystick,
-                            menu_button=int(menu_button_c),
-                            menu_context={
-                                "ctypes_structs": {
-                                    "airplane_tuning": {
-                                        "struct": airplane_tuning,
-                                        "title": "AIRPLANE",
-                                        "persist_path": params_menu.get("airplane_path", "airplane.json"),
-                                        "persist_key": "airplane_tuning",
-                                        "field_specs": airplane_field_specs,
-                                        "on_commit": _commit_airplane_tuning,
-                                        "persist_on_change": True,
-                                    },
-                                    "weapon_loadout": {
-                                        "struct": loadout,
-                                        "title": "LOADOUT",
-                                        "persist_path": "weapon_loadout.json",
-                                        "persist_key": "weapon_loadout",
-                                        "field_specs": loadout_field_specs,
-                                        "persist_on_change": True,
-                                    },
-                                    "particle_config": {
-                                        "struct": particle_cfg,
-                                        "title": "PARTICLE",
-                                        "persist_path": "particle_config.json",
-                                        "persist_key": "particle_config",
-                                        "on_commit": _commit_particle_config,
-                                        "field_specs": particle_field_specs,
-                                        "persist_on_change": True,
-                                    },
-                                    "world_env": {
-                                        "struct": world_env,
-                                        "title": "WORLD",
-                                        "persist_path": "world_config.json",
-                                        "persist_key": "world_env",
-                                        "on_commit": _commit_world_env,
-                                        "field_specs": world_field_specs,
-                                        "persist_on_change": True,
-                                    },
-                                    "flight_physics": {
-                                        "struct": flight_cfg,
-                                        "title": "FLIGHT",
-                                        "persist_path": "flight_physics.json",
-                                        "persist_key": "flight_physics",
-                                        "on_commit": _commit_flight_physics,
-                                        "field_specs": flight_field_specs,
-                                        "persist_on_change": True,
-                                    },
-                                    "ballistics": {
-                                        "struct": ball_cfg,
-                                        "title": "BALLISTICS",
-                                        "persist_path": "ballistics.json",
-                                        "persist_key": "ballistics",
-                                        "on_commit": _commit_ballistics,
-                                        "field_specs": ball_field_specs,
-                                        "persist_on_change": True,
-                                    },
-                                }
-                            },
-                        )
-                        if action == "quit":
-                            running = False
-                    except Exception:
-                        pass
                 elif menu and event.type in (pygame.JOYAXISMOTION, pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP):
                     # Forward joystick events to the shared side-menu handler *except*
                     # the bound menu button (handled above).
@@ -6298,7 +7418,8 @@ def _run_c_physics_only(
                         and event.type in (pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP)
                         and int(getattr(event, "button", -9999)) == int(menu_button_c)
                     ):
-                        menu.handle_event(event)
+                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                            menu.handle_event(event)
 
             # If the window is closing, don't attempt any further GL calls.
             if not running:
@@ -6306,24 +7427,26 @@ def _run_c_physics_only(
 
             # Apply joystick side-menu adjustments every frame.
             if menu:
-                menu.poll_axes()
-                now_t = pygame.time.get_ticks() * 0.001
-                mode_now_for_menu = str(params_menu.get("proj_mode", proj_mode) or "pca")
-                if not menu.flight_active(mode_now_for_menu):
-                    did_change = menu.update_params(
-                        params_menu,
-                        now_t=now_t,
-                        allow_proj_mode=True,
-                        allow_n_dim=False,
-                    )
-                    if did_change:
-                        with params_lock:
-                            params_seq += 1
+                if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                    menu.poll_axes()
+                    now_t = pygame.time.get_ticks() * 0.001
+                    mode_now_for_menu = str(params_menu.get("proj_mode", proj_mode) or "pca")
+                    if not menu.flight_active(mode_now_for_menu):
+                        did_change = menu.update_params(
+                            params_menu,
+                            now_t=now_t,
+                            allow_proj_mode=True,
+                            allow_n_dim=False,
+                        )
+                        if did_change:
+                            with params_lock:
+                                params_seq += 1
 
             # Config PIP (menu-nav bindings) tick.
             if cfg_pip is not None and joystick is not None:
                 try:
-                    cfg_pip.tick(joystick=joystick)
+                    if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                        cfg_pip.tick(joystick=joystick)
                 except Exception:
                     pass
 
@@ -7580,18 +8703,10 @@ def _run_c_physics_only(
                             zoom_mul = 1.0
 
                         try:
-                            if joystick is not None:
-                                cfg_zoom = joystick_menu.load_or_create_joystick_config("joystick.json")
-                                set_name = _resolve_effective_control_set(menu)
-                                z_in = _get_set_binding(cfg_zoom, set_name=set_name, group="camera", key="zoom_in")
-                                z_out = _get_set_binding(cfg_zoom, set_name=set_name, group="camera", key="zoom_out")
-                                axes_z, buttons_z, hats_z = joystick_menu._poll_joystick_snapshot(joystick)
-                                _a_in, v_in = _binding_active(z_in, axes_z, buttons_z, hats_z)
-                                _a_out, v_out = _binding_active(z_out, axes_z, buttons_z, hats_z)
-                                dz = float(max(0.0, float(v_in)) - max(0.0, float(v_out)))
-                                if abs(dz) > 1e-6:
-                                    zoom_rate = 2.2
-                                    zoom_mul *= float(math.exp(float(zoom_rate) * float(frame_dt_s) * float(dz)))
+                            dz = float((1.0 if bool(getattr(menu, "_zoom_in_down", False)) else 0.0) - (1.0 if bool(getattr(menu, "_zoom_out_down", False)) else 0.0))
+                            if abs(dz) > 1e-6:
+                                zoom_rate = 2.2
+                                zoom_mul *= float(math.exp(float(zoom_rate) * float(frame_dt_s) * float(dz)))
                         except Exception:
                             pass
 
@@ -8036,6 +9151,16 @@ def _run_c_physics_only(
                         pass
                 if (not in_flight) or bool(flight_debug_hud_visible):
                     base.draw_hud(font=font, fps_render=clock.get_fps(), fps_phys=phys_fps, text_lines=hud_lines, text_lines_right=hud_right)
+            except Exception:
+                pass
+
+            # Full-screen menu overlay (redraw-on-dirty buffer presenter).
+            try:
+                if full_menu_presenter is not None and menu is not None:
+                    snap = getattr(menu, "full_menu_snapshot", lambda: None)()
+                    if snap is not None and bool(getattr(snap, "active", False)):
+                        full_menu_presenter.update_if_needed(snap)
+                        full_menu_presenter.draw()
             except Exception:
                 pass
 
@@ -10950,26 +12075,34 @@ def run(
     except Exception:
         weap_rt = None
 
-    # Ensure joystick.json exists and bind a menu button if missing.
-    # If the menu button is not yet bound, show "press menu button", bind it,
-    # save joystick.json, then open the main menu.
+    # Ensure joystick.json exists. If menu bindings are incomplete, run the menu bootstrap.
     menu_button: int | None = None
     try:
-        menu_button, did_bind = joystick_menu.ensure_menu_button_binding(
-            cfg_path="joystick.json",
-            font=font,
-            width=int(1280),
-            height=int(720),
-            joystick=joystick,
-        )
-        if did_bind and joystick is not None and menu_button is not None:
+        cfg_boot = joystick_menu.load_or_create_joystick_config("joystick.json")
+        try:
+            cfg_boot = joystick_menu.ensure_menu_bindings_block(cfg_boot)
+        except Exception:
+            pass
+        if isinstance(cfg_boot.get("menu_button"), int):
+            menu_button = int(cfg_boot.get("menu_button"))
+
+        if joystick is not None and not joystick_menu.menu_bindings_complete(cfg_boot):
+            def _on_controls_changed() -> None:
+                try:
+                    if menu is not None:
+                        menu.soft_restart_controls()
+                except Exception:
+                    pass
+
             action = joystick_menu.run_main_menu(
                 font=font,
                 width=int(1280),
                 height=int(720),
                 joystick=joystick,
-                menu_button=int(menu_button),
+                menu_button=menu_button,
+                start_node="controls_menus",
                 menu_context={
+                    "on_controls_changed": _on_controls_changed,
                     "ctypes_structs": {
                         "weapon_loadout": {
                             "struct": loadout,
@@ -11036,6 +12169,18 @@ def run(
 
     orbit_enabled = False
     clock = pygame.time.Clock()
+    full_menu_presenter = None
+    try:
+        from menu_full_overlay import MenuBufferPresenter
+
+        _surf = pygame.display.get_surface()
+        if _surf is not None:
+            _mw, _mh = _surf.get_size()
+        else:
+            _mw, _mh = 1280, 720
+        full_menu_presenter = MenuBufferPresenter(font=font, width=int(_mw), height=int(_mh))
+    except Exception:
+        full_menu_presenter = None
     last_render_gen = -1
     ghost_history = deque(maxlen=max(0, int(params.get("ghost_history", 0))))
     ghost_hue_cycles = params.get("ghost_hue_cycles", 1.0)
@@ -11095,73 +12240,12 @@ def run(
                             state_masses[1 - state_idx] = state_masses[state_idx].copy()
                 elif joystick and event.type == pygame.JOYAXISMOTION:
                     if menu:
-                        menu.handle_event(event)
+                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                            menu.handle_event(event)
                 elif joystick and event.type == pygame.JOYBUTTONDOWN:
-                    # Menu button opens the main menu and must not be forwarded to
-                    # the side-menu handler (which historically used button 0).
-                    if menu_button is not None and int(event.button) == int(menu_button):
-                        try:
-                            action = joystick_menu.run_main_menu(
-                                font=font,
-                                width=int(1280),
-                                height=int(720),
-                                joystick=joystick,
-                                menu_button=int(menu_button),
-                                menu_context={
-                                    "ctypes_structs": {
-                                            "weapon_loadout": {
-                                                "struct": loadout,
-                                                "title": "LOADOUT",
-                                                "persist_path": "weapon_loadout.json",
-                                                "persist_key": "weapon_loadout",
-                                                "field_specs": loadout_field_specs,
-                                            },
-                                        "particle_config": {
-                                            "struct": particle_cfg,
-                                            "title": "PARTICLE",
-                                            "persist_path": "particle_config.json",
-                                            "persist_key": "particle_config",
-                                            "field_specs": particle_field_specs,
-                                            "on_commit": _commit_particle_config,
-                                            "persist_on_change": True,
-                                        },
-                                        "world_env": {
-                                            "struct": world_env,
-                                            "title": "WORLD",
-                                            "persist_path": "world_config.json",
-                                            "persist_key": "world_env",
-                                            "field_specs": world_field_specs,
-                                            "on_commit": _commit_world_env,
-                                            "persist_on_change": True,
-                                        },
-                                        "flight_physics": {
-                                            "struct": flight_cfg,
-                                            "title": "FLIGHT",
-                                            "persist_path": "flight_physics.json",
-                                            "persist_key": "flight_physics",
-                                            "field_specs": flight_field_specs,
-                                            "on_commit": _commit_flight_physics,
-                                            "persist_on_change": True,
-                                        },
-                                        "ballistics": {
-                                            "struct": ball_cfg,
-                                            "title": "BALLISTICS",
-                                            "persist_path": "ballistics.json",
-                                            "persist_key": "ballistics",
-                                            "field_specs": ball_field_specs,
-                                            "on_commit": _commit_ballistics,
-                                            "persist_on_change": True,
-                                        },
-                                    }
-                                },
-                            )
-                            if action == "quit":
-                                running = False
-                        except Exception:
-                            pass
-                        continue
                     if menu:
-                        menu.handle_event(event)
+                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                            menu.handle_event(event)
                     if event.button == 0:
                         # handled by menu (lock + velocity reset)
                         pass
@@ -11189,10 +12273,24 @@ def run(
                                 state_masses[state_idx] = masses.detach().cpu().numpy()
                                 state_masses[1 - state_idx] = state_masses[state_idx].copy()
                 elif joystick and event.type == pygame.JOYBUTTONUP:
-                    if menu_button is not None and int(event.button) == int(menu_button):
-                        continue
                     if menu:
-                        menu.handle_event(event)
+                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                            menu.handle_event(event)
+
+            # Dispatch full-screen menu actions (e.g., open Signal Workbench).
+            try:
+                if menu is not None:
+                    act = getattr(menu, "full_menu_consume_action", lambda: None)()
+                    if isinstance(act, str) and act.strip():
+                        getattr(menu, "dispatch_menu_action", lambda *_a, **_k: False)(
+                            act,
+                            font=font,
+                            width=int(_mw),
+                            height=int(_mh),
+                            menu_button=menu_button,
+                        )
+            except Exception:
+                pass
 
             # If the window is closing, don't attempt any further GL calls.
             if not running:
@@ -11200,7 +12298,8 @@ def run(
 
             # apply joystick adjustments every frame (poll axis to stay responsive)
             if joystick and menu:
-                menu.poll_axes()
+                if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                    menu.poll_axes()
 
                 dt_controls = 1.0 / 60.0
                 accel_gain = 2.0
@@ -11255,7 +12354,7 @@ def run(
                             )
 
                     mode_now_for_menu = str(params.get("proj_mode", "pca") or "pca")
-                    if not menu.flight_active(mode_now_for_menu):
+                    if not menu.flight_active(mode_now_for_menu) and (not bool(getattr(menu, "full_menu_active", lambda: False)())):
                         menu.update_params(
                             params,
                             now_t=now_t,
@@ -11271,7 +12370,8 @@ def run(
                 # Config PIP (menu-nav bindings) tick.
                 if cfg_pip is not None and joystick is not None:
                     try:
-                        cfg_pip.tick(joystick=joystick)
+                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
+                            cfg_pip.tick(joystick=joystick)
                     except Exception:
                         pass
 
@@ -11820,6 +12920,16 @@ def run(
                 except Exception:
                     pass
                 base.draw_hud(font=font, fps_render=clock.get_fps(), fps_phys=phys_fps, text_lines=overlay)
+            except Exception:
+                pass
+
+            # Full-screen menu overlay (redraw-on-dirty buffer presenter).
+            try:
+                if full_menu_presenter is not None and menu is not None:
+                    snap = getattr(menu, "full_menu_snapshot", lambda: None)()
+                    if snap is not None and bool(getattr(snap, "active", False)):
+                        full_menu_presenter.update_if_needed(snap)
+                        full_menu_presenter.draw()
             except Exception:
                 pass
             pygame.display.flip()
