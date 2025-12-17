@@ -407,16 +407,12 @@ int main() {
     int start_x = modules[0].x + first_out->first;
     int start_y = modules[0].y + first_out->second;
     gp_canvas_on_click(canvas, start_x, start_y);
-    // Allow sim to initialize prospective rope, then move mouse to two distinct targets to force rope endpoint updates.
-    for (int s = 0; s < 4; ++s) gp_canvas_step(canvas, 1.0f/60.0f);
     // Move mouse to two distinct targets to force rope endpoint updates.
     int tgt1_x = modules[0].x + modules[0].w + 20;
     int tgt1_y = modules[0].y + 220;
     int tgt2_x = modules[0].x + modules[0].w + 90;
     int tgt2_y = modules[0].y + 260;
     gp_canvas_on_mouse_move(canvas, tgt1_x, tgt1_y);
-    // step sim a few frames so rope relaxes toward the mouse target before rasterizing
-    for (int s = 0; s < 6; ++s) gp_canvas_step(canvas, 1.0f/60.0f);
     if (!gp_canvas_raster_rgba(canvas, rgba.data(), static_cast<int32_t>(rgba.size()))) {
         std::cerr << "Failed to raster canvas after prospective move 1\n";
         return 1;
@@ -424,7 +420,6 @@ int main() {
     std::vector<uint8_t> rope_frame_move1 = rgba;
     int rope_at_tgt1 = count_diff(rgba_after_edges, rope_frame_move1, canvas_w, canvas_h, tgt1_x - 20, tgt1_y - 20, tgt1_x + 20, tgt1_y + 20);
     gp_canvas_on_mouse_move(canvas, tgt2_x, tgt2_y);
-    for (int s = 0; s < 6; ++s) gp_canvas_step(canvas, 1.0f/60.0f);
     if (!gp_canvas_raster_rgba(canvas, rgba.data(), static_cast<int32_t>(rgba.size()))) {
         std::cerr << "Failed to raster canvas after prospective move 2\n";
         return 1;

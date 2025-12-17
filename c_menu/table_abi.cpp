@@ -693,6 +693,13 @@ int32_t gp_table_raster_rgba_with_hits(
     int col_x0[8] = {0};
     int col_w[8] = {0};
     compute_columns(cols, col_count, w, st.name_w, col_x0, col_w);
+    // If caller overrode the output geometry size, compute an effective
+    // per-row height so rows are laid out to match the target buffer
+    // height. This ensures hitbox coordinates line up with the rendered
+    // pixels when the renderer is asked to draw into a specific buffer
+    // (e.g. embedding a table into a larger module rect).
+    int row_h_eff = std::max(1, st.row_h);
+    if (row_count > 0) row_h_eff = std::max(1, h / row_count);
     if (out_geom) {
         out_geom->width_px = w;
         out_geom->height_px = h;
@@ -705,9 +712,9 @@ int32_t gp_table_raster_rgba_with_hits(
     const int led_count = 9;
     for (int i = 0; i < row_count; ++i) {
         const GP_TableRow& r = rows[i];
-        int y0 = i * st.row_h;
+        int y0 = i * row_h_eff;
         Color bg = (r.kind == GP_TABLE_ROW_HEADER) ? st.hdr : (r.selected ? st.bg_sel : st.bg);
-        memset_rect(out_rgba, w, h, w * 4, 0, y0, w, st.row_h, bg);
+        memset_rect(out_rgba, w, h, w * 4, 0, y0, w, row_h_eff, bg);
 
         // Expand box only on header/device rows to avoid clutter on leaf rows.
         int indent_px = st.indent * std::max(0, r.depth);
@@ -720,7 +727,7 @@ int32_t gp_table_raster_rgba_with_hits(
         // Label gutter still reserves name_w; callers overlay text as needed.
 
         // Cells
-        int cy = y0 + st.row_h / 2;
+        int cy = y0 + row_h_eff / 2;
         for (int c = 0; c < r.cell_count && c < col_count && c < 8; ++c) {
             const GP_TableCell& cell = r.cells[c];
             int x0 = col_x0[c];
@@ -780,10 +787,10 @@ int32_t gp_table_raster_rgba_with_hits(
                     int n = std::max(0, std::min<int>(pt.n, 3));
                     if (n <= 0) break;
                     int eff_w = std::max(1, cw - 4);
-                    int slot_h = std::max(6, st.row_h / std::max(1, n + 1));
+                    int slot_h = std::max(6, row_h_eff / std::max(1, n + 1));
                     for (int si = 0; si < n; ++si) {
                         const PackedStrip& ps = pt.strips[si];
-                        int cy_slot = y0 + (st.row_h * (si + 1)) / (n + 1);
+                        int cy_slot = y0 + (row_h_eff * (si + 1)) / (n + 1);
                         int led_spacing = std::max(3 * 2 + 2, eff_w / std::max(1, int(ps.count) + 1));
                         int cx0 = x0 + 2 + led_spacing;
                         for (int li = 0; li < ps.count; ++li) {
@@ -801,13 +808,13 @@ int32_t gp_table_raster_rgba_with_hits(
                     bool up_press = (cell.flags & 0x1u) != 0;
                     bool dn_press = (cell.flags & 0x2u) != 0;
                     int bar_w = std::max(1, cw - 2);
-                    int arrow_h = std::max(8, (st.row_h - 2) / 6);
-                    draw_scrollbar(out_rgba, w, h, w * 4, x0 + 1, y0 + 1, bar_w, st.row_h - 2, v, total, visible, up_press, dn_press, st.axis_bg, st.axis_val, st.text, st.text_hdr, st.bg_sel, st.bg);
+                    int arrow_h = std::max(8, (row_h_eff - 2) / 6);
+                    draw_scrollbar(out_rgba, w, h, w * 4, x0 + 1, y0 + 1, bar_w, row_h_eff - 2, v, total, visible, up_press, dn_press, st.axis_bg, st.axis_val, st.text, st.text_hdr, st.bg_sel, st.bg);
                     // Hitboxes: arrows + thumb
                     push_hit(x0 + 1, y0 + 1, x0 + 1 + bar_w, y0 + 1 + arrow_h, i, c, GP_TABLE_CELL_SCROLL, GP_TABLE_HIT_SCROLL_UP, 0, 0, 0);
                     push_hit(x0 + 1, y0 + st.row_h - 1 - arrow_h, x0 + 1 + bar_w, y0 + st.row_h - 1, i, c, GP_TABLE_CELL_SCROLL, GP_TABLE_HIT_SCROLL_DOWN, 0, 0, 0);
                     int track_y0 = y0 + 1 + arrow_h;
-                    int track_h = (st.row_h - 2) - 2 * arrow_h;
+                    int track_h = (row_h_eff - 2) - 2 * arrow_h;
                     if (track_h > 0) {
                         float vis_frac = std::clamp(float(visible) / float(std::max(visible, total)), 0.05f, 1.0f);
                         int thumb_h = std::max(6, int(vis_frac * track_h));
@@ -818,8 +825,8 @@ int32_t gp_table_raster_rgba_with_hits(
                     break;
                 }
                 case GP_TABLE_CELL_AXIS: {
-                    int bar_h = std::max(6, st.row_h / 3);
-                    int bar_y = y0 + (st.row_h - bar_h) / 2;
+                    int bar_h = std::max(6, row_h_eff / 3);
+                    int bar_y = y0 + (row_h_eff - bar_h) / 2;
 
                     // Optional extras: hold_s/min, last_s/max, calib params encoded as text.
                     float v_min = cell.hold_s;
@@ -874,8 +881,8 @@ int32_t gp_table_raster_rgba_with_hits(
                 case GP_TABLE_CELL_CALIB: {
                     bool inv_on = (cell.flags & 0x1u) != 0;
                     int mode = int((cell.flags >> 1) & 0x3u); // 0:none,1:trim,2:cap,3:ded
-                    int strip_h = std::max(6, st.row_h / 3);
-                    int strip_y = y0 + (st.row_h - strip_h) / 2;
+                    int strip_h = std::max(6, row_h_eff / 3);
+                    int strip_y = y0 + (row_h_eff - strip_h) / 2;
                     int eff_w = std::max(1, cw - 4);
                     draw_calib_strip(out_rgba, w, h, w * 4, x0 + 2, strip_y, eff_w, strip_h, inv_on, mode, st.axis_tick, st.timer, st.led_on);
                     // Slots: 0 INV, 1 TRIM, 2 CAP, 3 DED, 4 RST
@@ -891,14 +898,14 @@ int32_t gp_table_raster_rgba_with_hits(
                     break;
                 }
                 case GP_TABLE_CELL_TIMERS: {
-                    int t_h = std::max(2, st.row_h / 4);
-                    int t_y = y0 + (st.row_h - t_h) / 2;
+                    int t_h = std::max(2, row_h_eff / 4);
+                    int t_y = y0 + (row_h_eff - t_h) / 2;
                     draw_timers(out_rgba, w, h, w * 4, x0 + 2, t_y, std::max(1, cw - 4), t_h, cell.hold_s, cell.last_s, st.timer);
                     break;
                 }
                 case GP_TABLE_CELL_WAVE: {
-                    int wh = std::min(st.row_h - 4, cw);
-                    int wy = y0 + (st.row_h - wh) / 2;
+                    int wh = std::min(row_h_eff - 4, cw);
+                    int wy = y0 + (row_h_eff - wh) / 2;
                     draw_waveform(out_rgba, w, h, w * 4, x0 + 2, wy, std::max(1, cw - 4), wh, cell.wave, st.wave_bg, st.wave_fg);
                     break;
                 }
@@ -921,6 +928,8 @@ int32_t gp_table_raster_rgba_with_hits(
         Style st_local = load_style(style);
         int w_local = st_local.w;
         int h_local = std::max(1, int(row_count) * st_local.row_h);
+        int row_h_local = std::max(1, st_local.row_h);
+        if (row_count > 0) row_h_local = std::max(1, h_local / row_count);
         int pitch_local = w_local * 4;
 
         // Determine highlight color
@@ -947,10 +956,10 @@ int32_t gp_table_raster_rgba_with_hits(
         if (render_state->highlight_row >= 0) {
             int r = render_state->highlight_row;
             if (r >= 0 && r < row_count) {
-                int y0 = r * st_local.row_h;
+                int y0 = r * row_h_local;
                 // whole-cell highlight if col not provided
                 if (render_state->highlight_col < 0) {
-                    draw_outline(0, y0, w_local, st_local.row_h, hcol);
+                    draw_outline(0, y0, w_local, row_h_local, hcol);
                 } else {
                     int c = render_state->highlight_col;
                     if (c >= 0 && c < col_count) {
@@ -979,7 +988,7 @@ int32_t gp_table_raster_rgba_with_hits(
                             int li = render_state->highlight_aux0;
                             if (li >= 0 && li < led_count) {
                                 int cx = cx0 + li * led_spacing;
-                                int cy = y0 + st_local.row_h / 2;
+                                int cy = y0 + row_h_local / 2;
                                 // slightly larger ring for highlight
                                 draw_circle(out_rgba, w_local, h_local, pitch_local, cx, cy, radius + 2, hcol);
                             }
@@ -989,14 +998,14 @@ int32_t gp_table_raster_rgba_with_hits(
                             int gap = 2;
                             int eff_w = std::max(1, cw - 4);
                             int slot_w = std::max(4, (eff_w - gap * (slots - 1)) / slots);
-                            int sy = y0 + (st_local.row_h - slot_w) / 2; // approximate
+                            int sy = y0 + (row_h_local - slot_w) / 2; // approximate
                             int si = render_state->highlight_aux0;
                             if (si >= 0 && si < slots) {
                                 int sx = x0 + 2 + si * (slot_w + gap);
-                                draw_outline(sx, y0, slot_w, st_local.row_h, hcol);
+                                draw_outline(sx, y0, slot_w, row_h_local, hcol);
                             }
                         } else if (part == GP_TABLE_HIT_SCROLL_THUMB) {
-                            draw_outline(x0, y0, cw, st_local.row_h, hcol);
+                            draw_outline(x0, y0, cw, row_h_local, hcol);
                         } else {
                             // default: whole-cell outline
                             draw_outline(x0, y0, cw, st_local.row_h, hcol);

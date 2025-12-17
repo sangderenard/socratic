@@ -113,35 +113,14 @@ def make_module(x, y, w, h, left, right, label: str) -> CanvasModuleDesc:
 
 def main() -> int:
     pygame.init()
-    try:
-        style = ta.default_style(width_px=1000)
-        ctx = ta.TableContext(style=style)
-        # build simple columns and rows using table_api helpers
-        c1 = ta.GP_TableColumn()
-        c1.kind = ta.GP_TableCellKind.LEDS
-        c1.width_px = 140
-        c1.align = 0
-        c2 = ta.GP_TableColumn()
-        c2.kind = ta.GP_TableCellKind.AXIS
-        c2.width_px = 240
-        c2.align = 0
-        cols = [c1, c2]
-        r = ta.make_row(kind=ta.GP_TableRowKind.NOTE, label="Demo row", depth=0, expanded=True, cells=(ta.make_cell_leds(flags=0b111111111), ta.make_cell_axis(value=0.0)))
-        rows = [r]
-        ctx.set_columns(cols)
-        ctx.set_rows(rows)
-    except OSError as e:
-        print("Failed to load native table library (c_menu). Ensure it is built and on disk.")
-        print(e)
-        return 1
+    # We'll skip the top control table: spawn canvas-only demo modules.
+    # Use a slightly reduced width to keep the window compact.
+    table_w = 1000
+    table_h = 0
 
-    # table render dims
-    g = ctx.geom()
-    table_w = int(g.width_px)
-    table_h = int(g.height_px)
-
-    canvas_h = 220
-    info_h = 24
+    # Taller canvas for better visibility of rope simulation
+    canvas_h = 360
+    info_h = 28
     screen = pygame.display.set_mode((table_w, table_h + canvas_h + info_h))
     pygame.display.set_caption("Canvas + Tables demo")
 
@@ -176,6 +155,8 @@ def main() -> int:
     # Ensure canvas has created its internal rope_sim by forcing one raster.
     ok = lib.gp_canvas_raster_rgba(cctx, buf, buf_len)
 
+    # no pre-spawned modules; host can add modules via UI/tools
+
     clock = pygame.time.Clock()
     running = True
     font = pygame.font.SysFont(None, 18)
@@ -203,9 +184,14 @@ def main() -> int:
                     elif ev.type == pygame.MOUSEMOTION:
                         lib.gp_canvas_on_mouse_move(cctx, cx, cy)
 
-        # render table at top using table_api
-        w, h, rgba, geom, hits = ctx.render_with_state(ta.GP_TableRenderState())
-        surf_table = pygame.image.frombuffer(bytearray(rgba), (w, h), "RGBA").convert_alpha()
+        # No top table in this simplified demo; optionally draw a small
+        # header band when `table_h > 0` so the layout stays consistent.
+        surf_table = None
+        if table_h <= 0:
+            table_h = 1
+        if table_h > 0:
+            surf_table = pygame.Surface((table_w, table_h), pygame.SRCALPHA)
+            surf_table.fill((20, 20, 24))
 
         # step canvas sim to enable live solving (dt seconds)
         lib.gp_canvas_step(cctx, ctypes.c_float(1.0/60.0))

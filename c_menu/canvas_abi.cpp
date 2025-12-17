@@ -131,6 +131,13 @@ struct GP_CanvasContextImpl {
     DragState drag;
     // provisional rope index while user is selecting a contact and moving the mouse
     int prospective_rope_idx = -1;
+    // rope simulation tuning parameters and UI bar height
+    int rope_bar_h = 28; // extra bar above control bar
+    int sim_segs = 8;
+    float sim_slack = 0.0f;
+    int sim_iters = 8;
+    float sim_damping = 0.86f;
+    float sim_maxforce = 800.0f;
     // tool selection state: separate groups (exclusive within group)
     // canvas tool group: 0 = neutral, 1 = new table, 2 = new module
     int selected_tool_canvas = 0;
@@ -345,7 +352,15 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_table_owned.push_back(0);
     c->module_io_in_count.push_back(0);
     c->module_io_out_count.push_back(0);
-    return static_cast<int>(c->modules.size() - 1);
+    int new_idx = static_cast<int>(c->modules.size() - 1);
+    // Ensure newly-added modules get a canvas-owned table so table-driven
+    // hitboxes and dynamic LED cells work immediately instead of falling
+    // back to legacy module contact geometry.
+    gp_canvas_create_table(ctx_, new_idx);
+    // Populate the table's IO layout to reflect current module IO counts
+    // (this will add LED_ARG cells if module_io_in_count/out_count > 0).
+    sync_module_table_io_layout(c, new_idx);
+    return new_idx;
 }
 
 extern "C" int gp_canvas_move_module(GP_CanvasContext* ctx_, int module_idx, int x, int y) {
@@ -364,15 +379,33 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
 extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    printf("gp_canvas_on_click: click %d,%d\n", x, y);
+    printf("gp_canvas_on_click: click %d,%d selected_module=%d selected_contact=%d selected_left=%d prospective_rope=%d\n", x, y, c->selected.module, c->selected.contact_idx, c->selected.left, c->prospective_rope_idx);
     // find contact under point
     const int pick_r = 8;
-    // check control bar button regions first — buttons are canvas-local coords
-    if (y >= 0 && y < c->control_bar_h) {
+    // rope bar (top-most) — adjust sim parameters
+    if (y >= 0 && y < c->rope_bar_h) {
+        // simple left/right buttons: segs +/- at left, slack +/- at right
+        int bw = std::max(8, c->rope_bar_h - 8);
+        int spacing = 8;
+        int bx = 8;
+        // segs -
+        if (x >= bx && x < bx + bw) { c->sim_segs = std::max(2, c->sim_segs - 1); printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs); return 1; }
+        bx += bw + spacing;
+        // segs +
+        if (x >= bx && x < bx + bw) { c->sim_segs = std::min(64, c->sim_segs + 1); printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs); return 1; }
+        // slack -
+        int bx2 = c->width - 8 - bw*2 - spacing;
+        if (x >= bx2 && x < bx2 + bw) { c->sim_slack = std::max(0.0f, c->sim_slack - 0.1f); printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack); return 1; }
+        // slack +
+        bx2 += bw + spacing;
+        if (x >= bx2 && x < bx2 + bw) { c->sim_slack = std::min(8.0f, c->sim_slack + 0.1f); printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack); return 1; }
+    }
+    // check control bar button regions first — buttons are canvas-local coords (shifted down by rope_bar_h)
+    if (y >= c->rope_bar_h && y < c->rope_bar_h + c->control_bar_h) {
         const int canvas_btn_count = 3;
         const int table_btn_count = 3;
         const int spacing = 12;
-        int by = 4;
+        int by = c->rope_bar_h + 4;
         int bh = std::max(4, c->control_bar_h - 8);
         int bw = bh; // square buttons
         // left canvas group
@@ -463,6 +496,11 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 int hits_written = 0;
                 int ok = gp_table_render_rgba_with_state(t, nullptr, tmp.data(), static_cast<int32_t>(tmp.size()), &geom, hits.data(), hitcap, &hits_written);
                 printf("gp_canvas_on_click: module=%d has_table=%d geom=%d,%d render_ok=%d hits_cap=%d hits_written=%d\n", mi, (t!=nullptr)?1:0, tw, th, ok, hitcap, hits_written);
+                printf("gp_canvas_on_click: local point = %d,%d (module local lx,ly)\n", lx, ly);
+                for (int hi = 0; hi < hits_written; ++hi) {
+                    const auto &hbi = hits[hi];
+                    printf("  hit[%d]=part=%d row=%d col=%d aux0=%d aux1=%d rect=%d,%d-%d,%d flags=0x%x\n", hi, hbi.part, hbi.row_idx, hbi.col_idx, hbi.aux0, hbi.aux1, hbi.x0, hbi.y0, hbi.x1, hbi.y1, hbi.flags);
+                }
                 if (ok && hits_written > 0) {
                     // find first hit containing local point
                     GP_TableHitBox found{}; bool found_any = false;
@@ -484,7 +522,9 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         if (found.part == GP_TABLE_HIT_LED || found.part == GP_TABLE_HIT_LED_ARG || found.part == GP_TABLE_HIT_LED_TABLE) {
                             int ax = m.x + (found.x0 + found.x1) / 2;
                             int ay = m.y + (found.y0 + found.y1) / 2;
-                            bool is_left = (ax < m.x + m.w / 2);
+                            bool is_left = false;
+                            if (found.col_idx >= 0) is_left = (found.col_idx == 0);
+                            else is_left = (ax < m.x + m.w / 2);
                             int contact_idx = table_hit_contact_index(found);
                             c->focused_module = mi;
                             // If we're in edge-drawing mode (tool index 2), don't
@@ -493,11 +533,13 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                             if (c->selected.module == -1) {
                                 c->selected.module = mi; c->selected.contact_idx = contact_idx; c->selected.left = is_left ? 1 : 0;
                                 c->selected.anchor_x = ax; c->selected.anchor_y = ay;
+                                printf("gp_canvas_on_click: selecting table LED module=%d contact=%d left=%d anchor=%d,%d\n", mi, contact_idx, c->selected.left, ax, ay);
                                 if (!c->rope_sim) c->rope_sim = rope_sim_create(1024, 64);
                                 int ax0 = ax, ay0 = ay;
                                 int bx = ax, by = ay;
-                                int segs = 8; float slack = 0.0f;
+                                int segs = c->sim_segs; float slack = c->sim_slack;
                                 c->prospective_rope_idx = rope_sim_add_rope(c->rope_sim, static_cast<float>(ax0), static_cast<float>(ay0), static_cast<float>(bx), static_cast<float>(by), segs, slack);
+                                printf("gp_canvas_on_click: created prospective rope %d for table LED %d/%d\n", c->prospective_rope_idx, mi, contact_idx);
                                 return 1;
                             } else {
                                 if ((c->selected.left == 1 && !is_left) || (c->selected.left == 0 && is_left)) {
@@ -510,8 +552,10 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                                         e.b_module = c->selected.module; e.b_contact_idx = c->selected.contact_idx;
                                     }
                                     int ei = gp_canvas_add_edge(ctx_, &e);
-                                    if (c->prospective_rope_idx >= 0) {
+                                    printf("gp_canvas_on_click: gp_canvas_add_edge returned %d\n", ei);
+                                    if (ei >= 0 && c->prospective_rope_idx >= 0) {
                                         c->edges[ei].rope_idx = c->prospective_rope_idx;
+                                        printf("gp_canvas_on_click: promoted prospective rope %d to edge %d\n", c->prospective_rope_idx, ei);
                                         c->prospective_rope_idx = -1;
                                     }
                                     c->selected.module = -1; c->selected.contact_idx = -1; c->selected.left = -1; c->selected.anchor_x = -1; c->selected.anchor_y = -1;
@@ -564,8 +608,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     if (!c->rope_sim) c->rope_sim = rope_sim_create(1024, 64);
                     int ax = cx, ay = cy;
                     int bx = cx, by = cy;
-                    int segs = 8;
-                    float slack = 0.0f;
+                    int segs = c->sim_segs;
+                    float slack = c->sim_slack;
                     c->prospective_rope_idx = rope_sim_add_rope(c->rope_sim, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), segs, slack);
                     printf("gp_canvas_on_click: created prospective rope %d for left %d/%d\n", c->prospective_rope_idx, mi, ci);
                     return 1;
@@ -613,8 +657,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                     if (!c->rope_sim) c->rope_sim = rope_sim_create(1024, 64);
                     int ax = cx, ay = cy;
                     int bx = cx, by = cy;
-                    int segs = 8;
-                    float slack = 0.0f;
+                    int segs = c->sim_segs;
+                    float slack = c->sim_slack;
                     c->prospective_rope_idx = rope_sim_add_rope(c->rope_sim, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), segs, slack);
                     printf("gp_canvas_on_click: created prospective rope %d for right %d/%d\n", c->prospective_rope_idx, mi, ci);
                     return 1;
@@ -627,7 +671,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         int left_mod = c->selected.module;
                         int left_ci = c->selected.contact_idx;
                         int ei = gp_canvas_add_edge(ctx_, &e);
-                        if (c->prospective_rope_idx >= 0) {
+                        printf("gp_canvas_on_click: gp_canvas_add_edge returned %d\n", ei);
+                        if (ei >= 0 && c->prospective_rope_idx >= 0) {
                             c->edges[ei].rope_idx = c->prospective_rope_idx;
                             printf("gp_canvas_on_click: promoted prospective rope %d to edge %d\n", c->prospective_rope_idx, ei);
                             c->prospective_rope_idx = -1;
@@ -646,6 +691,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         }
     }
     // click not on any contact: clear selection
+    if (c->selected.module != -1) printf("gp_canvas_on_click: clearing selection module=%d contact=%d\n", c->selected.module, c->selected.contact_idx);
     c->selected.module = -1; c->selected.contact_idx = -1; c->selected.left = -1; c->selected.anchor_x = -1; c->selected.anchor_y = -1;
     // discard any provisional rope
     if (c->prospective_rope_idx >= 0) {
@@ -665,8 +711,9 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int nx = x - 20;
         int ny = y - 16;
         nx = std::max(0, std::min(c->width - 160, nx));
-        ny = std::max(0, std::min(c->height - 120, ny));
-        d.x = nx; d.y = ny; d.w = 160; d.h = 120; d.left_contacts = 3; d.right_contacts = 3;
+        // Use a larger default module size so spawned modules are wider/taller
+        ny = std::max(0, std::min(c->height - 240, ny));
+        d.x = nx; d.y = ny; d.w = 320; d.h = 240; d.left_contacts = 3; d.right_contacts = 3;
         char lbl[64]; std::snprintf(lbl, sizeof(lbl), "Table %zu", c->modules.size()); std::memset(d.label,0,sizeof(d.label)); std::memcpy(d.label,lbl,std::min<size_t>(strlen(lbl), sizeof(d.label)-1));
         int new_idx = gp_canvas_add_module(ctx_, &d);
         if (new_idx >= 0) {
@@ -706,7 +753,6 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
 extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    // if click on a contact, reuse gp_canvas_on_click behavior
     if (gp_canvas_on_click(ctx_, x, y)) return 1;
     // otherwise check for module hit to start dragging
     for (int mi = static_cast<int>(c->modules.size()) - 1; mi >= 0; --mi) {
@@ -784,6 +830,37 @@ extern "C" int gp_canvas_create_table(GP_CanvasContext* ctx_, int module_idx) {
     if (!t) return 0;
     c->module_tables[module_idx] = t;
     c->module_table_owned[module_idx] = 1;
+    // Tweak the table style for canvas-owned tables so row height is
+    // compact and rows aren't vertically stretched to fill module height.
+    // This helps keep LED hitboxes aligned with visual rows when modules
+    // are taller than the table content.
+    if (module_idx >= 0 && module_idx < static_cast<int>(c->modules.size())) {
+        const auto &mod = c->modules[module_idx];
+        GP_TableStyle st{};
+        st.width_px = std::max(1, mod.w);
+        st.row_h_px = 18; // slightly tighter than default 20
+        st.indent_px = 14;
+        st.expand_w_px = 12;
+        st.name_w_px = 160;
+        // Provide explicit colors to avoid zero/transparent defaults which
+        // would produce fully transparent output when rendered into a
+        // module buffer. These match the renderer's charcoal defaults.
+        st.bg_rgba[0] = 40; st.bg_rgba[1] = 40; st.bg_rgba[2] = 50; st.bg_rgba[3] = 255;
+        st.bg_sel_rgba[0] = 18; st.bg_sel_rgba[1] = 18; st.bg_sel_rgba[2] = 26; st.bg_sel_rgba[3] = 255;
+        st.hdr_rgba[0] = 20; st.hdr_rgba[1] = 20; st.hdr_rgba[2] = 28; st.hdr_rgba[3] = 255;
+        st.text_rgba[0] = 240; st.text_rgba[1] = 240; st.text_rgba[2] = 245; st.text_rgba[3] = 255;
+        st.text_hdr_rgba[0] = 255; st.text_hdr_rgba[1] = 255; st.text_hdr_rgba[2] = 255; st.text_hdr_rgba[3] = 255;
+        st.led_on_rgba[0] = 255; st.led_on_rgba[1] = 210; st.led_on_rgba[2] = 90; st.led_on_rgba[3] = 255;
+        st.led_off_rgba[0] = 70; st.led_off_rgba[1] = 70; st.led_off_rgba[2] = 80; st.led_off_rgba[3] = 255;
+        st.led_edge_rgba[0] = 255; st.led_edge_rgba[1] = 255; st.led_edge_rgba[2] = 255; st.led_edge_rgba[3] = 255;
+        st.axis_bg_rgba[0] = 18; st.axis_bg_rgba[1] = 18; st.axis_bg_rgba[2] = 22; st.axis_bg_rgba[3] = 255;
+        st.axis_tick_rgba[0] = 200; st.axis_tick_rgba[1] = 200; st.axis_tick_rgba[2] = 200; st.axis_tick_rgba[3] = 255;
+        st.axis_val_rgba[0] = 255; st.axis_val_rgba[1] = 255; st.axis_val_rgba[2] = 140; st.axis_val_rgba[3] = 255;
+        st.timer_rgba[0] = 110; st.timer_rgba[1] = 180; st.timer_rgba[2] = 255; st.timer_rgba[3] = 255;
+        st.wave_bg_rgba[0] = 6; st.wave_bg_rgba[1] = 6; st.wave_bg_rgba[2] = 8; st.wave_bg_rgba[3] = 255;
+        st.wave_fg_rgba[0] = 255; st.wave_fg_rgba[1] = 255; st.wave_fg_rgba[2] = 255; st.wave_fg_rgba[3] = 255;
+        gp_table_set_style(t, &st);
+    }
     // ensure module has a backing node in graph
     if (module_idx >= static_cast<int>(c->module_node_id.size())) c->module_node_id.resize(module_idx + 1, -1);
     if (c->module_node_id[module_idx] < 0) {
@@ -916,7 +993,7 @@ extern "C" int gp_canvas_step(GP_CanvasContext* ctx_, float dt) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (!c->rope_sim) return 0;
-    rope_sim_step(c->rope_sim, dt, 800.0f, 8, 0.86f);
+    rope_sim_step(c->rope_sim, dt, c->sim_maxforce, c->sim_iters, c->sim_damping);
     // Drive per-module table step callbacks using the UI-specified in/out counts.
     for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
         GP_TableContext* t = nullptr;
@@ -1145,7 +1222,9 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
         ei.hue_intensity = c->hue_intensity;
     }
     c->edges.push_back(std::move(ei));
-    return static_cast<int>(c->edges.size() - 1);
+    int idx = static_cast<int>(c->edges.size() - 1);
+    printf("gp_canvas_add_edge_with_type: added edge %d type=%d a=%d.%d b=%d.%d\n", idx, type_id, desc->a_module, desc->a_contact_idx, desc->b_module, desc->b_contact_idx);
+    return idx;
 }
 
 // Set the module's supported input/output type lists
@@ -1349,9 +1428,47 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     // clear
     memset(out_rgba, 0, static_cast<size_t>(w) * h * 4);
     // draw control bar at top with toggle tool buttons
+    int rb = ctx->rope_bar_h;
+    if (rb > 0) {
+        // draw rope sim bar at very top
+        memset_rect(out_rgba, w, h, pitch, 0, 0, w, rb, Color{22,22,28,255});
+        // draw simple controls: segs +/- at left, slack +/- at right, and display values
+        int bw = std::max(4, rb - 8);
+        int spacing = 8;
+        int bx = 8; int byy = 4;
+        memset_rect(out_rgba, w, h, pitch, bx, byy, bw, rb - 8, Color{60,60,72,255}); bx += bw + spacing;
+        memset_rect(out_rgba, w, h, pitch, bx, byy, bw, rb - 8, Color{60,60,72,255});
+        // slack buttons on right
+        int bx2 = w - 8 - bw*2 - spacing; memset_rect(out_rgba, w, h, pitch, bx2, byy, bw, rb - 8, Color{60,60,72,255}); bx2 += bw + spacing; memset_rect(out_rgba, w, h, pitch, bx2, byy, bw, rb - 8, Color{60,60,72,255});
+        // value text (render_text_to_rgba is available)
+        {
+            std::string s = std::string("segs:") + std::to_string(ctx->sim_segs) + " slack:" + std::to_string(ctx->sim_slack);
+            auto bm = render_text_to_rgba(s, 1.0f, {220,220,220,255});
+            if (!bm.pixels.empty()) {
+                int tx = (w - bm.width) / 2;
+                int ty = (rb - bm.height) / 2;
+                for (int yy = 0; yy < bm.height; ++yy) {
+                    int dst_y = ty + yy;
+                    if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < bm.width; ++xx) {
+                        int dst_x = tx + xx;
+                        if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &bm.pixels[(yy * bm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+    }
     int cbh = ctx->control_bar_h;
     if (cbh > 0) {
-        memset_rect(out_rgba, w, h, pitch, 0, 0, w, cbh, Color{28,28,34,255});
+        memset_rect(out_rgba, w, h, pitch, 0, rb, w, cbh, Color{28,28,34,255});
         // two tool groups: canvas (left) and table (right)
         const int canvas_btn_count = 3;
         const int table_btn_count = 3;
@@ -1359,7 +1476,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         int bh = std::max(4, cbh - 8);
         int bw = bh; // square buttons
         // left (canvas) group
-        int bx = 8; int by = 4;
+        int bx = 8; int by = rb + 4;
         for (int bi = 0; bi < canvas_btn_count; ++bi) {
             int bx_i = bx + bi * (bw + spacing);
             Color fill = (ctx->selected_tool_canvas == bi) ? Color{90,90,110,255} : Color{60,60,72,255};
@@ -1571,8 +1688,8 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         }
         int ridx = ctx->edges[ei].rope_idx;
         if (ridx < 0) {
-            int segs = 8;
-            float slack = 0.0f;
+            int segs = ctx->sim_segs;
+            float slack = ctx->sim_slack;
             int newr = rope_sim_add_rope(ctx->rope_sim, static_cast<float>(ax), static_cast<float>(ay), static_cast<float>(bx), static_cast<float>(by), segs, slack);
             ctx->edges[ei].rope_idx = newr;
         } else {
@@ -1581,7 +1698,7 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     }
 
     // step sim
-    rope_sim_step(ctx->rope_sim, 1.0f/60.0f, 800.0f, 8, 0.86f);
+    rope_sim_step(ctx->rope_sim, 1.0f/60.0f, ctx->sim_maxforce, ctx->sim_iters, ctx->sim_damping);
 
     // render edges using the table spline drawer for exact Catmull-Rom appearance
     extern void table_draw_rope_curve_blend_colored(uint8_t* img, int w, int h, int pitch, const float* verts, int count, int jacket_px, int jacket_border, const float* hues, int hue_count, int samples_per_segment, float hue_intensity);
