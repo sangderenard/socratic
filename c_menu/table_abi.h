@@ -224,6 +224,11 @@ int32_t gp_table_on_click(GP_TableContext* ctx, int32_t x, int32_t y, GP_TableHi
 // Set/get scroll position as a fraction 0..1 (0 -> top). Returns 1 on success.
 int32_t gp_table_set_scroll_fraction(GP_TableContext* ctx, float frac);
 int32_t gp_table_get_scroll_fraction(GP_TableContext* ctx, float* out_frac);
+// Set/get scroll position for both axes. Horizontal fraction is stored on the
+// context for embedding/containment scenarios (e.g. canvas viewports) and does
+// not currently alter table rendering.
+int32_t gp_table_set_scroll_fraction_xy(GP_TableContext* ctx, float frac_x, float frac_y);
+int32_t gp_table_get_scroll_fraction_xy(GP_TableContext* ctx, float* out_frac_x, float* out_frac_y);
 
 // Get row count and fetch a copy of a row by original index.
 int32_t gp_table_get_row_count(const GP_TableContext* ctx);

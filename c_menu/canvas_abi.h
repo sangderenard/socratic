@@ -55,6 +55,13 @@ int gp_canvas_on_click(GP_CanvasContext* ctx, int x, int y);
 int gp_canvas_on_mouse_down(GP_CanvasContext* ctx, int x, int y);
 int gp_canvas_on_mouse_move(GP_CanvasContext* ctx, int x, int y);
 int gp_canvas_on_mouse_up(GP_CanvasContext* ctx, int x, int y);
+// Set/get the canvas viewport offset (world origin mapped to local (0,0)).
+// Offsets are expressed in canvas-space pixels and can be updated by user
+// panning or by a containing table.
+int gp_canvas_set_offset(GP_CanvasContext* ctx, int offx, int offy);
+int gp_canvas_get_offset(GP_CanvasContext* ctx, int* out_offx, int* out_offy);
+// Query whether content overflows the viewport (useful for drawing scrollbars).
+int gp_canvas_get_scroll_flags(GP_CanvasContext* ctx, int* out_has_h, int* out_has_v);
 
 // Create/destroy a canvas-owned table attached to module. The created table
 // will be owned by the canvas and destroyed when detached or when canvas
@@ -105,6 +112,12 @@ int gp_canvas_load_from_file(GP_CanvasContext* ctx, const char* path);
 // table template APIs if they are invoked with dir==NULL).
 int gp_canvas_set_templates_dir(const char* dir);
 int gp_canvas_get_templates_dir(char* out_buf, int out_len);
+
+// Optional containment: attach a GP_TableContext that will mirror the canvas'
+// scroll fractions (both axes) so table-based containers can host a canvas
+// viewport. Ownership is controlled by `take_ownership`.
+int gp_canvas_set_container_table(GP_CanvasContext* ctx, GP_TableContext* table, int take_ownership);
+GP_TableContext* gp_canvas_get_container_table(GP_CanvasContext* ctx);
 
 // Per-canvas autosave: set autosave path and interval in seconds. If path is
 // NULL or empty, autosave is disabled. Autosave will trigger during

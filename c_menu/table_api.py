@@ -475,6 +475,16 @@ def render_table_rgba_with_hits(
     lib.gp_table_get_scroll_fraction = getattr(lib, "gp_table_get_scroll_fraction")
     lib.gp_table_get_scroll_fraction.restype = ctypes.c_int32
     lib.gp_table_get_scroll_fraction.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)]
+    lib.gp_table_set_scroll_fraction_xy = getattr(lib, "gp_table_set_scroll_fraction_xy")
+    lib.gp_table_set_scroll_fraction_xy.restype = ctypes.c_int32
+    lib.gp_table_set_scroll_fraction_xy.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_float]
+    lib.gp_table_get_scroll_fraction_xy = getattr(lib, "gp_table_get_scroll_fraction_xy")
+    lib.gp_table_get_scroll_fraction_xy.restype = ctypes.c_int32
+    lib.gp_table_get_scroll_fraction_xy.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
     lib.gp_table_get_row_count = getattr(lib, "gp_table_get_row_count")
     lib.gp_table_get_row_count.restype = ctypes.c_int32
     lib.gp_table_get_row_count.argtypes = [ctypes.c_void_p]
@@ -761,6 +771,31 @@ class TableContext:
         if not ok:
             raise RuntimeError("gp_table_get_scroll_fraction failed")
         return float(outf.value)
+
+    def set_scroll_fraction_xy(self, frac_x: float, frac_y: float) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_set_scroll_fraction_xy(
+            ctypes.c_void_p(int(self._ctx)),
+            ctypes.c_float(frac_x),
+            ctypes.c_float(frac_y),
+        )
+        if not ok:
+            raise RuntimeError("gp_table_set_scroll_fraction_xy failed")
+
+    def get_scroll_fraction_xy(self) -> Tuple[float, float]:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        outx = ctypes.c_float(0.0)
+        outy = ctypes.c_float(0.0)
+        ok = self._lib.gp_table_get_scroll_fraction_xy(
+            ctypes.c_void_p(int(self._ctx)),
+            ctypes.byref(outx),
+            ctypes.byref(outy),
+        )
+        if not ok:
+            raise RuntimeError("gp_table_get_scroll_fraction_xy failed")
+        return float(outx.value), float(outy.value)
 
     def get_row_count(self) -> int:
         if not self._ctx:

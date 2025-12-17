@@ -86,6 +86,12 @@ def load_canvas_lib():
     lib.gp_canvas_on_mouse_move.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
     lib.gp_canvas_on_mouse_up.restype = ctypes.c_int
     lib.gp_canvas_on_mouse_up.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+    lib.gp_canvas_set_offset.restype = ctypes.c_int
+    lib.gp_canvas_set_offset.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_int)
+    lib.gp_canvas_get_offset.restype = ctypes.c_int
+    lib.gp_canvas_get_offset.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
+    lib.gp_canvas_get_scroll_flags.restype = ctypes.c_int
+    lib.gp_canvas_get_scroll_flags.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
     lib.gp_canvas_step.restype = ctypes.c_int
     lib.gp_canvas_step.argtypes = (ctypes.c_void_p, ctypes.c_float)
     lib.gp_canvas_attach_table.restype = ctypes.c_int
@@ -94,6 +100,10 @@ def load_canvas_lib():
     lib.gp_canvas_create_table.argtypes = (ctypes.c_void_p, ctypes.c_int)
     lib.gp_canvas_destroy_table.restype = ctypes.c_int
     lib.gp_canvas_destroy_table.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    lib.gp_canvas_set_container_table.restype = ctypes.c_int
+    lib.gp_canvas_set_container_table.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
+    lib.gp_canvas_get_container_table.restype = ctypes.c_void_p
+    lib.gp_canvas_get_container_table.argtypes = (ctypes.c_void_p,)
     return lib
 
 
