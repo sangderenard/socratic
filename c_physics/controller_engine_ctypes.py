@@ -129,6 +129,18 @@ class GP_CtlPassthruDesc(ctypes.Structure):
     ]
 
 
+class GP_CtlTimerDesc(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("timer_id", c_uint32),
+        ("period_ticks", c_uint32),
+        ("duty_ticks", c_uint32),
+        ("phase_ticks", c_uint32),
+        ("flags", c_uint32),
+        ("_reserved0", c_uint32),
+    ]
+
+
 class GP_WheelSample(ctypes.Structure):
     _pack_ = 1
     _fields_ = [

@@ -81,6 +81,68 @@ static GP_CtlPassthruDesc* g_passthru = NULL;
 static uint32_t g_passthru_count = 0;
 static uint32_t g_passthru_cap = 0;
 
+// Timers: periodic pulses synthesized into the signal kernel.
+// Each timer writes a button-like signal each tick.
+static GP_CtlTimerDesc* g_timers = NULL;
+static uint32_t g_timer_count = 0;
+static uint32_t g_timer_cap = 0;
+
+// Monotonic controller tick counter (increments per gp_ctl_step_once).
+static uint64_t g_ctl_tick = 0;
+
+// Virtual timer signal encoding: reserve high joystick-button IDs.
+#ifndef GP_CTL_TIMER_VIRTUAL_BUTTON_BASE
+#define GP_CTL_TIMER_VIRTUAL_BUTTON_BASE 60000u
+#endif
+
+static uint32_t ctl_timer_signal_id(uint32_t timer_id) {
+  const uint32_t item_id = GP_CTL_TIMER_VIRTUAL_BUTTON_BASE + timer_id;
+  if (item_id > 0xFFFFu) return 0u;
+  return ((GP_DEV_JOYSTICK & 0xFFu) << 24) | ((GP_EV_BUTTON & 0xFFu) << 16) | (item_id & 0xFFFFu);
+}
+
+static int ctl_timers_ensure_cap(uint32_t want) {
+  if (want <= g_timer_cap) return 1;
+  uint32_t new_cap = g_timer_cap ? g_timer_cap : 8u;
+  while (new_cap < want) new_cap *= 2u;
+  GP_CtlTimerDesc* nt = (GP_CtlTimerDesc*)realloc(g_timers, (size_t)new_cap * sizeof(GP_CtlTimerDesc));
+  if (!nt) return 0;
+  g_timers = nt;
+  g_timer_cap = new_cap;
+  return 1;
+}
+
+static void ctl_timers_step(uint64_t now_ns, uint64_t tick) {
+  if (!g_timers || g_timer_count == 0u) return;
+  for (uint32_t i = 0; i < g_timer_count; ++i) {
+    const GP_CtlTimerDesc* t = &g_timers[i];
+    const uint32_t sid = ctl_timer_signal_id(t->timer_id);
+    if (sid == 0u) continue;
+
+    const uint32_t period = t->period_ticks ? t->period_ticks : 1u;
+    const uint32_t duty = t->duty_ticks ? t->duty_ticks : 1u;
+    const uint32_t phase = (period > 0u) ? (t->phase_ticks % period) : 0u;
+
+    int active = 0;
+    if (duty >= period) {
+      active = 1;
+    } else {
+      const uint32_t pos = (uint32_t)(tick % (uint64_t)period);
+      const uint32_t start = phase;
+      const uint32_t end = start + duty;
+      if (end <= period) {
+        active = (pos >= start && pos < end) ? 1 : 0;
+      } else {
+        const uint32_t wrap_end = (end % period);
+        active = (pos >= start || pos < wrap_end) ? 1 : 0;
+      }
+    }
+
+    // Synthesize a button-like signal state machine into the kernel.
+    gp_sigk_sigtobutton(now_ns, sid, active ? 1.0f : 0.0f, 0.5f);
+  }
+}
+
 static uint32_t ctl_total_floats(void) {
   return g_graph.total_floats + g_passthru_count;
 }
@@ -145,6 +207,14 @@ static void ctl_free_passthru(void) {
   g_passthru = NULL;
   g_passthru_count = 0;
   g_passthru_cap = 0;
+}
+
+static void ctl_free_timers(void) {
+  free(g_timers);
+  g_timers = NULL;
+  g_timer_count = 0;
+  g_timer_cap = 0;
+  g_ctl_tick = 0;
 }
 
 static void ctl_free_scratch(void) {
@@ -744,6 +814,12 @@ static int ctl_wheel_init(uint32_t signal_count, uint32_t history_len) {
   return 1;
 }
 
+static float ctl_clampf(float x, float lo, float hi) {
+  if (x < lo) return lo;
+  if (x > hi) return hi;
+  return x;
+}
+
 static inline uint32_t ctl_atomic_u32_exchange(uint32_t* p, uint32_t v) {
 #ifdef _WIN32
   return (uint32_t)InterlockedExchange((volatile LONG*)p, (LONG)v);
@@ -806,6 +882,7 @@ GP_EXPORT void gp_ctl_reset(void) {
   ctl_free_hooks();
   ctl_free_wheel();
   ctl_free_passthru();
+  ctl_free_timers();
   ctl_free_scratch();
   ctl_free_graph();
 }
@@ -1020,6 +1097,14 @@ GP_EXPORT int gp_ctl_step_once(uint64_t now_ns) {
   }
 
   if (!g_tick_values) return 0;
+
+  // Tick counter advances once per controller step.
+  const uint64_t tick = g_ctl_tick++;
+
+  // Emit backend timers into the signal kernel before evaluating the graph
+  // so compiled nodes/passthrough reads can see them this tick.
+  ctl_timers_step(now_ns, tick);
+
   const uint32_t tf = ctl_total_floats();
   memset(g_tick_values, 0, (size_t)tf * sizeof(float));
   const int ok = ctl_eval_once(now_ns, g_tick_values);
@@ -1271,6 +1356,39 @@ GP_EXPORT int gp_ctl_hookq_wait(uint64_t last_seen_seq, uint32_t timeout_ms, uin
 
 // ---------------- Passthrough outputs ----------------
 
+// ---------------- Timers ----------------
+
+GP_EXPORT void gp_ctl_timers_clear(void) {
+  // Must be configured while stopped.
+  if (gp_ctl_is_running()) return;
+  g_timer_count = 0u;
+  g_ctl_tick = 0u;
+}
+
+GP_EXPORT int gp_ctl_timers_add(const GP_CtlTimerDesc* t) {
+  if (!t) return 0;
+  if (gp_ctl_is_running()) return 0;
+  if (t->period_ticks == 0u) return 0;
+  if (t->duty_ticks == 0u) return 0;
+  if (ctl_timer_signal_id(t->timer_id) == 0u) return 0;
+
+  // Upsert by timer_id.
+  for (uint32_t i = 0; i < g_timer_count; ++i) {
+    if (g_timers[i].timer_id == t->timer_id) {
+      g_timers[i] = *t;
+      return 1;
+    }
+  }
+
+  if (!ctl_timers_ensure_cap(g_timer_count + 1u)) return 0;
+  g_timers[g_timer_count++] = *t;
+  return 1;
+}
+
+GP_EXPORT uint32_t gp_ctl_timer_signal_id(uint32_t timer_id) {
+  return ctl_timer_signal_id(timer_id);
+}
+
 GP_EXPORT void gp_ctl_passthru_clear(void) {
   // Must be configured while stopped.
   if (gp_ctl_is_running()) return;
@@ -1391,5 +1509,51 @@ GP_EXPORT int gp_ctl_wheel_drain_hot(uint32_t* out_indices, uint32_t max_indices
     }
   }
   if (out_count) *out_count = n;
+  return 1;
+}
+
+GP_EXPORT int gp_ctl_wheel_raster_rgba(uint32_t signal_idx, uint32_t span, uint32_t width_px, uint32_t height_px,
+                                      uint8_t* out_rgba, uint32_t out_len_bytes) {
+  if (!out_rgba) return 0;
+  if (width_px == 0u || height_px == 0u) return 0;
+  const uint64_t need = (uint64_t)width_px * (uint64_t)height_px * 4ull;
+  if ((uint64_t)out_len_bytes < need) return 0;
+
+  // Always produce a deterministic image (even if wheel isn't initialized).
+  memset(out_rgba, 0, (size_t)need);
+  for (uint64_t i = 0; i < (uint64_t)width_px * (uint64_t)height_px; ++i) {
+    out_rgba[i * 4ull + 3ull] = 255u;
+  }
+
+  if (!g_wheel_samples || !g_wheel_write_seq) return 0;
+  if (signal_idx >= g_wheel_signal_count) return 0;
+  if (g_wheel_history_len == 0u) return 0;
+
+  const uint32_t step = (span == 0u) ? 1u : span;
+  const uint64_t latest = g_wheel_write_seq[signal_idx];
+
+  // Draw latest samples right-to-left.
+  for (uint32_t x = 0; x < width_px; ++x) {
+    const uint64_t want_seq = (latest >= (uint64_t)x * (uint64_t)step) ? (latest - (uint64_t)x * (uint64_t)step) : 0ull;
+    // If too old to be in history, stop early.
+    if (latest - want_seq >= (uint64_t)g_wheel_history_len) break;
+    const uint32_t idx = (uint32_t)(want_seq & (uint64_t)g_wheel_mask);
+    const GP_WheelSample* s = &g_wheel_samples[(size_t)signal_idx * (size_t)g_wheel_history_len + (size_t)idx];
+    const float v = s->value;
+    const float v01 = 0.5f * (ctl_clampf(v, -1.0f, 1.0f) + 1.0f);
+    const float yf = (1.0f - v01) * (float)(height_px - 1u);
+    int y = (int)(yf + 0.5f);
+    if (y < 0) y = 0;
+    if ((uint32_t)y >= height_px) y = (int)(height_px - 1u);
+
+    const int xi = (int)(width_px - 1u - x);
+    if (xi < 0 || (uint32_t)xi >= width_px) continue;
+    const uint64_t off = ((uint64_t)y * (uint64_t)width_px + (uint64_t)xi) * 4ull;
+    out_rgba[off + 0ull] = 255u;
+    out_rgba[off + 1ull] = 255u;
+    out_rgba[off + 2ull] = 255u;
+    out_rgba[off + 3ull] = 255u;
+  }
+
   return 1;
 }

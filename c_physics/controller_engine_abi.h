@@ -192,6 +192,27 @@ typedef struct GP_WheelMeta {
   uint64_t tick_seq;       // monotonic tick counter (wakes waiters)
 } GP_WheelMeta;
 
+// ---------------- Timers (prototype) ----------------
+// Timers are backend-owned periodic pulses emitted by the controller engine.
+//
+// Implementation notes:
+// - The controller engine runs at a fixed tick rate (tick_hz).
+// - Each timer is evaluated in tick units and writes a button-like state
+//   into the signal kernel each tick.
+// - Menus can watch these as normal signal-kernel signals (e.g. GP_SIGSEL_DOWN).
+
+// Timer flags.
+#define GP_CTL_TIMER_REPEAT (1u << 0) // repeat forever (default)
+
+typedef struct GP_CtlTimerDesc {
+  uint32_t timer_id;      // user-defined logical id
+  uint32_t period_ticks;  // >=1 ticks per cycle
+  uint32_t duty_ticks;    // >=1 ticks high within the cycle
+  uint32_t phase_ticks;   // [0..period_ticks-1] start offset
+  uint32_t flags;         // GP_CTL_TIMER_*
+  uint32_t _reserved0;
+} GP_CtlTimerDesc;
+
 #pragma pack(pop)
 
 #ifdef __cplusplus

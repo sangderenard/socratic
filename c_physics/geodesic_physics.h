@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <stdbool.h>
+
 #include <inttypes.h>
 
 #ifdef _WIN32
@@ -108,6 +110,27 @@ GP_EXPORT int gp_ctl_wheel_peek_seq(uint32_t signal_idx, uint64_t write_seq, GP_
 
 // Collect indices with HOT since last drain and clear sticky flags for those indices.
 GP_EXPORT int gp_ctl_wheel_drain_hot(uint32_t* out_indices, uint32_t max_indices, uint32_t* out_count);
+
+// Rasterize a simple pixel waveform from a wheel signal's history into an RGBA8 buffer.
+// - width_px * height_px * 4 bytes are written.
+// - span controls horizontal decimation: x=0 uses latest sample, x=1 uses (latest-span), etc.
+// - Output is opaque black background with white pixels for the waveform.
+// Returns 1 on success.
+GP_EXPORT int gp_ctl_wheel_raster_rgba(uint32_t signal_idx, uint32_t span, uint32_t width_px, uint32_t height_px,
+                                      uint8_t* out_rgba, uint32_t out_len_bytes);
+
+// ---------------- Controller timers (prototype) ----------------
+// Backend-owned periodic pulses. Implemented in the controller engine tick loop
+// by writing button-like signals into the signal kernel each tick.
+
+// Clear all registered timers.
+GP_EXPORT void gp_ctl_timers_clear(void);
+
+// Add a timer. Returns 1 on success.
+GP_EXPORT int gp_ctl_timers_add(const GP_CtlTimerDesc* t);
+
+// Return the signal_id used for a given timer_id (0 if invalid).
+GP_EXPORT uint32_t gp_ctl_timer_signal_id(uint32_t timer_id);
 
 // ---------------- Signal operator helpers (prototype) ----------------
 // These are small math/logic kernels intended to be used by the upcoming

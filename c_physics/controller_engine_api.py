@@ -11,6 +11,7 @@ from .controller_engine_ctypes import (
     GP_CtlMeta,
     GP_CtlOutputDesc,
     GP_CtlPassthruDesc,
+    GP_CtlTimerDesc,
     GP_WheelMeta,
     GP_WheelSample,
 )
@@ -82,6 +83,17 @@ def bind_controller_engine(lib: ctypes.CDLL) -> None:
     lib.gp_ctl_passthru_add.argtypes = [POINTER(GP_CtlPassthruDesc)]
     lib.gp_ctl_passthru_add.restype = c_int
 
+    # Timers (optional)
+    if hasattr(lib, "gp_ctl_timers_clear"):
+        lib.gp_ctl_timers_clear.argtypes = []
+        lib.gp_ctl_timers_clear.restype = None
+    if hasattr(lib, "gp_ctl_timers_add"):
+        lib.gp_ctl_timers_add.argtypes = [POINTER(GP_CtlTimerDesc)]
+        lib.gp_ctl_timers_add.restype = c_int
+    if hasattr(lib, "gp_ctl_timer_signal_id"):
+        lib.gp_ctl_timer_signal_id.argtypes = [c_uint32]
+        lib.gp_ctl_timer_signal_id.restype = c_uint32
+
     # Signal wheel
     lib.gp_ctl_wheel_get_meta.argtypes = [POINTER(GP_WheelMeta)]
     lib.gp_ctl_wheel_get_meta.restype = c_int
@@ -100,6 +112,10 @@ def bind_controller_engine(lib: ctypes.CDLL) -> None:
 
     lib.gp_ctl_wheel_drain_hot.argtypes = [POINTER(c_uint32), c_uint32, POINTER(c_uint32)]
     lib.gp_ctl_wheel_drain_hot.restype = c_int
+
+    # Wheel waveform raster (RGBA8)
+    lib.gp_ctl_wheel_raster_rgba.argtypes = [c_uint32, c_uint32, c_uint32, c_uint32, ctypes.POINTER(ctypes.c_uint8), c_uint32]
+    lib.gp_ctl_wheel_raster_rgba.restype = c_int
 
 
 def try_load_controller_engine(*, search_dir: str | None = None):

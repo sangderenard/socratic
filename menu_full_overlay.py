@@ -14,6 +14,7 @@ class MenuSnapshot:
     title: str
     item_labels: list[str]
     selected_idx: int
+    selected_action: str
 
 
 @dataclass(frozen=True)
@@ -39,12 +40,22 @@ class NonBlockingJsonMenu:
     Rendering is expected to be "redraw on dirty" using the snapshot generation.
     """
 
-    def __init__(self, *, menu_path: str = "menu.json", start_node: str = "main") -> None:
+    def __init__(
+        self,
+        *,
+        menu_path: str = "menu.json",
+        start_node: str = "main",
+        page_registry: Any | None = None,
+    ) -> None:
         self._lock = threading.Lock()
 
         self._menu_path = str(menu_path)
         self._nodes: dict[str, dict[str, Any]] = {}
         self._load_nodes()
+
+        # Optional per-node page builders (for modular menus).
+        # If provided, this is consulted first for node definitions.
+        self._page_registry = page_registry
 
         self._active = False
         self._gen = 0
@@ -66,6 +77,15 @@ class NonBlockingJsonMenu:
             self._nodes = {}
 
     def _cur_node(self) -> dict[str, Any]:
+        # Prefer a registry-provided node (dynamic / modular) if available.
+        try:
+            reg = getattr(self, "_page_registry", None)
+            if reg is not None and hasattr(reg, "build_node"):
+                node = reg.build_node(str(self._node_id))
+                if isinstance(node, dict):
+                    return node
+        except Exception:
+            pass
         return self._nodes.get(self._node_id, {}) if isinstance(self._nodes, dict) else {}
 
     def _cur_items(self) -> list[dict[str, Any]]:
@@ -163,9 +183,16 @@ class NonBlockingJsonMenu:
                     self._gen += 1
                     return
 
-                # "start" closes the menu (resume gameplay). Others are surfaced as pending.
+                # Only "start" is a semantic close. Other actions are surfaced
+                # as pending actions but do NOT close the menu; focus decides
+                # which overlay receives input.
+                if a == "start":
+                    self._pending_action = str(action)
+                    self._active = False
+                    self._gen += 1
+                    return
+
                 self._pending_action = str(action)
-                self._active = False
                 self._gen += 1
                 return
 
@@ -190,6 +217,17 @@ class NonBlockingJsonMenu:
             else:
                 sel = 0
 
+            sel_action = ""
+            try:
+                if items and 0 <= int(sel) < int(len(items)):
+                    it = items[int(sel)]
+                    if isinstance(it, dict):
+                        a = it.get("action")
+                        if isinstance(a, str):
+                            sel_action = str(a)
+            except Exception:
+                sel_action = ""
+
             return MenuSnapshot(
                 active=bool(self._active),
                 gen=int(self._gen),
@@ -197,6 +235,7 @@ class NonBlockingJsonMenu:
                 title=title,
                 item_labels=labels,
                 selected_idx=sel,
+                selected_action=str(sel_action),
             )
 
 
@@ -269,15 +308,32 @@ class MenuBufferPresenter:
     only needs the immutable snapshot + generation counter.
     """
 
-    def __init__(self, *, font, width: int, height: int) -> None:
+    def __init__(self, *, font, width: int, height: int, page_registry: Any | None = None) -> None:
         self._font = font
         self._w = int(width)
         self._h = int(height)
 
+        self._page_registry = page_registry
+
         self._front_rgba: bytes | None = None
         self._front_gen: int = -1
+        self._front_live_seq: int = -1
+        self._front_has_live: bool = False
 
         self._assets = None
+
+        self._ctl_lib = None
+
+    def _ensure_ctl(self) -> None:
+        if self._ctl_lib is not None:
+            return
+        try:
+            from c_physics.controller_engine_api import try_load_controller_engine
+
+            lib, _ = try_load_controller_engine(search_dir="c_physics")
+            self._ctl_lib = lib
+        except Exception:
+            self._ctl_lib = None
 
     def _ensure_assets(self) -> None:
         if self._assets is not None:
@@ -293,21 +349,67 @@ class MenuBufferPresenter:
         if not bool(getattr(snap, "active", False)):
             return
         gen = int(getattr(snap, "gen", -1))
-        if gen == int(self._front_gen) and self._front_rgba is not None:
+
+        # For live widgets (e.g., wheel waveforms), we allow redraw when the
+        # controller wheel tick advances even if menu generation is unchanged.
+        if gen == int(self._front_gen) and self._front_rgba is not None and not bool(self._front_has_live):
             return
+
+        if gen == int(self._front_gen) and self._front_rgba is not None and bool(self._front_has_live):
+            self._ensure_ctl()
+            try:
+                if self._ctl_lib is not None and hasattr(self._ctl_lib, "gp_ctl_wheel_get_tick_seq"):
+                    cur = int(self._ctl_lib.gp_ctl_wheel_get_tick_seq())
+                    if cur == int(self._front_live_seq):
+                        return
+            except Exception:
+                # If live-seq check fails, fall through and redraw.
+                pass
 
         title = str(getattr(snap, "title", ""))
         items = list(getattr(snap, "item_labels", []) or [])
         sel = int(getattr(snap, "selected_idx", 0))
 
-        doc = _menu_list_layout_to_uidoc(gen=int(gen), title=title, items=items, selected_idx=int(sel))
+        # Optional registry hook: allow a page to supply a custom UiDoc.
+        doc = None
+        try:
+            reg = getattr(self, "_page_registry", None)
+            if reg is not None and hasattr(reg, "build_uidoc"):
+                maybe = reg.build_uidoc(snap=snap, width_px=int(self._w), height_px=int(self._h))
+                if isinstance(maybe, UiDoc):
+                    doc = maybe
+        except Exception:
+            doc = None
+
+        if doc is None:
+            doc = _menu_list_layout_to_uidoc(gen=int(gen), title=title, items=items, selected_idx=int(sel))
         rgba = self._render_uidoc_to_rgba(doc)
         self._front_rgba = rgba
         self._front_gen = gen
 
+        # Track whether doc contains any live widgets.
+        self._front_has_live = False
+        try:
+            for cmd in (doc.commands or []):
+                if isinstance(cmd, dict) and str(cmd.get("op", "")).strip().lower() == "wheel_waveform":
+                    self._front_has_live = True
+                    break
+        except Exception:
+            self._front_has_live = False
+
+        if self._front_has_live:
+            self._ensure_ctl()
+            try:
+                if self._ctl_lib is not None and hasattr(self._ctl_lib, "gp_ctl_wheel_get_tick_seq"):
+                    self._front_live_seq = int(self._ctl_lib.gp_ctl_wheel_get_tick_seq())
+            except Exception:
+                self._front_live_seq = -1
+
     def _render_uidoc_to_rgba(self, doc: UiDoc) -> bytes:
         import pygame
         import joystick_menu
+
+        import ctypes
 
         self._ensure_assets()
 
@@ -320,6 +422,14 @@ class MenuBufferPresenter:
         def _py_from_gl_y(y_norm_gl: float) -> int:
             # UI docs use bottom-left origin like GL; pygame uses top-left.
             return int(round((1.0 - float(y_norm_gl)) * float(self._h)))
+
+        def _rgba_u8(cmd: dict[str, Any], key: str = "rgba") -> tuple[int, int, int, int]:
+            rgba = cmd.get(key)
+            try:
+                r, g, b, a = (int(rgba[0]), int(rgba[1]), int(rgba[2]), int(rgba[3]))
+                return (r, g, b, a)
+            except Exception:
+                return (255, 255, 255, 255)
 
         def _get_reticle_surface(sprite_name: str):
             if self._assets is None:
@@ -354,8 +464,12 @@ class MenuBufferPresenter:
                 continue
             if op == "text":
                 txt = str(cmd.get("text", ""))
-                x = _px(float(cmd.get("x", 0.0) or 0.0))
-                y = _py_from_gl_y(float(cmd.get("y", 0.0) or 0.0))
+                if "x_px" in cmd and "y_px" in cmd:
+                    x = int(cmd.get("x_px") or 0)
+                    y = int(cmd.get("y_px") or 0)
+                else:
+                    x = _px(float(cmd.get("x", 0.0) or 0.0))
+                    y = _py_from_gl_y(float(cmd.get("y", 0.0) or 0.0))
                 s = joystick_menu._render_cell_text(self._font, txt)
                 surf.blit(s, (x, y))
                 continue
@@ -367,6 +481,63 @@ class MenuBufferPresenter:
                     ret = _get_reticle_surface(sprite)
                     if ret is not None:
                         surf.blit(ret, (x, y))
+                continue
+
+            if op == "rect":
+                x = int(cmd.get("x_px") or 0)
+                y = int(cmd.get("y_px") or 0)
+                w = int(cmd.get("w_px") or 0)
+                h = int(cmd.get("h_px") or 0)
+                r, g, b, a = _rgba_u8(cmd, "rgba")
+                if w > 0 and h > 0:
+                    pygame.draw.rect(surf, (r, g, b, a), pygame.Rect(x, y, w, h), width=0)
+                if "outline_rgba" in cmd:
+                    or_, og, ob, oa = _rgba_u8(cmd, "outline_rgba")
+                    ow = int(cmd.get("outline_w_px") or 1)
+                    if w > 0 and h > 0 and ow > 0:
+                        pygame.draw.rect(surf, (or_, og, ob, oa), pygame.Rect(x, y, w, h), width=ow)
+                continue
+
+            if op == "line":
+                x0 = int(cmd.get("x0_px") or 0)
+                y0 = int(cmd.get("y0_px") or 0)
+                x1 = int(cmd.get("x1_px") or 0)
+                y1 = int(cmd.get("y1_px") or 0)
+                r, g, b, a = _rgba_u8(cmd, "rgba")
+                ww = int(cmd.get("w_px") or 1)
+                pygame.draw.line(surf, (r, g, b, a), (x0, y0), (x1, y1), width=max(1, ww))
+                continue
+
+            if op == "circle":
+                cx = int(cmd.get("cx_px") or 0)
+                cy = int(cmd.get("cy_px") or 0)
+                rr = int(cmd.get("r_px") or 0)
+                r, g, b, a = _rgba_u8(cmd, "rgba")
+                if rr > 0:
+                    pygame.draw.circle(surf, (r, g, b, a), (cx, cy), rr)
+                continue
+
+            if op == "wheel_waveform":
+                x = int(cmd.get("x_px") or 0)
+                y = int(cmd.get("y_px") or 0)
+                w = int(cmd.get("w_px") or 0)
+                h = int(cmd.get("h_px") or 0)
+                sig = int(cmd.get("signal_idx") or 0)
+                span = int(cmd.get("span") or 1)
+                if w <= 0 or h <= 0:
+                    continue
+                self._ensure_ctl()
+                if self._ctl_lib is None or not hasattr(self._ctl_lib, "gp_ctl_wheel_raster_rgba"):
+                    continue
+                try:
+                    buf = bytearray(int(w * h * 4))
+                    p = (ctypes.c_uint8 * len(buf)).from_buffer(buf)
+                    ok = int(self._ctl_lib.gp_ctl_wheel_raster_rgba(int(sig), int(span), int(w), int(h), p, int(len(buf))))
+                    if ok:
+                        img = pygame.image.frombuffer(bytes(buf), (int(w), int(h)), "RGBA")
+                        surf.blit(img, (x, y))
+                except Exception:
+                    pass
                 continue
 
         return pygame.image.tostring(surf, "RGBA", True)

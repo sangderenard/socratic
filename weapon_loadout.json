@@ -2,9 +2,9 @@
   "weapon_loadout": {
     "bay_inner": 1,
     "bay_outer": 1,
-    "left_hp1": 3,
+    "left_hp1": 4,
     "left_hp2": 3,
-    "nose_gun": 2,
+    "nose_gun": 0,
     "right_hp1": 3,
     "right_hp2": 3,
     "sourcing_mode": 1,

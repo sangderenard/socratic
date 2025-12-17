@@ -337,7 +337,9 @@ def run_signal_workbench(
     # Per-signal value history (for the right-pane mini history strip)
     sig_history: dict[str, list[float]] = {}
     last_hist_ns: int = 0
-    hist_period_ns: int = int(33_000_000)  # ~30Hz
+    # History sampling period (ns). Use 0 to sample every paint so we don't
+    # throttle waveform/flag updates and accidentally drop short pulses.
+    hist_period_ns: int = 0
     hist_len: int = 40
 
     # Optional C signal-kernel integration (for live status flags / timers).
@@ -3415,15 +3417,14 @@ def run_signal_workbench(
                             _rebuild_graphs(int(_mono_ns()))
                     break
 
-        # Clear one-shot pulse flags once per frame so multiple peeks in a frame
-        # (left table + right signals) see consistent edges.
-        if _sigk is not None and hasattr(_sigk, "gp_sigk_clear_pulses"):
-            try:
-                _sigk.gp_sigk_clear_pulses()
-            except Exception:
-                pass
+        # Do not clear pulses here; the C controller engine already owns pulse
+        # lifetime. Clearing in the UI loop was dropping data for other
+        # consumers and clobbering short-lived edges before they could be
+        # visualized.
 
         pygame.display.flip()
-        clock.tick(60)
+        # No frame cap: let the workbench run as fast as the host can draw so
+        # LED/hist strips track kernel updates without an artificial governor.
+        clock.tick(0)
 
         axes_prev, buttons_prev, hats_prev = dict(axes_now), set(buttons_now), dict(hats_now)

@@ -42,6 +42,9 @@ import world_config_structs
 from flight_camera import PlanetFlightCamera, lookat_up_away_from_planet, clamp_radius_band
 
 
+_DBG_HOOKS = str(os.environ.get("SOC_DEBUG_HOOKS", "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _resolve_effective_control_set(menu: object | None) -> str:
     """Resolve the effective control-set name for this frame.
 
@@ -3991,9 +3994,38 @@ class _JoystickSideMenu:
         try:
             from menu_full_overlay import NonBlockingJsonMenu
 
-            self._full_menu = NonBlockingJsonMenu(menu_path="menu.json", start_node="main")
+            try:
+                import menu_pages
+
+                page_registry = getattr(menu_pages, "DEFAULT_REGISTRY", None)
+            except Exception:
+                page_registry = None
+
+            self._full_menu = NonBlockingJsonMenu(menu_path="menu.json", start_node="main", page_registry=page_registry)
         except Exception:
             self._full_menu = None
+
+        # Establish a default focus origin so we can distinguish:
+        # - off (disabled origin)
+        # - background (enabled but not focused)
+        # - foreground (focused)
+        try:
+            import input_interest
+
+            if input_interest.get_focus_origin() is None:
+                input_interest.push_focus("flight")
+        except Exception:
+            pass
+
+        # Concurrent overlay sources (separate from the full-screen menu itself).
+        # This establishes a precedent for selectable overlay sources without blocking gameplay.
+        self._workbench_overlay = None
+        try:
+            import workbench_overlay
+
+            self._workbench_overlay = workbench_overlay.WorkbenchOverlay()
+        except Exception:
+            self._workbench_overlay = None
 
         # Optional C signal kernel and controller backend evaluator.
         # This is the bridge step: gameplay can read controls from the backend even if
@@ -4038,11 +4070,20 @@ class _JoystickSideMenu:
         try:
             from c_physics import signal_kernel_api
 
-            _lib, api = signal_kernel_api.try_load_signal_kernel()
+            # Critical: load signal kernel from the same DLL search path as the controller engine.
+            # If they load from different filesystem paths on Windows, you can end up with two
+            # separate DLL instances (split globals), where pushed inputs never reach the engine.
+            _lib, api = signal_kernel_api.try_load_signal_kernel(search_dir="c_physics")
             self._sigk = api
             if self._sigk is not None:
                 try:
                     self._sigk.gp_sigk_reset()
+                except Exception:
+                    pass
+
+                try:
+                    if _DBG_HOOKS and _lib is not None:
+                        print(f"[dbg] sigk_dll={getattr(_lib, '_name', '')}")
                 except Exception:
                     pass
 
@@ -4053,10 +4094,18 @@ class _JoystickSideMenu:
 
                     lib2, ctl = controller_engine_api.try_load_controller_engine(search_dir="c_physics")
                     if ctl is not None:
+                        try:
+                            if _DBG_HOOKS and lib2 is not None:
+                                print(f"[dbg] ctl_dll={getattr(lib2, '_name', '')}")
+                        except Exception:
+                            pass
                         # Load compiled blob and start the fixed-rate evaluator.
                         ok_load = int(ctl.gp_ctl_load_graph_file(b"controller_graph_final.bin"))
                         if ok_load:
-                            bindings = None
+                            # Hook bindings:
+                            # - Load channel-based semantic actions from the config (menu_* etc)
+                            # - Add a small set of optional signal watches (flight_toggle/minimap_cycle)
+                            # Important: do not drop *all* bindings if an optional attribute is missing.
                             try:
                                 from controller_binding_hooks import HookBinding, HookBindingDispatcher, load_hook_bindings_from_cfg
                                 from c_physics import signal_kernel_api
@@ -4066,38 +4115,51 @@ class _JoystickSideMenu:
                                     cfg = joystick_menu.ensure_menu_bindings_block(cfg)
                                 except Exception:
                                     pass
-                                bindings = load_hook_bindings_from_cfg(cfg)
 
-                                # Add internal bindings that were previously hardwired to pygame events.
-                                # These are pass-through signal-kernel watches on joystick buttons.
-                                bindings.extend(
-                                    [
+                                bindings: list[HookBinding] = []
+                                try:
+                                    bindings.extend(load_hook_bindings_from_cfg(cfg))
+                                except Exception:
+                                    bindings = []
+
+                                # Optional legacy-but-still-useful semantic actions.
+                                try:
+                                    b = int(getattr(self, "flight_toggle_button"))
+                                    bindings.append(
                                         HookBinding(
                                             action="flight_toggle",
                                             source="signal",
                                             device=int(signal_kernel_api.GP_DEV_JOYSTICK),
                                             kind=int(signal_kernel_api.GP_EV_BUTTON),
-                                            item_id=int(self.flight_toggle_button),
+                                            item_id=int(b),
                                             sigsel=2,
                                             edge="rise",
                                             threshold=0.5,
                                             hysteresis=0.05,
-                                        ),
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+
+                                try:
+                                    b = int(getattr(self, "minimap_cycle_button"))
+                                    bindings.append(
                                         HookBinding(
                                             action="minimap_cycle",
                                             source="signal",
                                             device=int(signal_kernel_api.GP_DEV_JOYSTICK),
                                             kind=int(signal_kernel_api.GP_EV_BUTTON),
-                                            item_id=int(self.minimap_cycle_button),
+                                            item_id=int(b),
                                             sigsel=2,
                                             edge="rise",
                                             threshold=0.5,
                                             hysteresis=0.05,
-                                        ),
-                                    ]
-                                )
+                                        )
+                                    )
+                                except Exception:
+                                    pass
                             except Exception:
-                                bindings = None
+                                bindings = []
 
                             # Important: do NOT auto-materialize controller-engine passthrough outputs.
                             # "Passthrough" (direct signal->channel) is treated as a temporary/uncompiled
@@ -4109,11 +4171,38 @@ class _JoystickSideMenu:
                                 except Exception:
                                     pass
 
+                            # Optional: backend-owned timers (C controller engine).
+                            # These synthesize virtual button-like signals into the signal kernel each tick.
+                            if hasattr(ctl, "gp_ctl_timers_clear") and hasattr(ctl, "gp_ctl_timers_add"):
+                                try:
+                                    ctl.gp_ctl_timers_clear()
+                                    try:
+                                        from controller_timers import load_timer_descs_from_cfg
+
+                                        for td in load_timer_descs_from_cfg(cfg if isinstance(cfg, dict) else {}, tick_hz=240):
+                                            try:
+                                                ctl.gp_ctl_timers_add(ctypes.byref(td))
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+
                             # Configure announce-mode input interest for the C signal kernel.
                             # This keeps the default runtime path quiet/efficient while still
                             # allowing tools (binding/workbench) to switch into scan-mode.
                             try:
                                 import input_interest
+
+                                # Cache a minimal always-needed interest set so the menu system
+                                # stays reachable even if other binding/graph setup fails.
+                                try:
+                                    from controller_binding_hooks import get_root_ui_interest
+
+                                    _root_ui = get_root_ui_interest(cfg) if isinstance(cfg, dict) else set()
+                                except Exception:
+                                    _root_ui = set()
 
                                 interest: set[tuple[int, int, int]] = set()
 
@@ -4141,6 +4230,11 @@ class _JoystickSideMenu:
 
                                 input_interest.set_announce_interest(interest)
                                 self._ann_sigk_interest = set(interest)
+                                try:
+                                    # Store separately for runtime self-heal.
+                                    self._root_sigk_interest = set(_root_ui)
+                                except Exception:
+                                    pass
 
                                 def _ids_for(dev: int, kind: int) -> set[int]:
                                     return {int(iid) for (d, k, iid) in (self._ann_sigk_interest or set()) if int(d) == int(dev) and int(k) == int(kind)}
@@ -4167,6 +4261,10 @@ class _JoystickSideMenu:
                                 self._ann_sigk_keyboard_keys = None
                                 self._ann_sigk_mouse_motion = None
                                 self._ann_sigk_mouse_buttons = None
+                                try:
+                                    self._root_sigk_interest = set()
+                                except Exception:
+                                    pass
 
                             ctl.gp_ctl_start(240, 4096)
                             meta = GP_CtlMeta()
@@ -4192,19 +4290,26 @@ class _JoystickSideMenu:
 
                                 # Bindings-as-hooks dispatcher (parked Python waiter thread).
                                 try:
-                                    if bindings is None:
-                                        from controller_binding_hooks import HookBindingDispatcher
+                                    from controller_binding_hooks import HookBindingDispatcher
 
-                                        disp = HookBindingDispatcher(ctl)
-                                        disp.register([])
-                                    else:
-                                        from controller_binding_hooks import HookBindingDispatcher
-
-                                        disp = HookBindingDispatcher(ctl)
-                                        disp.register(bindings)
+                                    disp = HookBindingDispatcher(ctl, sigk_lib=getattr(self, "_sigk", None))
+                                    disp.register(bindings or [])
 
                                     def _act_flight_toggle(_ev) -> None:
                                         try:
+                                            try:
+                                                import input_interest
+
+                                                if bool(input_interest.capture_blocks("flight")):
+                                                    return
+                                            except Exception:
+                                                pass
+                                            # Avoid conflicts: MenuCancelOR commonly shares the same
+                                            # physical button as flight_toggle (e.g. joy.btn1).
+                                            # When the menu overlay is active, treat the button as
+                                            # a menu action only.
+                                            if self._full_menu is not None and bool(self._full_menu.is_active()):
+                                                return
                                             self.flight_enabled = not bool(self.flight_enabled)
                                             if self.flight_enabled:
                                                 self.flight_cam.reset_north_pole()
@@ -4213,6 +4318,13 @@ class _JoystickSideMenu:
 
                                     def _act_minimap_cycle(_ev) -> None:
                                         try:
+                                            try:
+                                                import input_interest
+
+                                                if bool(input_interest.capture_blocks("flight")):
+                                                    return
+                                            except Exception:
+                                                pass
                                             now = float(time.monotonic())
                                             if (now - float(self._last_minimap_cycle_time)) < float(self.selector_cooldown):
                                                 return
@@ -4224,12 +4336,26 @@ class _JoystickSideMenu:
 
                                     def _act_targeting_toggle(_ev) -> None:
                                         try:
+                                            try:
+                                                import input_interest
+
+                                                if bool(input_interest.capture_blocks("flight")):
+                                                    return
+                                            except Exception:
+                                                pass
                                             self._targeting_active = not bool(self._targeting_active)
                                         except Exception:
                                             pass
 
                                     def _act_camera_zoom_in(ev) -> None:
                                         try:
+                                            try:
+                                                import input_interest
+
+                                                if bool(input_interest.capture_blocks("flight")):
+                                                    return
+                                            except Exception:
+                                                pass
                                             fl = int(getattr(ev, "flags", 0))
                                             if fl & 1:
                                                 self._zoom_in_down = True
@@ -4240,6 +4366,13 @@ class _JoystickSideMenu:
 
                                     def _act_camera_zoom_out(ev) -> None:
                                         try:
+                                            try:
+                                                import input_interest
+
+                                                if bool(input_interest.capture_blocks("flight")):
+                                                    return
+                                            except Exception:
+                                                pass
                                             fl = int(getattr(ev, "flags", 0))
                                             if fl & 1:
                                                 self._zoom_out_down = True
@@ -4249,58 +4382,202 @@ class _JoystickSideMenu:
                                             pass
 
                                     def _act_weapons_fire_1(_ev) -> None:
+                                        try:
+                                            import input_interest
+
+                                            if bool(input_interest.capture_blocks("flight")):
+                                                return
+                                        except Exception:
+                                            pass
                                         # Placeholder: wire into weapon runtime if desired.
                                         pass
 
                                     def _act_weapons_fire_2(_ev) -> None:
+                                        try:
+                                            import input_interest
+
+                                            if bool(input_interest.capture_blocks("flight")):
+                                                return
+                                        except Exception:
+                                            pass
                                         pass
 
                                     def _act_menu_open(_ev) -> None:
                                         try:
-                                            if self._full_menu is not None:
-                                                self._full_menu.toggle()
+                                            if self._full_menu is None:
+                                                return
+                                            try:
+                                                import input_interest
+
+                                                focus = input_interest.get_focus_origin()
+                                            except Exception:
+                                                focus = None
+
+                                            # If the menu is already active but not focused, bring it
+                                            # to the foreground instead of toggling it closed.
+                                            if bool(self._full_menu.is_active()) and str(focus or "") != "menu":
+                                                try:
+                                                    import input_interest
+
+                                                    input_interest.push_focus("menu")
+                                                except Exception:
+                                                    pass
+                                                return
+
+                                            self._full_menu.toggle()
+                                            try:
+                                                import input_interest
+
+                                                if bool(self._full_menu.is_active()):
+                                                    input_interest.push_focus("menu")
+                                                else:
+                                                    input_interest.pop_focus("menu")
+                                            except Exception:
+                                                pass
+                                                if _DBG_HOOKS:
+                                                    try:
+                                                        snap = self._full_menu.snapshot()
+                                                        print(f"[dbg] menu_open -> active={bool(snap.active)} gen={int(snap.gen)} node={str(snap.node_id)}")
+                                                    except Exception:
+                                                        print("[dbg] menu_open -> toggled")
                                         except Exception:
                                             pass
 
                                     def _act_menu_confirm(_ev) -> None:
                                         try:
-                                            if self._full_menu is not None:
+                                            try:
+                                                import input_interest
+
+                                                focus = input_interest.get_focus_origin()
+                                            except Exception:
+                                                focus = None
+
+                                            if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                                 self._full_menu.confirm()
+                                                try:
+                                                    act = self.full_menu_consume_action()
+                                                    if act:
+                                                        ok = bool(self._dispatch_pending_menu_action(act))
+                                                        if not ok:
+                                                            try:
+                                                                import input_interest
+
+                                                                input_interest.push_focus("menu")
+                                                            except Exception:
+                                                                pass
+                                                except Exception:
+                                                    pass
+                                            elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                                self._workbench_overlay.confirm()
                                         except Exception:
                                             pass
 
                                     def _act_menu_cancel(_ev) -> None:
                                         try:
-                                            if self._full_menu is not None:
+                                            try:
+                                                import input_interest
+
+                                                focus = input_interest.get_focus_origin()
+                                            except Exception:
+                                                focus = None
+
+                                            if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                                 self._full_menu.cancel()
+                                                try:
+                                                    import input_interest
+
+                                                    if self._full_menu is None or (not bool(self._full_menu.is_active())):
+                                                        input_interest.pop_focus("menu")
+                                                except Exception:
+                                                    pass
+                                            elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                                self._workbench_overlay.cancel()
                                         except Exception:
                                             pass
 
                                     def _act_menu_up(_ev) -> None:
                                         try:
-                                            if self._full_menu is not None:
+                                            try:
+                                                import input_interest
+
+                                                focus = input_interest.get_focus_origin()
+                                            except Exception:
+                                                focus = None
+
+                                            if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                                 self._full_menu.nav(-1)
+                                            elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                                self._workbench_overlay.nav(-1)
                                         except Exception:
                                             pass
 
                                     def _act_menu_down(_ev) -> None:
                                         try:
-                                            if self._full_menu is not None:
+                                            try:
+                                                import input_interest
+
+                                                focus = input_interest.get_focus_origin()
+                                            except Exception:
+                                                focus = None
+
+                                            if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                                 self._full_menu.nav(1)
+                                            elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                                self._workbench_overlay.nav(1)
                                         except Exception:
                                             pass
 
                                     def _act_menu_left(_ev) -> None:
                                         try:
-                                            if self._full_menu is not None:
+                                            try:
+                                                import input_interest
+
+                                                focus = input_interest.get_focus_origin()
+                                            except Exception:
+                                                focus = None
+
+                                            if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                                 self._full_menu.cancel()
+                                                try:
+                                                    import input_interest
+
+                                                    if self._full_menu is None or (not bool(self._full_menu.is_active())):
+                                                        input_interest.pop_focus("menu")
+                                                except Exception:
+                                                    pass
+                                            elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                                # In the workbench overlay, left/right are navigation,
+                                                # not "close". Close is menu_cancel.
+                                                self._workbench_overlay.nav(-1)
                                         except Exception:
                                             pass
 
                                     def _act_menu_right(_ev) -> None:
                                         try:
-                                            if self._full_menu is not None:
+                                            try:
+                                                import input_interest
+
+                                                focus = input_interest.get_focus_origin()
+                                            except Exception:
+                                                focus = None
+
+                                            if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                                 self._full_menu.confirm()
+                                                try:
+                                                    act = self.full_menu_consume_action()
+                                                    if act:
+                                                        ok = bool(self._dispatch_pending_menu_action(act))
+                                                        if not ok:
+                                                            try:
+                                                                import input_interest
+
+                                                                input_interest.push_focus("menu")
+                                                            except Exception:
+                                                                pass
+                                                except Exception:
+                                                    pass
+                                            elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                                self._workbench_overlay.nav(1)
                                         except Exception:
                                             pass
 
@@ -4321,7 +4598,7 @@ class _JoystickSideMenu:
                                         "menu_right": _act_menu_right,
                                     }
 
-                                    disp.start(handlers=self._hook_handlers, poll_timeout_ms=50)
+                                    disp.start(handlers=self._hook_handlers, poll_timeout_ms=5)
                                     self._hook_dispatcher = disp
                                 except Exception:
                                     self._hook_dispatcher = None
@@ -4473,7 +4750,13 @@ class _JoystickSideMenu:
         if disp is None:
             return
         try:
-            disp.drain(handlers=getattr(self, "_hook_handlers", {}) or {})
+            # Keep per-frame dispatch bounded; old events are already bounded in the dispatcher.
+            disp.drain(
+                handlers=getattr(self, "_hook_handlers", {}) or {},
+                max_events=128,
+                max_time_ms=1.5,
+                now_ns=int(time.monotonic_ns()),
+            )
         except Exception:
             pass
 
@@ -4484,6 +4767,90 @@ class _JoystickSideMenu:
             return self._full_menu.snapshot()
         except Exception:
             return None
+
+    def overlay_snapshot(self):
+        """Return the currently active overlay snapshot.
+
+        Rendering follows *focus*, not merely "active" state:
+        - Multiple overlays may be active concurrently.
+        - Only the focused one should receive input and be rendered.
+        - Background overlays stay active (no forced idle/close).
+        """
+
+        menu_active = False
+        wb_active = False
+        try:
+            if self._full_menu is not None:
+                s0 = self._full_menu.snapshot()
+                menu_active = bool(s0 is not None and bool(getattr(s0, "active", False)))
+        except Exception:
+            menu_active = False
+
+        try:
+            wb_active = bool(self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()))
+        except Exception:
+            wb_active = False
+
+        # Robustness backstop: dispatch any pending menu action in a stable,
+        # per-frame location. This works whether the menu closes on confirm or
+        # stays open.
+        try:
+            act = self.full_menu_consume_action()
+            if act:
+                self._dispatch_pending_menu_action(act)
+        except Exception:
+            pass
+
+        # Focus bookkeeping: do NOT force focus just because an overlay is
+        # active. Only clean up if focus points at a now-inactive overlay.
+        try:
+            import input_interest
+
+            cur = input_interest.get_focus_origin()
+            if (not menu_active) and str(cur or "") == "menu":
+                input_interest.pop_focus("menu")
+                cur = input_interest.get_focus_origin()
+            if (not wb_active) and str(cur or "") == "workbench":
+                input_interest.pop_focus("workbench")
+                cur = input_interest.get_focus_origin()
+            if (not menu_active) and (not wb_active):
+                if cur is None or str(cur) in ("menu", "workbench"):
+                    input_interest.push_focus("flight")
+        except Exception:
+            cur = None
+
+        # Select snapshot by focus when possible.
+        try:
+            import input_interest
+
+            focus = input_interest.get_focus_origin()
+        except Exception:
+            focus = None
+
+        if str(focus or "") == "workbench" and wb_active:
+            try:
+                return self._workbench_overlay.snapshot() if self._workbench_overlay is not None else None
+            except Exception:
+                return None
+
+        if str(focus or "") == "menu" and menu_active:
+            try:
+                return self._full_menu.snapshot() if self._full_menu is not None else None
+            except Exception:
+                return None
+
+        # Fallback: show any active overlay (prefer workbench).
+        if wb_active:
+            try:
+                return self._workbench_overlay.snapshot() if self._workbench_overlay is not None else None
+            except Exception:
+                return None
+        if menu_active:
+            try:
+                return self._full_menu.snapshot() if self._full_menu is not None else None
+            except Exception:
+                return None
+        return None
 
     def full_menu_active(self) -> bool:
         try:
@@ -4503,6 +4870,57 @@ class _JoystickSideMenu:
         except Exception:
             return None
 
+    def _dispatch_pending_menu_action(self, action: str) -> bool:
+        """Dispatch a pending menu action without relying on closure locals.
+
+        Hook callbacks in this file are nested deep enough that `font`, `width`,
+        `height`, and `menu_button` may not be in scope (NameError), which would
+        silently drop the action. This helper derives safe runtime defaults.
+        """
+
+        a = str(action or "").strip()
+        if not a:
+            return False
+
+        try:
+            import pygame
+
+            w, h = 1280, 720
+            try:
+                surf = pygame.display.get_surface()
+                if surf is not None:
+                    w, h = surf.get_size()
+            except Exception:
+                w, h = 1280, 720
+
+            # Minimal font fallback (dispatch_menu_action only needs it for
+            # legacy blocking tools; controller_workbench doesn't use it).
+            try:
+                if not pygame.font.get_init():
+                    pygame.font.init()
+                fnt = pygame.font.SysFont(None, 18)
+            except Exception:
+                fnt = None
+
+            # Try to recover menu_button from config if needed by legacy tools.
+            mb = None
+            try:
+                import joystick_menu
+
+                cfg0 = joystick_menu.load_or_create_joystick_config("joystick.json")
+                try:
+                    cfg0 = joystick_menu.ensure_menu_bindings_block(cfg0)
+                except Exception:
+                    pass
+                if isinstance(cfg0.get("menu_button"), int):
+                    mb = int(cfg0.get("menu_button"))
+            except Exception:
+                mb = None
+
+            return bool(self.dispatch_menu_action(a, font=fnt, width=int(w), height=int(h), menu_button=mb))
+        except Exception:
+            return False
+
     def dispatch_menu_action(self, action: str, *, font: pygame.font.Font, width: int, height: int, menu_button: int | None) -> bool:
         """Dispatch a menu action string to an in-app tool.
 
@@ -4516,22 +4934,35 @@ class _JoystickSideMenu:
 
         if a == "controller_workbench":
             try:
-                import signal_workbench
+                # New behavior: switch to a concurrent overlay source.
+                wb_opened = False
+                if self._workbench_overlay is None:
+                    try:
+                        import workbench_overlay
 
-                signal_workbench.run_signal_workbench(
-                    font=font,
-                    width=int(width),
-                    height=int(height),
-                    joystick=self.joystick,
-                    menu_button=menu_button,
-                    load_or_create_joystick_config=joystick_menu.load_or_create_joystick_config,
-                    save_joystick_config=joystick_menu.save_joystick_config,
-                    get_menu_nav=joystick_menu._get_menu_nav,
-                    get_menu_scroll=joystick_menu._get_menu_scroll,
-                    nav_edge=joystick_menu._nav_edge,
-                    poll_joystick_snapshot=joystick_menu._poll_joystick_snapshot,
-                    draw_fullscreen_lines=joystick_menu._draw_fullscreen_lines,
-                )
+                        self._workbench_overlay = workbench_overlay.WorkbenchOverlay()
+                    except Exception:
+                        self._workbench_overlay = None
+                if self._workbench_overlay is not None:
+                    self._workbench_overlay.open()
+                    try:
+                        wb_opened = bool(self._workbench_overlay.is_active())
+                    except Exception:
+                        wb_opened = False
+
+                # If we couldn't open the overlay, treat as failure so the
+                # caller can keep the menu up (instead of closing to nothing).
+                if not bool(wb_opened):
+                    return False
+
+                # Do not close the menu. Workbench becomes the focused overlay;
+                # menu may remain active in background.
+                try:
+                    import input_interest
+
+                    input_interest.push_focus("workbench")
+                except Exception:
+                    pass
                 return True
             except Exception:
                 return False
@@ -4713,6 +5144,13 @@ class _JoystickSideMenu:
                         import input_interest
                         from c_physics import signal_kernel_api
 
+                        try:
+                            from controller_binding_hooks import get_root_ui_interest
+
+                            _root_ui = get_root_ui_interest(cfg) if isinstance(cfg, dict) else set()
+                        except Exception:
+                            _root_ui = set()
+
                         interest: set[tuple[int, int, int]] = set()
 
                         compiled = _try_load_final_graph_kernel_inputs(path="controller_graph_final.json")
@@ -4739,6 +5177,10 @@ class _JoystickSideMenu:
 
                         input_interest.set_announce_interest(interest)
                         self._ann_sigk_interest = set(interest)
+                        try:
+                            self._root_sigk_interest = set(_root_ui)
+                        except Exception:
+                            pass
 
                         def _ids_for(dev: int, kind: int) -> set[int]:
                             return {int(iid) for (d, k, iid) in (self._ann_sigk_interest or set()) if int(d) == int(dev) and int(k) == int(kind)}
@@ -4765,6 +5207,10 @@ class _JoystickSideMenu:
                         self._ann_sigk_keyboard_keys = None
                         self._ann_sigk_mouse_motion = None
                         self._ann_sigk_mouse_buttons = None
+                        try:
+                            self._root_sigk_interest = set()
+                        except Exception:
+                            pass
 
                     # Start engine and refresh metadata.
                     try:
@@ -4799,6 +5245,19 @@ class _JoystickSideMenu:
 
                             def _act_flight_toggle(_ev) -> None:
                                 try:
+                                    try:
+                                        import input_interest
+
+                                        if bool(input_interest.capture_blocks("flight")):
+                                            return
+                                    except Exception:
+                                        pass
+                                    # Avoid conflicts: MenuCancelOR commonly shares the same
+                                    # physical button as flight_toggle (e.g. joy.btn1).
+                                    # When the menu overlay is active, treat the button as
+                                    # a menu action only.
+                                    if self._full_menu is not None and bool(self._full_menu.is_active()):
+                                        return
                                     self.flight_enabled = not bool(self.flight_enabled)
                                     if self.flight_enabled:
                                         self.flight_cam.reset_north_pole()
@@ -4807,6 +5266,13 @@ class _JoystickSideMenu:
 
                             def _act_minimap_cycle(_ev) -> None:
                                 try:
+                                    try:
+                                        import input_interest
+
+                                        if bool(input_interest.capture_blocks("flight")):
+                                            return
+                                    except Exception:
+                                        pass
                                     now = float(time.monotonic())
                                     if (now - float(self._last_minimap_cycle_time)) < float(self.selector_cooldown):
                                         return
@@ -4818,12 +5284,26 @@ class _JoystickSideMenu:
 
                             def _act_targeting_toggle(_ev) -> None:
                                 try:
+                                    try:
+                                        import input_interest
+
+                                        if bool(input_interest.capture_blocks("flight")):
+                                            return
+                                    except Exception:
+                                        pass
                                     self._targeting_active = not bool(self._targeting_active)
                                 except Exception:
                                     pass
 
                             def _act_camera_zoom_in(ev) -> None:
                                 try:
+                                    try:
+                                        import input_interest
+
+                                        if bool(input_interest.capture_blocks("flight")):
+                                            return
+                                    except Exception:
+                                        pass
                                     fl = int(getattr(ev, "flags", 0))
                                     if fl & 1:
                                         self._zoom_in_down = True
@@ -4834,6 +5314,13 @@ class _JoystickSideMenu:
 
                             def _act_camera_zoom_out(ev) -> None:
                                 try:
+                                    try:
+                                        import input_interest
+
+                                        if bool(input_interest.capture_blocks("flight")):
+                                            return
+                                    except Exception:
+                                        pass
                                     fl = int(getattr(ev, "flags", 0))
                                     if fl & 1:
                                         self._zoom_out_down = True
@@ -4843,57 +5330,191 @@ class _JoystickSideMenu:
                                     pass
 
                             def _act_weapons_fire_1(_ev) -> None:
+                                try:
+                                    import input_interest
+
+                                    if bool(input_interest.capture_blocks("flight")):
+                                        return
+                                except Exception:
+                                    pass
                                 pass
 
                             def _act_weapons_fire_2(_ev) -> None:
+                                try:
+                                    import input_interest
+
+                                    if bool(input_interest.capture_blocks("flight")):
+                                        return
+                                except Exception:
+                                    pass
                                 pass
 
                             def _act_menu_open(_ev) -> None:
                                 try:
-                                    if self._full_menu is not None:
-                                        self._full_menu.toggle()
+                                    if self._full_menu is None:
+                                        return
+                                    try:
+                                        import input_interest
+
+                                        focus = input_interest.get_focus_origin()
+                                    except Exception:
+                                        focus = None
+
+                                    if bool(self._full_menu.is_active()) and str(focus or "") != "menu":
+                                        try:
+                                            import input_interest
+
+                                            input_interest.push_focus("menu")
+                                        except Exception:
+                                            pass
+                                        return
+
+                                    self._full_menu.toggle()
+                                    try:
+                                        import input_interest
+
+                                        if bool(self._full_menu.is_active()):
+                                            input_interest.push_focus("menu")
+                                        else:
+                                            input_interest.pop_focus("menu")
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     pass
 
                             def _act_menu_confirm(_ev) -> None:
                                 try:
-                                    if self._full_menu is not None:
+                                    try:
+                                        import input_interest
+
+                                        focus = input_interest.get_focus_origin()
+                                    except Exception:
+                                        focus = None
+
+                                    if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                         self._full_menu.confirm()
+                                        try:
+                                            act = self.full_menu_consume_action()
+                                            if act:
+                                                ok = bool(self._dispatch_pending_menu_action(act))
+                                                if not ok:
+                                                    try:
+                                                        import input_interest
+
+                                                        input_interest.push_focus("menu")
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
+                                    elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                        self._workbench_overlay.confirm()
                                 except Exception:
                                     pass
 
                             def _act_menu_cancel(_ev) -> None:
                                 try:
-                                    if self._full_menu is not None:
+                                    try:
+                                        import input_interest
+
+                                        focus = input_interest.get_focus_origin()
+                                    except Exception:
+                                        focus = None
+
+                                    if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                         self._full_menu.cancel()
+                                        try:
+                                            import input_interest
+
+                                            if self._full_menu is None or (not bool(self._full_menu.is_active())):
+                                                input_interest.pop_focus("menu")
+                                        except Exception:
+                                            pass
+                                    elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                        self._workbench_overlay.cancel()
                                 except Exception:
                                     pass
 
                             def _act_menu_up(_ev) -> None:
                                 try:
-                                    if self._full_menu is not None:
+                                    try:
+                                        import input_interest
+
+                                        focus = input_interest.get_focus_origin()
+                                    except Exception:
+                                        focus = None
+
+                                    if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                         self._full_menu.nav(-1)
+                                    elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                        self._workbench_overlay.nav(-1)
                                 except Exception:
                                     pass
 
                             def _act_menu_down(_ev) -> None:
                                 try:
-                                    if self._full_menu is not None:
+                                    try:
+                                        import input_interest
+
+                                        focus = input_interest.get_focus_origin()
+                                    except Exception:
+                                        focus = None
+
+                                    if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                         self._full_menu.nav(1)
+                                    elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                        self._workbench_overlay.nav(1)
                                 except Exception:
                                     pass
 
                             def _act_menu_left(_ev) -> None:
                                 try:
-                                    if self._full_menu is not None:
+                                    try:
+                                        import input_interest
+
+                                        focus = input_interest.get_focus_origin()
+                                    except Exception:
+                                        focus = None
+
+                                    if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                         self._full_menu.cancel()
+                                        try:
+                                            import input_interest
+
+                                            if self._full_menu is None or (not bool(self._full_menu.is_active())):
+                                                input_interest.pop_focus("menu")
+                                        except Exception:
+                                            pass
+                                    elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                        self._workbench_overlay.nav(-1)
                                 except Exception:
                                     pass
 
                             def _act_menu_right(_ev) -> None:
                                 try:
-                                    if self._full_menu is not None:
+                                    try:
+                                        import input_interest
+
+                                        focus = input_interest.get_focus_origin()
+                                    except Exception:
+                                        focus = None
+
+                                    if str(focus or "") == "menu" and self._full_menu is not None and bool(self._full_menu.is_active()):
                                         self._full_menu.confirm()
+                                        try:
+                                            act = self.full_menu_consume_action()
+                                            if act:
+                                                ok = bool(self._dispatch_pending_menu_action(act))
+                                                if not ok:
+                                                    try:
+                                                        import input_interest
+
+                                                        input_interest.push_focus("menu")
+                                                    except Exception:
+                                                        pass
+                                        except Exception:
+                                            pass
+                                    elif str(focus or "") == "workbench" and self._workbench_overlay is not None and bool(self._workbench_overlay.is_active()):
+                                        self._workbench_overlay.nav(1)
                                 except Exception:
                                     pass
 
@@ -4914,9 +5535,9 @@ class _JoystickSideMenu:
                                 "menu_right": _act_menu_right,
                             }
 
-                            disp2 = HookBindingDispatcher(ctl)
+                            disp2 = HookBindingDispatcher(ctl, sigk_lib=getattr(self, "_sigk", None))
                             disp2.register(bindings or [])
-                            disp2.start(handlers=self._hook_handlers, poll_timeout_ms=50)
+                            disp2.start(handlers=self._hook_handlers, poll_timeout_ms=5)
                             self._hook_dispatcher = disp2
                         except Exception:
                             self._hook_dispatcher = None
@@ -5067,6 +5688,35 @@ class _JoystickSideMenu:
                     mode = "announce"
                     allow, deny = set(), set()
 
+                # Diagnostics (low noise): show whether announce-mode is actually allowing inputs.
+                try:
+                    if _DBG_HOOKS:
+                        t0 = float(getattr(self, "_dbg_hooks_t0", 0.0) or 0.0)
+                        now0 = float(time.monotonic())
+                        if (now0 - t0) > 1.0:
+                            setattr(self, "_dbg_hooks_t0", now0)
+                            a_n = (len(allow) if isinstance(allow, set) else -1)
+                            d_n = (len(deny) if isinstance(deny, set) else -1)
+                            print(f"[dbg] mode={mode} allow={a_n} deny={d_n} ctl_ready={bool(getattr(self,'_ctl_ready',False))} hook_disp={bool(getattr(self,'_hook_dispatcher',None))}")
+                except Exception:
+                    pass
+
+                # Self-heal: if announce-mode is active but the allowlist is empty,
+                # hooks and controller-graph-driven bindings will never see input.
+                # Rebuild allowlist from the compiled final graph as a safe default.
+                try:
+                    if str(mode) == "announce" and isinstance(allow, set) and len(allow) == 0 and bool(getattr(self, "_ctl_ready", False)):
+                        import input_interest as _ii
+
+                        compiled0 = _try_load_final_graph_kernel_inputs(path="controller_graph_final.json")
+                        root0 = set(getattr(self, "_root_sigk_interest", set()) or set())
+                        rebuilt = set(compiled0 or set()) | set(root0 or set())
+                        if isinstance(rebuilt, set) and rebuilt:
+                            _ii.set_announce_interest(set(rebuilt))
+                            allow = set(rebuilt)
+                except Exception:
+                    pass
+
                 deny = set(deny or set())
                 if allow is not None:
                     allow = set(allow) - deny
@@ -5102,6 +5752,36 @@ class _JoystickSideMenu:
                             button_ids=sorted(phys_btns) if phys_btns else [],
                             hat_ids=sorted(hat_ids) if hat_ids else [],
                         )
+
+                        # Debug-only: also poll *all* physical buttons so we can see
+                        # what the device is actually reporting (helps align config
+                        # to reality without changing the controller graph behavior).
+                        try:
+                            if _DBG_HOOKS:
+                                nb = 0
+                                try:
+                                    nb = int(self.joystick.get_numbuttons())
+                                except Exception:
+                                    nb = 0
+                                if nb > 0:
+                                    _axes2, buttons_all, _hats2 = joystick_menu._poll_joystick_snapshot(
+                                        self.joystick,
+                                        axes_ids=[],
+                                        button_ids=list(range(int(nb))),
+                                        hat_ids=[],
+                                    )
+                                    # Rate-limit and only print when something is down.
+                                    if buttons_all:
+                                        t_btn = float(getattr(self, "_dbg_hooks_btn", 0.0) or 0.0)
+                                        now_btn = float(time.monotonic())
+                                        if (now_btn - t_btn) > 0.25:
+                                            setattr(self, "_dbg_hooks_btn", now_btn)
+                                            wanted = sorted(phys_btns) if phys_btns else []
+                                            down = sorted(set(buttons_all or set()))
+                                            extra = [b for b in down if b not in set(wanted)]
+                                            print(f"[dbg] joy_buttons_down={down} wanted={wanted} extra={extra}")
+                        except Exception:
+                            pass
                 except Exception:
                     axes_now, buttons_now, hats_now = {}, set(), {}
 
@@ -5158,6 +5838,27 @@ class _JoystickSideMenu:
                 if b_evs:
                     arrb_t = GP_InputEvent * len(b_evs)
                     self._sigk.gp_sigk_push_events(arrb_t(*b_evs), int(len(b_evs)))
+                    # Update prev after successful push.
+                    try:
+                        self._sigk_buttons_prev = set(buttons_now or set())
+                    except Exception:
+                        pass
+                    try:
+                        if _DBG_HOOKS:
+                            t_pb = float(getattr(self, "_dbg_push_btn", 0.0) or 0.0)
+                            now_pb = float(time.monotonic())
+                            if (now_pb - t_pb) > 0.5:
+                                setattr(self, "_dbg_push_btn", now_pb)
+                                ids = sorted({int(getattr(e, "id", -1)) for e in b_evs})
+                                print(f"[dbg] pushed_joy_buttons={ids}")
+                    except Exception:
+                        pass
+                else:
+                    # Still keep prev in sync so future edges are correct.
+                    try:
+                        self._sigk_buttons_prev = set(buttons_now or set())
+                    except Exception:
+                        pass
 
                 # Axes each frame.
                 a_evs: list[GP_InputEvent] = []
@@ -5563,6 +6264,37 @@ class _JoystickSideMenu:
                     arrh_t = GP_InputEvent * len(h_evs)
                     self._sigk.gp_sigk_push_events(arrh_t(*h_evs), int(len(h_evs)))
 
+                # Keep hat prev state in sync.
+                try:
+                    self._sigk_hats_prev = dict(hats_now or {})
+                except Exception:
+                    pass
+
+                # Debug: verify the signal-kernel DOWN selector for menu open sources.
+                try:
+                    if _DBG_HOOKS and hasattr(self._sigk, "gp_sigk_peek_sel"):
+                        t_pk = float(getattr(self, "_dbg_peek_k", 0.0) or 0.0)
+                        now_pk = float(time.monotonic())
+                        if (now_pk - t_pk) > 1.0:
+                            setattr(self, "_dbg_peek_k", now_pk)
+                            from c_physics.signal_kernel_ctypes import GP_SignalFrame
+
+                            SIGSEL_DOWN = 2
+
+                            def _peek_down(dev: int, kind: int, iid: int) -> float:
+                                fr = GP_SignalFrame()
+                                sid = int(signal_kernel_api.compose_signal_id(int(dev), int(kind), int(iid)))
+                                ok = int(self._sigk.gp_sigk_peek_sel(int(time.monotonic_ns()), int(sid), int(SIGSEL_DOWN), ctypes.byref(fr)))
+                                if ok != 1:
+                                    return float("nan")
+                                return float(getattr(fr, "v0", 0.0))
+
+                            v_start = _peek_down(int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), 7)
+                            v_tab = _peek_down(int(signal_kernel_api.GP_DEV_KEYBOARD), int(signal_kernel_api.GP_EV_KEY), int(pygame.K_TAB))
+                            print(f"[dbg] sigk_down joy.btn7={v_start:+.1f} key.tab={v_tab:+.1f}")
+                except Exception:
+                    pass
+
                 # Backend funnel (step 2): evaluate controller graph and publish channels.
                 if bool(getattr(self, "_ctl_ready", False)) and getattr(self, "_ctl", None) is not None:
                     try:
@@ -5601,6 +6333,24 @@ class _JoystickSideMenu:
                                         pass
                                 try:
                                     self.flight_cam.controller_channels_2d = channels_2d
+                                except Exception:
+                                    pass
+
+                                # Diagnostics: show menu channel values (confirm/cancel/open + nav) once per second.
+                                try:
+                                    if _DBG_HOOKS:
+                                        t1 = float(getattr(self, "_dbg_hooks_t1", 0.0) or 0.0)
+                                        now1 = float(time.monotonic())
+                                        if (now1 - t1) > 1.0:
+                                            setattr(self, "_dbg_hooks_t1", now1)
+                                            ch6 = float(overrides_1d.get(6, 0.0))
+                                            ch7 = float(overrides_1d.get(7, 0.0))
+                                            ch8 = float(overrides_1d.get(8, 0.0))
+                                            ch9 = float(overrides_1d.get(9, 0.0))
+                                            ch10 = float(overrides_1d.get(10, 0.0))
+                                            ch11 = float(overrides_1d.get(11, 0.0))
+                                            ch12 = float(overrides_1d.get(12, 0.0))
+                                            print(f"[dbg] ctl_seq={int(seq.value)} menu_ch6..12=({ch6:+.2f},{ch7:+.2f},{ch8:+.2f},{ch9:+.2f},{ch10:+.2f},{ch11:+.2f},{ch12:+.2f})")
                                 except Exception:
                                     pass
                     except Exception:
@@ -5766,8 +6516,11 @@ class _JoystickSideMenu:
             ret_x = 0.0
             ret_y = 0.0
 
-        trig_back = _trigger_unit(float(rev_sign) * float(axes_now.get(rev_axis, float(self.axis_state.get(rev_axis, 0.0))))) if rev_axis is not None else 0.0
-        trig_fwd = _trigger_unit(float(fwd_sign) * float(axes_now.get(fwd_axis, float(self.axis_state.get(fwd_axis, 0.0))))) if fwd_axis is not None else 0.0
+        # IMPORTANT: do not fall back to legacy axis_state for throttle triggers.
+        # If an axis isn't part of the backend-pushed snapshot (announce-mode allowlist),
+        # it should not affect flight controls.
+        trig_back = _trigger_unit(float(rev_sign) * float(axes_now.get(rev_axis, 0.0))) if rev_axis is not None else 0.0
+        trig_fwd = _trigger_unit(float(fwd_sign) * float(axes_now.get(fwd_axis, 0.0))) if fwd_axis is not None else 0.0
         throttle_nudge = float(trig_fwd - trig_back)
 
         # Rates are split: craft movement uses `speed`; view uses view yaw/pitch rates.
@@ -6039,6 +6792,10 @@ class _JoystickSideMenu:
 
     def handle_event(self, event) -> None:
         if event.type == pygame.JOYAXISMOTION:
+            # Legacy axis tracking: disable while the backend controller engine is active.
+            # Flight controls should be driven from the backend funnel + controller outputs.
+            if bool(getattr(self, "_ctl_ready", False)) or bool(getattr(self, "_hook_dispatcher", None)):
+                return
             self.axis_state[event.axis] = float(event.value)
         elif event.type == pygame.JOYBUTTONDOWN:
             # When hooks are active, these are dispatched by the async backend.
@@ -6063,6 +6820,9 @@ class _JoystickSideMenu:
                 self.adjust_locked = False
 
     def poll_axes(self) -> None:
+        # Legacy axis polling: disable while the backend controller engine is active.
+        if bool(getattr(self, "_ctl_ready", False)) or bool(getattr(self, "_hook_dispatcher", None)):
+            return
         # Refresh all axes to avoid relying solely on events.
         try:
             n_axes = int(self.joystick.get_numaxes())
@@ -7391,7 +8151,14 @@ def _run_c_physics_only(
         try:
             from menu_full_overlay import MenuBufferPresenter
 
-            full_menu_presenter = MenuBufferPresenter(font=font, width=int(width), height=int(height))
+            try:
+                import menu_pages
+
+                page_registry = getattr(menu_pages, "DEFAULT_REGISTRY", None)
+            except Exception:
+                page_registry = None
+
+            full_menu_presenter = MenuBufferPresenter(font=font, width=int(width), height=int(height), page_registry=page_registry)
         except Exception:
             full_menu_presenter = None
 
@@ -7408,18 +8175,8 @@ def _run_c_physics_only(
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    running = False
-                elif menu and event.type in (pygame.JOYAXISMOTION, pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP):
-                    # Forward joystick events to the shared side-menu handler *except*
-                    # the bound menu button (handled above).
-                    if not (
-                        menu_button_c is not None
-                        and event.type in (pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP)
-                        and int(getattr(event, "button", -9999)) == int(menu_button_c)
-                    ):
-                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
-                            menu.handle_event(event)
+                # No legacy key-based program-exit hotkeys here.
+                # ESC participates in menu cancel; menu access is hook-driven.
 
             # If the window is closing, don't attempt any further GL calls.
             if not running:
@@ -9157,7 +9914,7 @@ def _run_c_physics_only(
             # Full-screen menu overlay (redraw-on-dirty buffer presenter).
             try:
                 if full_menu_presenter is not None and menu is not None:
-                    snap = getattr(menu, "full_menu_snapshot", lambda: None)()
+                    snap = getattr(menu, "overlay_snapshot", lambda: None)()
                     if snap is not None and bool(getattr(snap, "active", False)):
                         full_menu_presenter.update_if_needed(snap)
                         full_menu_presenter.draw()
@@ -12178,7 +12935,14 @@ def run(
             _mw, _mh = _surf.get_size()
         else:
             _mw, _mh = 1280, 720
-        full_menu_presenter = MenuBufferPresenter(font=font, width=int(_mw), height=int(_mh))
+        try:
+            import menu_pages
+
+            page_registry = getattr(menu_pages, "DEFAULT_REGISTRY", None)
+        except Exception:
+            page_registry = None
+
+        full_menu_presenter = MenuBufferPresenter(font=font, width=int(_mw), height=int(_mh), page_registry=page_registry)
     except Exception:
         full_menu_presenter = None
     last_render_gen = -1
@@ -12205,47 +12969,17 @@ def run(
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
-                    running = False
+                # No legacy key-based program-exit hotkeys here.
+                # ESC participates in menu cancel; menu access is hook-driven.
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                     orbit_enabled = not orbit_enabled
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_TAB:
-                    # Only toggle while flight camera is active (ship mode).
-                    try:
-                        proj_now = str(params.get("proj_mode", "pca") or "pca")
-                        if menu is not None and menu.flight_active(proj_now):
-                            flight_debug_hud_visible = not bool(flight_debug_hud_visible)
-                    except Exception:
-                        pass
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_y:
                     adaptive_dt = base_dt
                     dt_change_reason = "manual reset"
-                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
-                    # inflate the active node mass via mouse
-                    with pos_lock:
-                        if pos.shape[0] > 0:
-                            idx = node_selector_idx % pos.shape[0]
-                            mult = params.get("inflate_mult", 1.2)
-                            masses[idx] = torch.clamp(masses[idx] * mult, min=1e-6)
-                            state_masses[state_idx] = masses.detach().cpu().numpy()
-                            state_masses[1 - state_idx] = state_masses[state_idx].copy()
-                elif event.type == pygame.KEYDOWN and event.key in (pygame.K_i, pygame.K_KP_PLUS):
-                    # keyboard inflate for accessibility
-                    with pos_lock:
-                        if pos.shape[0] > 0:
-                            idx = node_selector_idx % pos.shape[0]
-                            mult = params.get("inflate_mult", 1.2)
-                            masses[idx] = torch.clamp(masses[idx] * mult, min=1e-6)
-                            state_masses[state_idx] = masses.detach().cpu().numpy()
-                            state_masses[1 - state_idx] = state_masses[state_idx].copy()
                 elif joystick and event.type == pygame.JOYAXISMOTION:
-                    if menu:
-                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
-                            menu.handle_event(event)
+                    pass
                 elif joystick and event.type == pygame.JOYBUTTONDOWN:
-                    if menu:
-                        if not bool(getattr(menu, "full_menu_active", lambda: False)()):
-                            menu.handle_event(event)
+                    pass
                     if event.button == 0:
                         # handled by menu (lock + velocity reset)
                         pass

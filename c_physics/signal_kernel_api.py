@@ -23,6 +23,28 @@ GP_EV_MOUSE_MOTION = 5
 GP_EV_MOUSE_BUTTON = 6
 GP_EV_MOUSE_WHEEL = 7
 
+# Virtual (backend-owned) signal IDs
+#
+# The controller engine can synthesize button-like signals into the kernel.
+# We reserve a high, non-physical button id range for timers.
+TIMER_VIRTUAL_BUTTON_BASE = 60000
+
+
+def compose_timer_signal_id(timer_id: int) -> int:
+    """Return a stable signal_id for a backend timer.
+
+    Timers are represented as virtual joystick buttons with IDs:
+    TIMER_VIRTUAL_BUTTON_BASE + timer_id.
+    """
+
+    tid = int(timer_id)
+    if tid < 0:
+        return 0
+    item_id = int(TIMER_VIRTUAL_BUTTON_BASE) + tid
+    if item_id > 0xFFFF:
+        return 0
+    return compose_signal_id(int(GP_DEV_JOYSTICK), int(GP_EV_BUTTON), int(item_id))
+
 
 def compose_signal_id(device: int, kind: int, item_id: int) -> int:
     """Compose a stable 32-bit signal_id matching the C kernel."""

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
@@ -21,10 +24,40 @@ from c_physics.controller_engine_ctypes import (
 from c_physics import signal_kernel_api
 
 
+_DBG_HOOKS = str(os.environ.get("SOC_DEBUG_HOOKS", "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dbg_print(msg: str) -> None:
+    if not _DBG_HOOKS:
+        return
+    try:
+        print(f"[hooks] {msg}")
+    except Exception:
+        pass
+
+
+class _Rate:
+    def __init__(self, period_s: float = 1.0) -> None:
+        self._period_s = float(period_s)
+        self._t_next = 0.0
+
+    def ok(self) -> bool:
+        now = float(time.monotonic())
+        if now < float(self._t_next):
+            return False
+        self._t_next = now + float(self._period_s)
+        return True
+
+
 @dataclass(frozen=True)
 class HookBinding:
     action: str
     source: str = "signal"  # signal|channel
+    # Logical listener origin for focus/idle gating (see input_interest).
+    # Empty => always deliver (UI/global actions).
+    origin: str = ""
+    # If True, this action may fire even when its origin is background.
+    allow_background: bool = False
     # Channel source
     channel: int = 0
     comp: int = 0
@@ -56,6 +89,22 @@ def _edge_to_flags(edge: str) -> int:
         elif t in ("level", "held", "hold"):
             flags |= int(GP_CTL_HOOK_LEVEL)
     return int(flags) if flags else int(GP_CTL_HOOK_ON_RISE)
+
+
+def _edge_tokens(edge: str) -> set[str]:
+    e = str(edge).strip().lower()
+    if not e:
+        return {"rise"}
+    toks = [t.strip() for t in e.replace("|", "+").replace(",", "+").split("+") if t.strip()]
+    out: set[str] = set()
+    for t in (toks or [e]):
+        if t in ("rise", "on_rise", "up"):
+            out.add("rise")
+        elif t in ("fall", "on_fall", "down"):
+            out.add("fall")
+        elif t in ("level", "held", "hold"):
+            out.add("level")
+    return out or {"rise"}
 
 
 def _dir_to_hat_btn_idx(x: int, y: int) -> int | None:
@@ -168,6 +217,7 @@ def load_hook_bindings_from_cfg(cfg: dict[str, Any]) -> list[HookBinding]:
                 HookBinding(
                     action=f"camera_{key}",
                     source="signal",
+                    origin="flight",
                     device=int(dev),
                     kind=int(kind),
                     item_id=int(item_id),
@@ -191,6 +241,7 @@ def load_hook_bindings_from_cfg(cfg: dict[str, Any]) -> list[HookBinding]:
                 HookBinding(
                     action=f"weapons_{key}",
                     source="signal",
+                    origin="flight",
                     device=int(dev),
                     kind=int(kind),
                     item_id=int(item_id),
@@ -212,6 +263,8 @@ def load_hook_bindings_from_cfg(cfg: dict[str, Any]) -> list[HookBinding]:
                 HookBinding(
                     action="menu_open",
                     source="signal",
+                    origin="",
+                    allow_background=True,
                     device=int(signal_kernel_api.GP_DEV_JOYSTICK),
                     kind=int(signal_kernel_api.GP_EV_BUTTON),
                     item_id=int(menu_btn),
@@ -380,6 +433,8 @@ class HookEventPump:
         def _run() -> None:
             last_seen = int(self._last_seq)
             ev = GP_CtlHookEvent()
+            rate = _Rate(1.0)
+            seen = 0
             while not self._stop.is_set():
                 out_seq = ctypes.c_uint64(0)
                 rc = int(self._ctl.gp_ctl_hookq_wait(last_seen, int(poll_timeout_ms), ctypes.byref(out_seq)))
@@ -389,7 +444,10 @@ class HookEventPump:
                         if int(self._ctl.gp_ctl_hookq_peek_seq(int(s), ctypes.byref(ev))) != 1:
                             break
                         on_event(int(s), ev)
+                        seen += 1
                     last_seen = new_seq
+                    if _DBG_HOOKS and rate.ok():
+                        _dbg_print(f"hookq seq={last_seen} events_seen~{seen}")
                 else:
                     # Stay responsive to stop requests.
                     continue
@@ -439,6 +497,9 @@ class WheelHotPump:
             idx_buf = arr_t()
             out_n = ctypes.c_uint32(0)
 
+            rate = _Rate(1.0)
+            hot_seen = 0
+
             while not self._stop.is_set():
                 out_tick = ctypes.c_uint64(0)
                 rc = int(self._ctl.gp_ctl_wheel_wait(int(last_seen), int(poll_timeout_ms), ctypes.byref(out_tick)))
@@ -454,6 +515,10 @@ class WheelHotPump:
                 n = int(out_n.value)
                 for i in range(n):
                     on_hot(int(idx_buf[i]))
+                    hot_seen += 1
+
+                if _DBG_HOOKS and n and rate.ok():
+                    _dbg_print(f"wheel tick_seq={last_seen} hot_n={n} hot_seen~{hot_seen}")
 
             self._last_tick_seq = last_seen
 
@@ -471,17 +536,42 @@ class WheelHotPump:
 class HookBindingDispatcher:
     """Registers hook watches and dispatches named actions onto the main thread."""
 
-    def __init__(self, ctl_lib) -> None:
+    def __init__(self, ctl_lib, sigk_lib: Any | None = None) -> None:
         self._ctl = ctl_lib
+        self._sigk = sigk_lib
+
+        # Dispatch mode:
+        # - live: no waiting/pumps; sample current C buffers on demand (tearing ok).
+        # - pump: background pumps wait/drain hook queue + wheel hot indices.
+        self._mode = str(os.environ.get("SOC_HOOKS_MODE", "live") or "live").strip().lower()
+        if self._mode not in ("live", "pump"):
+            self._mode = "live"
+
         self._pump = HookEventPump(ctl_lib)
         self._wheel_pump = WheelHotPump(ctl_lib)
         self._lock = threading.Lock()
-        self._pending: list[tuple[str, GP_CtlHookEvent]] = []
+        # Bounded pending queue to avoid unmanageable control latency if the main
+        # thread stalls (e.g. heavy render / debug printing). Oldest events drop.
+        try:
+            cap = int(os.environ.get("SOC_HOOK_MAX_PENDING", "512") or "512")
+        except Exception:
+            cap = 512
+        self._pending: deque[tuple[str, GP_CtlHookEvent]] = deque(maxlen=max(64, int(cap)))
         self._hook_id_to_action: dict[int, str] = {}
         self._action_dispatch: dict[str, str] = {}
+        self._action_origin: dict[str, str] = {}
+        self._action_allow_bg: dict[str, bool] = {}
 
-        # Wheel mapping: packed scalar index -> list[(action, dispatch, channel, comp)]
-        self._wheel_idx_to_actions: dict[int, list[tuple[str, str, int, int]]] = {}
+        # Live-mode signal bindings: (action, dispatch, signal_id, sigsel, edge, thr, hys)
+        self._sig_id_to_actions: dict[int, list[tuple[str, str, int, str, float, float]]] = {}
+        # Per-binding Schmitt state for live-mode signal-gated actions.
+        self._sig_gate: dict[tuple[int, str], bool] = {}
+
+        # Wheel mapping: packed scalar index -> list[(action, dispatch, channel, comp, edge, thr, hys)]
+        self._wheel_idx_to_actions: dict[int, list[tuple[str, str, int, int, str, float, float]]] = {}
+        # Per-binding Schmitt state for wheel-gated channel actions.
+        # Keyed by (sig_idx, action, channel, comp)
+        self._wheel_gate: dict[tuple[int, str, int, int], bool] = {}
         self._wheel_sample = GP_WheelSample()
         self._wheel_ws = ctypes.c_uint64(0)
 
@@ -510,13 +600,31 @@ class HookBindingDispatcher:
         return out
 
     def register(self, bindings: Iterable[HookBinding]) -> None:
-        self._ctl.gp_ctl_hooks_clear()
+        # In pump-mode we register C hook watches; in live-mode we do not.
+        try:
+            if self._mode == "pump":
+                self._ctl.gp_ctl_hooks_clear()
+        except Exception:
+            pass
         self._hook_id_to_action.clear()
         self._action_dispatch.clear()
+        self._action_origin.clear()
+        self._action_allow_bg.clear()
         self._wheel_idx_to_actions.clear()
+        self._wheel_gate.clear()
+        self._sig_id_to_actions.clear()
+        self._sig_gate.clear()
 
         wheel_ok = self._wheel_available()
         ch_map = self._build_channel_comp_to_signal_idx() if wheel_ok else {}
+
+        if _DBG_HOOKS:
+            b_list = list(bindings)
+            n_sig = sum(1 for b in b_list if str(getattr(b, "source", "channel") or "channel").strip().lower() == "signal")
+            n_ch = len(b_list) - n_sig
+            _dbg_print(f"register bindings={len(b_list)} signal={n_sig} channel={n_ch} wheel_ok={wheel_ok} ch_map={len(ch_map)}")
+            # Put the iterator back.
+            bindings = b_list
 
         next_hook_id = 1
         for b in bindings:
@@ -527,49 +635,103 @@ class HookBindingDispatcher:
             hid = int(next_hook_id)
             next_hook_id += 1
 
+            act = str(getattr(b, "action", "") or "").strip()
+            origin = str(getattr(b, "origin", "") or "").strip()
+            allow_bg = bool(getattr(b, "allow_background", False))
+            if act:
+                self._action_origin[act] = origin
+                self._action_allow_bg[act] = bool(allow_bg)
+
             flags = int(_edge_to_flags(b.edge))
             if str(getattr(b, "source", "channel") or "channel").strip().lower() == "signal":
-                flags |= int(GP_CTL_HOOK_SRC_SIGNAL)
-                sid = signal_kernel_api.compose_signal_id(int(b.device), int(b.kind), int(b.item_id))
-                w = GP_CtlHookWatch(
-                    hook_id=hid,
-                    channel=0,
-                    comp=0,
-                    flags=int(flags),
-                    threshold=float(b.threshold),
-                    hysteresis=float(b.hysteresis),
-                    signal_id=int(sid),
-                    sigsel=int(b.sigsel),
-                )
-                self._ctl.gp_ctl_hooks_add(ctypes.byref(w))
-                self._hook_id_to_action[int(hid)] = str(b.action)
-                self._action_dispatch[str(b.action)] = str(disp)
-            else:
-                # Prefer the wheel path for channel bindings if available.
-                sig_idx = ch_map.get((int(b.channel), int(b.comp))) if wheel_ok else None
-                if sig_idx is not None:
-                    self._wheel_idx_to_actions.setdefault(int(sig_idx), []).append((str(b.action), str(disp), int(b.channel), int(b.comp)))
-                    self._action_dispatch[str(b.action)] = str(disp)
-                else:
-                    # Fallback: use hook watches on controller outputs.
+                sid = int(signal_kernel_api.compose_signal_id(int(b.device), int(b.kind), int(b.item_id)))
+                if self._mode == "pump":
+                    flags |= int(GP_CTL_HOOK_SRC_SIGNAL)
                     w = GP_CtlHookWatch(
                         hook_id=hid,
-                        channel=int(b.channel),
-                        comp=int(b.comp),
+                        channel=0,
+                        comp=0,
                         flags=int(flags),
                         threshold=float(b.threshold),
                         hysteresis=float(b.hysteresis),
-                        signal_id=0,
-                        sigsel=0,
+                        signal_id=int(sid),
+                        sigsel=int(b.sigsel),
                     )
                     self._ctl.gp_ctl_hooks_add(ctypes.byref(w))
                     self._hook_id_to_action[int(hid)] = str(b.action)
                     self._action_dispatch[str(b.action)] = str(disp)
+                else:
+                    # Live mode: sample kernel selector directly per frame.
+                    self._sig_id_to_actions.setdefault(int(sid), []).append(
+                        (str(b.action), str(disp), int(b.sigsel), str(b.edge), float(b.threshold), float(b.hysteresis))
+                    )
+                    self._action_dispatch[str(b.action)] = str(disp)
+            else:
+                # Prefer the wheel path for channel bindings if available.
+                sig_idx = ch_map.get((int(b.channel), int(b.comp))) if wheel_ok else None
+                if sig_idx is not None:
+                    self._wheel_idx_to_actions.setdefault(int(sig_idx), []).append(
+                        (
+                            str(b.action),
+                            str(disp),
+                            int(b.channel),
+                            int(b.comp),
+                            str(b.edge),
+                            float(b.threshold),
+                            float(b.hysteresis),
+                        )
+                    )
+                    self._action_dispatch[str(b.action)] = str(disp)
+                else:
+                    # Fallback: use hook watches on controller outputs.
+                    if self._mode == "pump":
+                        w = GP_CtlHookWatch(
+                            hook_id=hid,
+                            channel=int(b.channel),
+                            comp=int(b.comp),
+                            flags=int(flags),
+                            threshold=float(b.threshold),
+                            hysteresis=float(b.hysteresis),
+                            signal_id=0,
+                            sigsel=0,
+                        )
+                        self._ctl.gp_ctl_hooks_add(ctypes.byref(w))
+                        self._hook_id_to_action[int(hid)] = str(b.action)
+                        self._action_dispatch[str(b.action)] = str(disp)
 
-    def start(self, *, handlers: dict[str, Callable[[GP_CtlHookEvent], None]], poll_timeout_ms: int = 50) -> None:
+    def _should_deliver_action(self, action: str) -> bool:
+        """Return True if this action should be interpreted/dispatched now."""
+
+        a = str(action or "").strip()
+        if not a:
+            return False
+        origin = str(self._action_origin.get(a, "") or "").strip()
+        if not origin:
+            return True
+        try:
+            import input_interest
+
+            st = str(input_interest.get_origin_state(origin) or "").strip().lower()
+            if st == "off":
+                return False
+            if st == "foreground":
+                return True
+            # background
+            return bool(self._action_allow_bg.get(a, False))
+        except Exception:
+            # If focus system isn't available, be permissive.
+            return True
+
+    def start(self, *, handlers: dict[str, Callable[[GP_CtlHookEvent], None]], poll_timeout_ms: int = 5) -> None:
+        # Live mode: no background waiters. We will sample in drain().
+        if self._mode == "live":
+            return
+
         def _on_event(_seq: int, ev: GP_CtlHookEvent) -> None:
             action = self._hook_id_to_action.get(int(ev.hook_id))
             if not action:
+                return
+            if not self._should_deliver_action(str(action)):
                 return
             disp = str(self._action_dispatch.get(str(action), "main") or "main").strip().lower()
             fn = handlers.get(str(action))
@@ -594,6 +756,8 @@ class HookBindingDispatcher:
         # Start the wheel pump (for channel bindings, if any).
         if self._wheel_idx_to_actions and self._wheel_available():
 
+            rate_hot = _Rate(0.25)
+
             def _on_hot(sig_idx: int) -> None:
                 items = self._wheel_idx_to_actions.get(int(sig_idx))
                 if not items:
@@ -609,7 +773,40 @@ class HookBindingDispatcher:
                 except Exception:
                     pass
 
-                for action, disp, ch, comp in list(items):
+                for action, disp, ch, comp, edge, thr, hys in list(items):
+                    # Apply edge/threshold/hysteresis gating in Python for wheel-bound channels.
+                    # This makes channel bindings match hook semantics (rise/fall/level).
+                    fired = False
+                    try:
+                        key = (int(sig_idx), str(action), int(ch), int(comp))
+                        prev_on = bool(self._wheel_gate.get(key, False))
+                        on = bool(prev_on)
+                        t = float(thr)
+                        h = float(hys)
+                        if on:
+                            if v <= (t - h):
+                                on = False
+                        else:
+                            if v >= t:
+                                on = True
+                        self._wheel_gate[key] = bool(on)
+
+                        edges = _edge_tokens(edge)
+                        if ("rise" in edges) and (not prev_on) and on:
+                            fired = True
+                        if ("fall" in edges) and prev_on and (not on):
+                            fired = True
+                        if ("level" in edges) and on:
+                            fired = True
+                    except Exception:
+                        # Conservative fallback: if gating fails, do nothing.
+                        fired = False
+
+                    if not fired:
+                        continue
+
+                    if _DBG_HOOKS and rate_hot.ok() and str(action).startswith("menu_"):
+                        _dbg_print(f"menu_hot action={action} ch={ch}.{comp} v={v:+.3f}")
                     fn = handlers.get(str(action))
                     if fn is None:
                         continue
@@ -633,18 +830,234 @@ class HookBindingDispatcher:
 
             self._wheel_pump.start(on_hot=_on_hot, poll_timeout_ms=int(poll_timeout_ms))
 
-    def drain(self, *, handlers: dict[str, Callable[[GP_CtlHookEvent], None]]) -> int:
+    def _live_fire_channel_actions(
+        self,
+        *,
+        handlers: dict[str, Callable[[GP_CtlHookEvent], None]],
+        max_events: int,
+        t_deadline: float | None,
+    ) -> int:
+        fired_n = 0
+        # Sample each mapped scalar index once per drain.
+        for sig_idx, items in list(self._wheel_idx_to_actions.items()):
+            if fired_n >= int(max_events):
+                break
+            if t_deadline is not None and float(time.monotonic()) >= float(t_deadline):
+                break
+            # Skip any expensive sampling if no actions are eligible.
+            if not any(self._should_deliver_action(str(a)) for (a, _disp, _ch, _comp, _edge, _thr, _hys) in list(items)):
+                continue
+
+            t_ns = 0
+            v = 0.0
+            try:
+                self._wheel_ws.value = 0
+                if int(self._ctl.gp_ctl_wheel_peek_latest(int(sig_idx), ctypes.byref(self._wheel_sample), ctypes.byref(self._wheel_ws))) == 1:
+                    t_ns = int(getattr(self._wheel_sample, "t_ns", 0))
+                    v = float(getattr(self._wheel_sample, "value", 0.0))
+            except Exception:
+                continue
+
+            for action, disp, ch, comp, edge, thr, hys in list(items):
+                if not self._should_deliver_action(str(action)):
+                    continue
+                if fired_n >= int(max_events):
+                    break
+                if t_deadline is not None and float(time.monotonic()) >= float(t_deadline):
+                    break
+
+                fired = False
+                try:
+                    key = (int(sig_idx), str(action), int(ch), int(comp))
+                    prev_on = bool(self._wheel_gate.get(key, False))
+                    on = bool(prev_on)
+                    t = float(thr)
+                    h = float(hys)
+                    if on:
+                        if v <= (t - h):
+                            on = False
+                    else:
+                        if v >= t:
+                            on = True
+                    self._wheel_gate[key] = bool(on)
+
+                    edges = _edge_tokens(edge)
+                    if ("rise" in edges) and (not prev_on) and on:
+                        fired = True
+                    if ("fall" in edges) and prev_on and (not on):
+                        fired = True
+                    if ("level" in edges) and on:
+                        fired = True
+                except Exception:
+                    fired = False
+
+                if not fired:
+                    continue
+
+                fn = handlers.get(str(action))
+                if fn is None:
+                    continue
+                ev = GP_CtlHookEvent(
+                    t_ns=int(t_ns),
+                    hook_id=0,
+                    channel=int(ch),
+                    comp=int(comp),
+                    flags=0,
+                    value=float(v),
+                    _pad0=0.0,
+                )
+                try:
+                    fn(ev)
+                except Exception:
+                    pass
+                fired_n += 1
+        return int(fired_n)
+
+    def _live_fire_signal_actions(
+        self,
+        *,
+        now_ns: int,
+        handlers: dict[str, Callable[[GP_CtlHookEvent], None]],
+        max_events: int,
+        t_deadline: float | None,
+    ) -> int:
+        fired_n = 0
+        if self._sigk is None or not hasattr(self._sigk, "gp_sigk_peek_sel"):
+            return 0
+
+        # Import lazily to keep hot-path imports local.
+        try:
+            from c_physics.signal_kernel_ctypes import GP_SignalFrame
+        except Exception:
+            return 0
+
+        for sid, items in list(self._sig_id_to_actions.items()):
+            if fired_n >= int(max_events):
+                break
+            if t_deadline is not None and float(time.monotonic()) >= float(t_deadline):
+                break
+
+            if not any(self._should_deliver_action(str(a)) for (a, _disp, _sigsel, _edge, _thr, _hys) in list(items)):
+                continue
+
+            for action, _disp, sigsel, edge, thr, hys in list(items):
+                if not self._should_deliver_action(str(action)):
+                    continue
+                if fired_n >= int(max_events):
+                    break
+                if t_deadline is not None and float(time.monotonic()) >= float(t_deadline):
+                    break
+                fr = GP_SignalFrame()
+                ok = 0
+                try:
+                    ok = int(self._sigk.gp_sigk_peek_sel(int(now_ns), int(sid), int(sigsel), ctypes.byref(fr)))
+                except Exception:
+                    ok = 0
+                if ok != 1:
+                    continue
+                v = float(getattr(fr, "v0", 0.0))
+
+                fired = False
+                try:
+                    key = (int(sid), str(action))
+                    prev_on = bool(self._sig_gate.get(key, False))
+                    on = bool(prev_on)
+                    t = float(thr)
+                    h = float(hys)
+                    if on:
+                        if v <= (t - h):
+                            on = False
+                    else:
+                        if v >= t:
+                            on = True
+                    self._sig_gate[key] = bool(on)
+
+                    edges = _edge_tokens(edge)
+                    if ("rise" in edges) and (not prev_on) and on:
+                        fired = True
+                    if ("fall" in edges) and prev_on and (not on):
+                        fired = True
+                    if ("level" in edges) and on:
+                        fired = True
+                except Exception:
+                    fired = False
+
+                if not fired:
+                    continue
+
+                fn = handlers.get(str(action))
+                if fn is None:
+                    continue
+                ev = GP_CtlHookEvent(
+                    t_ns=int(now_ns),
+                    hook_id=0,
+                    channel=0,
+                    comp=0,
+                    flags=0,
+                    value=float(v),
+                    _pad0=0.0,
+                )
+                try:
+                    fn(ev)
+                except Exception:
+                    pass
+                fired_n += 1
+
+        return int(fired_n)
+
+    def drain(
+        self,
+        *,
+        handlers: dict[str, Callable[[GP_CtlHookEvent], None]],
+        max_events: int | None = None,
+        max_time_ms: float | None = None,
+        now_ns: int | None = None,
+    ) -> int:
         """Run pending actions on the caller thread.
 
         Returns number of dispatched events.
         """
 
-        with self._lock:
-            items = list(self._pending)
-            self._pending.clear()
+        if max_events is None:
+            try:
+                max_events = int(os.environ.get("SOC_HOOK_DRAIN_MAX", "128") or "128")
+            except Exception:
+                max_events = 128
+        max_events = max(1, int(max_events))
+
+        t_deadline = None
+        if max_time_ms is not None:
+            try:
+                t_deadline = float(time.monotonic()) + (float(max_time_ms) * 0.001)
+            except Exception:
+                t_deadline = None
+
+        if self._mode == "live":
+            if now_ns is None:
+                now_ns = int(time.monotonic_ns())
+            n_live = 0
+            # Fire channel-derived actions (controller outputs).
+            try:
+                n_live += self._live_fire_channel_actions(handlers=handlers, max_events=int(max_events), t_deadline=t_deadline)
+            except Exception:
+                pass
+            # Fire signal-derived actions (kernel selectors).
+            try:
+                if n_live < int(max_events):
+                    n_live += self._live_fire_signal_actions(now_ns=int(now_ns), handlers=handlers, max_events=int(max_events - n_live), t_deadline=t_deadline)
+            except Exception:
+                pass
+            return int(n_live)
 
         n = 0
-        for action, ev in items:
+        while n < int(max_events):
+            if t_deadline is not None and float(time.monotonic()) >= float(t_deadline):
+                break
+            with self._lock:
+                if not self._pending:
+                    break
+                action, ev = self._pending.popleft()
+
             fn = handlers.get(str(action))
             if fn is None:
                 continue
@@ -653,8 +1066,44 @@ class HookBindingDispatcher:
             except Exception:
                 pass
             n += 1
-        return n
+        return int(n)
 
     def stop(self) -> None:
         self._wheel_pump.stop()
         self._pump.stop()
+
+
+def get_root_ui_interest(cfg: dict[str, Any]) -> set[tuple[int, int, int]]:
+    """Return a minimal, always-needed input interest set for the canonical menu system.
+
+    This provides a "system root listening set" so the user can always
+    open/navigate the menu even if compiled graphs are missing or other
+    bindings fail to load.
+
+    Output items are (device, kind, item_id) numeric codes.
+    """
+
+    out: set[tuple[int, int, int]] = set()
+    try:
+        from c_physics import signal_kernel_api
+
+        # menu button
+        try:
+            menu_btn = int(cfg.get("menu_button", -1))
+        except Exception:
+            menu_btn = -1
+        if int(menu_btn) >= 0:
+            out.add((int(signal_kernel_api.GP_DEV_JOYSTICK), int(signal_kernel_api.GP_EV_BUTTON), int(menu_btn)))
+
+        # menu nav
+        nav = cfg.get("menu_nav") if isinstance(cfg.get("menu_nav"), dict) else {}
+        for k in ("confirm", "cancel", "up", "down", "left", "right"):
+            b = nav.get(k)
+            spec = _binding_to_signal_watch(b) if isinstance(b, dict) else None
+            if spec is None:
+                continue
+            dev, kind, item_id, _sigsel = spec
+            out.add((int(dev), int(kind), int(item_id)))
+    except Exception:
+        return set(out)
+    return set(out)
