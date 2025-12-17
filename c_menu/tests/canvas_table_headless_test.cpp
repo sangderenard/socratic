@@ -127,7 +127,8 @@ int control_bar_y_center() {
     return 4 + 20 / 2;
 }
 
-int count_nonzero(const std::vector<uint8_t>& buf, int w, int h, int x0, int y0, int x1, int y1) {
+int count_diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b, int w, int h, int x0, int y0, int x1, int y1) {
+    if (a.size() != b.size()) return -1;
     int x_start = std::max(0, std::min(x0, x1));
     int x_end = std::min(w, std::max(x0, x1));
     int y_start = std::max(0, std::min(y0, y1));
@@ -136,12 +137,71 @@ int count_nonzero(const std::vector<uint8_t>& buf, int w, int h, int x0, int y0,
     for (int y = y_start; y < y_end; ++y) {
         for (int x = x_start; x < x_end; ++x) {
             size_t idx = static_cast<size_t>(y * w + x) * 4;
-            if (idx + 3 < buf.size()) {
-                if (buf[idx + 0] || buf[idx + 1] || buf[idx + 2] || buf[idx + 3]) ++count;
+            if (idx + 3 < a.size()) {
+                if (a[idx + 0] != b[idx + 0] || a[idx + 1] != b[idx + 1] || a[idx + 2] != b[idx + 2] || a[idx + 3] != b[idx + 3]) {
+                    ++count;
+                }
             }
         }
     }
     return count;
+}
+
+std::optional<GP_TableHitBox> table_hit_at_point(GP_TableContext* t, int w, int h, int lx, int ly) {
+    if (!t || w <= 0 || h <= 0) return std::nullopt;
+    GP_TableGeom geom{};
+    gp_table_get_geom(t, &geom);
+    geom.width_px = w;
+    geom.height_px = h;
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+    const int cap = 512;
+    std::vector<GP_TableHitBox> hits(cap);
+    int written = 0;
+    int ok = gp_table_render_rgba_with_state(t, nullptr, rgba.data(), static_cast<int32_t>(rgba.size()), &geom, hits.data(), cap, &written);
+    if (!ok || written <= 0) return std::nullopt;
+    for (int i = 0; i < written; ++i) {
+        const auto& hb = hits[i];
+        if (lx >= hb.x0 && lx < hb.x1 && ly >= hb.y0 && ly < hb.y1) return hb;
+    }
+    return std::nullopt;
+}
+
+bool is_led_part(int part) {
+    return part == GP_TABLE_HIT_LED || part == GP_TABLE_HIT_LED_ARG || part == GP_TABLE_HIT_LED_TABLE;
+}
+
+struct LedHit {
+    int idx = -1;
+    int cx = 0;
+    int cy = 0;
+    int aux1 = 0;
+    int part = 0;
+    int col = 0;
+};
+
+std::vector<LedHit> list_led_hits(GP_TableContext* t, bool left_column, int w, int h) {
+    std::vector<LedHit> hits_out;
+    if (!t || w <= 0 || h <= 0) return hits_out;
+    GP_TableGeom geom{};
+    gp_table_get_geom(t, &geom);
+    geom.width_px = w;
+    geom.height_px = h;
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+    const int cap = 512;
+    std::vector<GP_TableHitBox> hits(cap);
+    int written = 0;
+    int ok = gp_table_render_rgba_with_state(t, nullptr, rgba.data(), static_cast<int32_t>(rgba.size()), &geom, hits.data(), cap, &written);
+    if (!ok || written <= 0) return hits_out;
+    for (int i = 0; i < written; ++i) {
+        const auto& hb = hits[i];
+        if (!is_led_part(hb.part)) continue;
+        bool is_left = (hb.col_idx == 0);
+        if (is_left != left_column) continue;
+        int cx = (hb.x0 + hb.x1) / 2;
+        int cy = (hb.y0 + hb.y1) / 2;
+        hits_out.push_back(LedHit{hb.aux0, cx, cy, hb.aux1, hb.part, hb.col_idx});
+    }
+    return hits_out;
 }
 
 struct IOButtons {
@@ -179,7 +239,9 @@ IOButtons compute_io_buttons(int canvas_width) {
 } // namespace
 
 int main() {
-    GP_CanvasContext* canvas = gp_canvas_create(800, 600);
+    const int canvas_w = 800;
+    const int canvas_h = 600;
+    GP_CanvasContext* canvas = gp_canvas_create(canvas_w, canvas_h);
     if (!canvas) {
         std::cerr << "Failed to create canvas\n";
         return 1;
@@ -203,6 +265,7 @@ int main() {
     gp_canvas_move_module(canvas, 1, modules[1].x, modules[1].y);
 
     // Replace auto-created tables with deterministic 3-LED tables.
+    std::vector<GP_TableContext*> attached_tables;
     for (int mi = 0; mi < 2; ++mi) {
         gp_canvas_destroy_table(canvas, mi);
         GP_TableContext* t = make_three_led_table();
@@ -211,10 +274,18 @@ int main() {
             return 1;
         }
         gp_canvas_attach_table(canvas, mi, t, 1);
+        attached_tables.push_back(t);
+        auto pre_left = list_led_hits(t, true, modules[mi].w, modules[mi].h);
+        auto pre_right = list_led_hits(t, false, modules[mi].w, modules[mi].h);
+        std::cerr << "Module " << mi << " initial left hits: ";
+        for (const auto& h : pre_left) std::cerr << h.idx << "{" << h.aux1 << "," << h.part << "," << h.col << "}@(" << h.cx << "," << h.cy << ") ";
+        std::cerr << " right hits: ";
+        for (const auto& h : pre_right) std::cerr << h.idx << "{" << h.aux1 << "," << h.part << "," << h.col << "}@(" << h.cx << "," << h.cy << ") ";
+        std::cerr << "\n";
     }
 
     // Bump IO counters to 3 via synthetic control-bar clicks for each module.
-    IOButtons io_btns = compute_io_buttons(800);
+    IOButtons io_btns = compute_io_buttons(canvas_w);
     for (int mi = 0; mi < 2; ++mi) {
         // Focus module.
         const auto& m = modules[mi];
@@ -225,24 +296,42 @@ int main() {
         }
     }
 
-    // Locate LED centers (layout is deterministic) and click through the canvas.
-    GP_TableContext* table_layout = make_three_led_table();
-    if (!table_layout) {
-        std::cerr << "Failed to create layout table\n";
+    std::vector<uint8_t> rgba_before_edges(static_cast<size_t>(canvas_w) * canvas_h * 4);
+    if (!gp_canvas_raster_rgba(canvas, rgba_before_edges.data(), static_cast<int32_t>(rgba_before_edges.size()))) {
+        std::cerr << "Failed to raster canvas before edge creation\n";
         return 1;
     }
+
+    // Locate LED centers (layout is deterministic) and click through the canvas.
     for (int led = 0; led < 3; ++led) {
-        auto out_local = find_led_center(table_layout, false, led, modules[0].w, modules[0].h);
-        auto in_local = find_led_center(table_layout, true, led, modules[1].w, modules[1].h);
+        auto out_local = find_led_center(attached_tables[0], false, led, modules[0].w, modules[0].h);
+        auto in_local = find_led_center(attached_tables[1], true, led, modules[1].w, modules[1].h);
         if (!out_local || !in_local) {
-            std::cerr << "Failed to locate LED " << led << "\n";
-            gp_table_destroy(table_layout);
+            std::cerr << "Failed to locate LED " << led << " (out=" << static_cast<bool>(out_local) << ", in=" << static_cast<bool>(in_local) << ")\n";
+            auto outs = list_led_hits(attached_tables[0], false, modules[0].w, modules[0].h);
+            auto ins = list_led_hits(attached_tables[1], true, modules[1].w, modules[1].h);
+            std::cerr << "Module 0 right hits: ";
+            for (const auto& h : outs) std::cerr << h.idx << "{" << h.aux1 << "," << h.part << "," << h.col << "}@(" << h.cx << "," << h.cy << ") ";
+            std::cerr << "\nModule 1 left hits: ";
+            for (const auto& h : ins) std::cerr << h.idx << "{" << h.aux1 << "," << h.part << "," << h.col << "}@(" << h.cx << "," << h.cy << ") ";
+            std::cerr << "\n";
             return 1;
         }
         int out_x = modules[0].x + out_local->first;
         int out_y = modules[0].y + out_local->second;
         int in_x = modules[1].x + in_local->first;
         int in_y = modules[1].y + in_local->second;
+        auto out_hit = table_hit_at_point(attached_tables[0], modules[0].w, modules[0].h, out_local->first, out_local->second);
+        auto in_hit = table_hit_at_point(attached_tables[1], modules[1].w, modules[1].h, in_local->first, in_local->second);
+        if (!out_hit || !is_led_part(out_hit->part)) {
+            std::cerr << "Module 0 LED " << led << " not hittable at (" << out_local->first << "," << out_local->second << ")\n";
+            return 1;
+        }
+        if (!in_hit || !is_led_part(in_hit->part)) {
+            std::cerr << "Module 1 LED " << led << " not hittable at (" << in_local->first << "," << in_local->second << ")\n";
+            return 1;
+        }
+        std::cerr << "Connecting LED " << led << " from (" << out_x << "," << out_y << ") to (" << in_x << "," << in_y << ")\n";
 
         gp_canvas_on_click(canvas, out_x, out_y);
         gp_canvas_on_click(canvas, in_x, in_y);
@@ -289,27 +378,28 @@ int main() {
     }
 
     // Rasterize and ensure edges appear visually between modules.
-    const int w = 800, h = 600;
-    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+    std::vector<uint8_t> rgba(static_cast<size_t>(canvas_w) * canvas_h * 4);
     if (!gp_canvas_raster_rgba(canvas, rgba.data(), static_cast<int32_t>(rgba.size()))) {
         std::cerr << "Failed to raster canvas\n";
         return 1;
     }
-    int edge_roi = count_nonzero(
+    int edge_roi_diff = count_diff(
+        rgba_before_edges,
         rgba,
-        w,
-        h,
+        canvas_w,
+        canvas_h,
         modules[0].x + modules[0].w,
         modules[0].y,
         modules[1].x,
         modules[0].y + modules[0].h);
-    if (edge_roi <= 0) {
-        std::cerr << "Edge pixels not found between modules\n";
+    if (edge_roi_diff <= 0) {
+        std::cerr << "Edge pixels not found between modules (diff count " << edge_roi_diff << ")\n";
         return 1;
     }
+    std::vector<uint8_t> rgba_after_edges = rgba;
 
     // Create a prospective edge and verify it animates/responds to mouse moves.
-    auto first_out = find_led_center(table_layout, false, 0, modules[0].w, modules[0].h);
+    auto first_out = find_led_center(attached_tables[0], false, 0, modules[0].w, modules[0].h);
     if (!first_out) {
         std::cerr << "Failed to find prospective start LED\n";
         return 1;
@@ -327,23 +417,29 @@ int main() {
         std::cerr << "Failed to raster canvas after prospective move 1\n";
         return 1;
     }
-    int rope_at_tgt1 = count_nonzero(rgba, w, h, tgt1_x - 20, tgt1_y - 20, tgt1_x + 20, tgt1_y + 20);
+    std::vector<uint8_t> rope_frame_move1 = rgba;
+    int rope_at_tgt1 = count_diff(rgba_after_edges, rope_frame_move1, canvas_w, canvas_h, tgt1_x - 20, tgt1_y - 20, tgt1_x + 20, tgt1_y + 20);
     gp_canvas_on_mouse_move(canvas, tgt2_x, tgt2_y);
     if (!gp_canvas_raster_rgba(canvas, rgba.data(), static_cast<int32_t>(rgba.size()))) {
         std::cerr << "Failed to raster canvas after prospective move 2\n";
         return 1;
     }
-    int rope_at_tgt2 = count_nonzero(rgba, w, h, tgt2_x - 20, tgt2_y - 20, tgt2_x + 20, tgt2_y + 20);
+    std::vector<uint8_t> rope_frame_move2 = rgba;
+    int rope_at_tgt2 = count_diff(rgba_after_edges, rope_frame_move2, canvas_w, canvas_h, tgt2_x - 20, tgt2_y - 20, tgt2_x + 20, tgt2_y + 20);
+    int rope_residual_at_tgt1 = count_diff(rgba_after_edges, rope_frame_move2, canvas_w, canvas_h, tgt1_x - 20, tgt1_y - 20, tgt1_x + 20, tgt1_y + 20);
+    int rope_shift_at_tgt1 = count_diff(rope_frame_move1, rope_frame_move2, canvas_w, canvas_h, tgt1_x - 20, tgt1_y - 20, tgt1_x + 20, tgt1_y + 20);
     if (rope_at_tgt1 <= 0 || rope_at_tgt2 <= 0) {
-        std::cerr << "Prospective rope pixels not found at expected targets\n";
+        std::cerr << "Prospective rope pixels not found at expected targets (t1=" << rope_at_tgt1 << ", t2=" << rope_at_tgt2 << ")\n";
+        return 1;
+    }
+    if (rope_shift_at_tgt1 <= 0 || rope_residual_at_tgt1 * 2 >= rope_at_tgt1) {
+        std::cerr << "Prospective rope did not relocate after mouse move (shift=" << rope_shift_at_tgt1 << ", residual=" << rope_residual_at_tgt1 << ", initial=" << rope_at_tgt1 << ")\n";
         return 1;
     }
     if (rope_at_tgt1 == rope_at_tgt2) {
-        std::cerr << "Prospective rope did not move between targets\n";
+        std::cerr << "Prospective rope did not move between targets (counts equal)\n";
         return 1;
     }
-
-    gp_table_destroy(table_layout);
 
     gp_canvas_destroy(canvas);
     std::cout << "Headless canvas/table wiring test passed\n";
