@@ -462,12 +462,20 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 std::vector<GP_TableHitBox> hits(hitcap);
                 int hits_written = 0;
                 int ok = gp_table_render_rgba_with_state(t, nullptr, tmp.data(), static_cast<int32_t>(tmp.size()), &geom, hits.data(), hitcap, &hits_written);
+                printf("gp_canvas_on_click: module=%d has_table=%d geom=%d,%d render_ok=%d hits_cap=%d hits_written=%d\n", mi, (t!=nullptr)?1:0, tw, th, ok, hitcap, hits_written);
                 if (ok && hits_written > 0) {
                     // find first hit containing local point
                     GP_TableHitBox found{}; bool found_any = false;
                     for (int hi = 0; hi < hits_written; ++hi) {
                         const GP_TableHitBox &hb = hits[hi];
                         if (lx >= hb.x0 && lx < hb.x1 && ly >= hb.y0 && ly < hb.y1) { found = hb; found_any = true; break; }
+                    }
+                    if (!found_any) {
+                        printf("gp_canvas_on_click: module=%d table_hits_present=%d but none contain (%d,%d) local\n", mi, hits_written, lx, ly);
+                        for (int hi = 0; hi < hits_written; ++hi) {
+                            const GP_TableHitBox &hb = hits[hi];
+                            printf("  hit[%d]=part=%d row=%d col=%d aux0=%d aux1=%d rect=%d,%d-%d,%d flags=0x%x\n", hi, hb.part, hb.row_idx, hb.col_idx, hb.aux0, hb.aux1, hb.x0, hb.y0, hb.x1, hb.y1, hb.flags);
+                        }
                     }
                     if (found_any) {
                         // If LED hit, handle canvas-level connection flow. In
@@ -703,7 +711,11 @@ extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
     // otherwise check for module hit to start dragging
     for (int mi = static_cast<int>(c->modules.size()) - 1; mi >= 0; --mi) {
         const auto &m = c->modules[mi];
-        if (x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h) {
+        // Only start a drag if the mouse is within a small header area at the
+        // top of the module. This prevents clicks on embedded table content or
+        // contacts from immediately initiating a window move.
+        int header_h = std::min(24, std::max(8, m.h / 6));
+        if (x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + header_h) {
             // start drag: record in per-canvas DragState
             c->drag.dragging = 1;
             c->drag.module = mi;
