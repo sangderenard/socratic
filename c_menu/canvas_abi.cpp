@@ -96,7 +96,15 @@ static void draw_blob_blend(uint8_t* img, int w, int h, int pitch, int cx, int c
     }
 }
 // Per-canvas drag state (moved into the canvas object to avoid global map)
-struct DragState { int dragging = 0; int module = -1; int offx = 0; int offy = 0; };
+struct DragState {
+    int dragging = 0;
+    int module = -1;
+    int offx = 0;
+    int offy = 0;
+    int panning = 0;
+    int pan_last_x = 0;
+    int pan_last_y = 0;
+};
 
 // Minimal internal canvas context implementation
 struct GP_CanvasContextImpl {
@@ -163,6 +171,14 @@ struct GP_CanvasContextImpl {
     std::vector<NodeContract> nodes;
     // UI control bar height (in canvas-local pixels)
     int control_bar_h = 28;
+    // viewport offset (world origin visible at (0,0) in screen space)
+    int offset_x = 0;
+    int offset_y = 0;
+    int scroll_x_needed = 0;
+    int scroll_y_needed = 0;
+    // optional table container (non-owning unless marked)
+    GP_TableContext* container_table = nullptr;
+    int container_table_owned = 0;
     // autosave parameters (path may be empty to disable)
     std::string autosave_path;
     double autosave_interval_s = 0.0;
@@ -192,6 +208,93 @@ static inline void compute_contact_pos_with_count(const GP_CanvasModuleDesc &m, 
 static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
     if (hb.part == GP_TABLE_HIT_LED_TABLE) return hb.aux1;
     return hb.aux0;
+}
+
+struct CanvasBounds {
+    int min_x = 0;
+    int max_x = 0;
+    int min_y = 0;
+    int max_y = 0;
+    bool has_any = false;
+};
+
+static CanvasBounds compute_canvas_bounds(const GP_CanvasContextImpl* ctx) {
+    CanvasBounds b;
+    if (!ctx) return b;
+    if (!ctx->modules.empty()) {
+        b.has_any = true;
+        b.min_x = ctx->modules.front().x;
+        b.max_x = ctx->modules.front().x + ctx->modules.front().w;
+        b.min_y = ctx->modules.front().y;
+        b.max_y = ctx->modules.front().y + ctx->modules.front().h;
+        for (const auto& m : ctx->modules) {
+            b.min_x = std::min(b.min_x, m.x);
+            b.max_x = std::max(b.max_x, m.x + m.w);
+            b.min_y = std::min(b.min_y, m.y);
+            b.max_y = std::max(b.max_y, m.y + m.h);
+        }
+    } else {
+        b.min_x = 0; b.max_x = ctx->width;
+        b.min_y = 0; b.max_y = ctx->height;
+    }
+    return b;
+}
+
+static void clamp_offset_to_bounds(GP_CanvasContextImpl* ctx, const CanvasBounds& b) {
+    if (!ctx) return;
+    int view_w = std::max(1, ctx->width);
+    int view_h = std::max(1, ctx->height);
+    int min_off_x = std::min(0, b.min_x);
+    int max_off_x = std::max(min_off_x, b.max_x - view_w);
+    int min_off_y = std::min(0, b.min_y);
+    int max_off_y = std::max(min_off_y, b.max_y - view_h);
+    ctx->offset_x = std::clamp(ctx->offset_x, min_off_x, max_off_x);
+    ctx->offset_y = std::clamp(ctx->offset_y, min_off_y, max_off_y);
+    ctx->scroll_x_needed = (b.min_x < ctx->offset_x) || (b.max_x > ctx->offset_x + view_w);
+    ctx->scroll_y_needed = (b.min_y < ctx->offset_y) || (b.max_y > ctx->offset_y + view_h);
+}
+
+static void sync_container_scroll(GP_CanvasContextImpl* ctx, const CanvasBounds& b) {
+    if (!ctx || !ctx->container_table) return;
+    float fx = 0.0f, fy = 0.0f;
+    // tolerate older tables that only expose vertical scroll
+    if (!gp_table_get_scroll_fraction_xy(ctx->container_table, &fx, &fy)) {
+        gp_table_get_scroll_fraction(ctx->container_table, &fy);
+        fx = 0.0f;
+    }
+    fx = std::clamp(fx, 0.0f, 1.0f);
+    fy = std::clamp(fy, 0.0f, 1.0f);
+    int view_w = std::max(1, ctx->width);
+    int view_h = std::max(1, ctx->height);
+    int min_off_x = std::min(0, b.min_x);
+    int max_off_x = std::max(min_off_x, b.max_x - view_w);
+    int min_off_y = std::min(0, b.min_y);
+    int max_off_y = std::max(min_off_y, b.max_y - view_h);
+    ctx->offset_x = min_off_x + static_cast<int>(std::lround(fx * float(max_off_x - min_off_x)));
+    ctx->offset_y = min_off_y + static_cast<int>(std::lround(fy * float(max_off_y - min_off_y)));
+    ctx->offset_x = std::clamp(ctx->offset_x, min_off_x, max_off_x);
+    ctx->offset_y = std::clamp(ctx->offset_y, min_off_y, max_off_y);
+    float out_fx = (max_off_x == min_off_x) ? 0.0f : float(ctx->offset_x - min_off_x) / float(max_off_x - min_off_x);
+    float out_fy = (max_off_y == min_off_y) ? 0.0f : float(ctx->offset_y - min_off_y) / float(max_off_y - min_off_y);
+    gp_table_set_scroll_fraction_xy(ctx->container_table, out_fx, out_fy);
+}
+
+static CanvasBounds update_canvas_scroll_state(GP_CanvasContextImpl* ctx, bool pull_from_container) {
+    CanvasBounds b = compute_canvas_bounds(ctx);
+    if (pull_from_container) sync_container_scroll(ctx, b);
+    clamp_offset_to_bounds(ctx, b);
+    if (ctx && ctx->container_table) {
+        int view_w = std::max(1, ctx->width);
+        int view_h = std::max(1, ctx->height);
+        int min_off_x = std::min(0, b.min_x);
+        int max_off_x = std::max(min_off_x, b.max_x - view_w);
+        int min_off_y = std::min(0, b.min_y);
+        int max_off_y = std::max(min_off_y, b.max_y - view_h);
+        float fx = (max_off_x == min_off_x) ? 0.0f : float(ctx->offset_x - min_off_x) / float(max_off_x - min_off_x);
+        float fy = (max_off_y == min_off_y) ? 0.0f : float(ctx->offset_y - min_off_y) / float(max_off_y - min_off_y);
+        gp_table_set_scroll_fraction_xy(ctx->container_table, fx, fy);
+    }
+    return b;
 }
 
 // Query attached table for input/output IO key counts. If table is null,
@@ -340,6 +443,9 @@ extern "C" void gp_canvas_destroy(GP_CanvasContext* ctx) {
             gp_table_destroy(c->module_tables[i]);
         }
     }
+    if (c->container_table && c->container_table_owned) {
+        gp_table_destroy(c->container_table);
+    }
     delete c;
 }
 
@@ -360,6 +466,7 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     // Populate the table's IO layout to reflect current module IO counts
     // (this will add LED_ARG cells if module_io_in_count/out_count > 0).
     sync_module_table_io_layout(c, new_idx);
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
     return new_idx;
 }
 
@@ -369,6 +476,7 @@ extern "C" int gp_canvas_move_module(GP_CanvasContext* ctx_, int module_idx, int
     if (module_idx < 0 || module_idx >= static_cast<int>(c->modules.size())) return -1;
     c->modules[module_idx].x = x;
     c->modules[module_idx].y = y;
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
     return 1;
 }
 
@@ -379,29 +487,34 @@ extern "C" int gp_canvas_add_edge_with_type(GP_CanvasContext* ctx_, const GP_Can
 extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
-    printf("gp_canvas_on_click: click %d,%d selected_module=%d selected_contact=%d selected_left=%d prospective_rope=%d\n", x, y, c->selected.module, c->selected.contact_idx, c->selected.left, c->prospective_rope_idx);
+    update_canvas_scroll_state(c, /*pull_from_container=*/true);
+    int view_x = x;
+    int view_y = y;
+    int world_x = x + c->offset_x;
+    int world_y = y + c->offset_y;
+    printf("gp_canvas_on_click: click view=%d,%d world=%d,%d selected_module=%d selected_contact=%d selected_left=%d prospective_rope=%d\n", view_x, view_y, world_x, world_y, c->selected.module, c->selected.contact_idx, c->selected.left, c->prospective_rope_idx);
     // find contact under point
     const int pick_r = 8;
     // rope bar (top-most) — adjust sim parameters
-    if (y >= 0 && y < c->rope_bar_h) {
+    if (view_y >= 0 && view_y < c->rope_bar_h) {
         // simple left/right buttons: segs +/- at left, slack +/- at right
         int bw = std::max(8, c->rope_bar_h - 8);
         int spacing = 8;
         int bx = 8;
         // segs -
-        if (x >= bx && x < bx + bw) { c->sim_segs = std::max(2, c->sim_segs - 1); printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs); return 1; }
+        if (view_x >= bx && view_x < bx + bw) { c->sim_segs = std::max(2, c->sim_segs - 1); printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs); return 1; }
         bx += bw + spacing;
         // segs +
-        if (x >= bx && x < bx + bw) { c->sim_segs = std::min(64, c->sim_segs + 1); printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs); return 1; }
+        if (view_x >= bx && view_x < bx + bw) { c->sim_segs = std::min(64, c->sim_segs + 1); printf("gp_canvas_on_click: sim_segs=%d\n", c->sim_segs); return 1; }
         // slack -
         int bx2 = c->width - 8 - bw*2 - spacing;
-        if (x >= bx2 && x < bx2 + bw) { c->sim_slack = std::max(0.0f, c->sim_slack - 0.1f); printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack); return 1; }
+        if (view_x >= bx2 && view_x < bx2 + bw) { c->sim_slack = std::max(0.0f, c->sim_slack - 0.1f); printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack); return 1; }
         // slack +
         bx2 += bw + spacing;
-        if (x >= bx2 && x < bx2 + bw) { c->sim_slack = std::min(8.0f, c->sim_slack + 0.1f); printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack); return 1; }
+        if (view_x >= bx2 && view_x < bx2 + bw) { c->sim_slack = std::min(8.0f, c->sim_slack + 0.1f); printf("gp_canvas_on_click: sim_slack=%.2f\n", c->sim_slack); return 1; }
     }
     // check control bar button regions first — buttons are canvas-local coords (shifted down by rope_bar_h)
-    if (y >= c->rope_bar_h && y < c->rope_bar_h + c->control_bar_h) {
+    if (view_y >= c->rope_bar_h && view_y < c->rope_bar_h + c->control_bar_h) {
         const int canvas_btn_count = 3;
         const int table_btn_count = 3;
         const int spacing = 12;
@@ -412,7 +525,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int bx = 8;
         for (int bi = 0; bi < canvas_btn_count; ++bi) {
             int bx_i = bx + bi * (bw + spacing);
-            if (x >= bx_i && x < bx_i + bw && y >= by && y < by + bh) {
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
                 if (c->selected_tool_canvas == bi) c->selected_tool_canvas = 0; else c->selected_tool_canvas = bi;
                 printf("gp_canvas_on_click: canvas tool %d toggled -> selected_tool_canvas=%d\n", bi, c->selected_tool_canvas);
                 return 1;
@@ -423,7 +536,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         int bx_r = std::max(8, c->width - 8 - group_width);
         for (int bi = 0; bi < table_btn_count; ++bi) {
             int bx_i = bx_r + bi * (bw + spacing);
-            if (x >= bx_i && x < bx_i + bw && y >= by && y < by + bh) {
+            if (view_x >= bx_i && view_x < bx_i + bw && view_y >= by && view_y < by + bh) {
                 if (c->selected_tool_table == bi) c->selected_tool_table = 0; else c->selected_tool_table = bi;
                 printf("gp_canvas_on_click: table tool %d toggled -> selected_tool_table=%d\n", bi, c->selected_tool_table);
                 return 1;
@@ -443,12 +556,12 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             int bx_minus_in = io_base_x - (nbw + gap + num_w + gap + nbw);
             int bx_num_in = bx_minus_in + nbw + gap;
             int bx_plus_in = bx_num_in + num_w + gap;
-            if (x >= bx_minus_in && x < bx_minus_in + nbw && y >= by && y < by + bh) {
+            if (view_x >= bx_minus_in && view_x < bx_minus_in + nbw && view_y >= by && view_y < by + bh) {
                 c->module_io_in_count[focused] = std::max(0, in_count - 1);
                 printf("gp_canvas_on_click: dec inputs for module %d -> %d\n", focused, c->module_io_in_count[focused]);
                 return 1;
             }
-            if (x >= bx_plus_in && x < bx_plus_in + nbw && y >= by && y < by + bh) {
+            if (view_x >= bx_plus_in && view_x < bx_plus_in + nbw && view_y >= by && view_y < by + bh) {
                 c->module_io_in_count[focused] = std::min(64, in_count + 1);
                 printf("gp_canvas_on_click: inc inputs for module %d -> %d\n", focused, c->module_io_in_count[focused]);
                 return 1;
@@ -458,12 +571,12 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
             int bx_minus_out = io_base_x - io_shift - (nbw + gap + num_w + gap + nbw);
             int bx_num_out = bx_minus_out + nbw + gap;
             int bx_plus_out = bx_num_out + num_w + gap;
-            if (x >= bx_minus_out && x < bx_minus_out + nbw && y >= by && y < by + bh) {
+            if (view_x >= bx_minus_out && view_x < bx_minus_out + nbw && view_y >= by && view_y < by + bh) {
                 c->module_io_out_count[focused] = std::max(0, out_count - 1);
                 printf("gp_canvas_on_click: dec outputs for module %d -> %d\n", focused, c->module_io_out_count[focused]);
                 return 1;
             }
-            if (x >= bx_plus_out && x < bx_plus_out + nbw && y >= by && y < by + bh) {
+            if (view_x >= bx_plus_out && view_x < bx_plus_out + nbw && view_y >= by && view_y < by + bh) {
                 c->module_io_out_count[focused] = std::min(64, out_count + 1);
                 printf("gp_canvas_on_click: inc outputs for module %d -> %d\n", focused, c->module_io_out_count[focused]);
                 return 1;
@@ -477,14 +590,14 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         // map that hit into the canvas contact selection/rope creation flow
         // so clicks target the actual LED cells rendered by the table.
         if (mi < static_cast<int>(c->module_tables.size()) && c->module_tables[mi]) {
-            if (x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h) {
+            if (world_x >= m.x && world_x < m.x + m.w && world_y >= m.y && world_y < m.y + m.h) {
                 // Query the attached table for hitboxes without invoking
                 // `gp_table_on_click` (which mutates table selection). This
                 // lets the canvas resolve LED hits for edge-mode without
                 // competing with the table's own selection logic.
                 GP_TableContext* t = c->module_tables[mi];
-                int lx = x - m.x;
-                int ly = y - m.y;
+                int lx = world_x - m.x;
+                int ly = world_y - m.y;
                 int tw = std::max(1, m.w);
                 int th = std::max(1, m.h);
                 std::vector<uint8_t> tmp(static_cast<size_t>(tw) * static_cast<size_t>(th) * 4);
@@ -595,7 +708,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         // left contacts
         for (int ci = 0; ci < left_count; ++ci) {
             int cx, cy; compute_contact_pos_with_count(m, true, ci, left_count, cx, cy);
-            int dx = x - cx; int dy = y - cy;
+            int dx = world_x - cx; int dy = world_y - cy;
             if (dx*dx + dy*dy <= pick_r*pick_r) {
                 // clicked a left contact
                 // focus the module
@@ -644,7 +757,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
         // right contacts
         for (int ci = 0; ci < right_count; ++ci) {
             int cx, cy; compute_contact_pos_with_count(m, false, ci, right_count, cx, cy);
-            int dx = x - cx; int dy = y - cy;
+            int dx = world_x - cx; int dy = world_y - cy;
             if (dx*dx + dy*dy <= pick_r*pick_r) {
                 // clicked a right contact
                 // focus the module
@@ -704,15 +817,12 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     bool hit_module = false;
     for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
         const auto &m = c->modules[mi];
-        if (x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h) { hit_module = true; break; }
+        if (world_x >= m.x && world_x < m.x + m.w && world_y >= m.y && world_y < m.y + m.h) { hit_module = true; break; }
     }
     if (!hit_module && c->selected_tool_canvas == 1) {
         GP_CanvasModuleDesc d{};
-        int nx = x - 20;
-        int ny = y - 16;
-        nx = std::max(0, std::min(c->width - 160, nx));
-        // Use a larger default module size so spawned modules are wider/taller
-        ny = std::max(0, std::min(c->height - 240, ny));
+        int nx = world_x - 20;
+        int ny = world_y - 16;
         d.x = nx; d.y = ny; d.w = 320; d.h = 240; d.left_contacts = 3; d.right_contacts = 3;
         char lbl[64]; std::snprintf(lbl, sizeof(lbl), "Table %zu", c->modules.size()); std::memset(d.label,0,sizeof(d.label)); std::memcpy(d.label,lbl,std::min<size_t>(strlen(lbl), sizeof(d.label)-1));
         int new_idx = gp_canvas_add_module(ctx_, &d);
@@ -730,7 +840,7 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
     // forward click to any attached table that contains the point
     for (int mi = 0; mi < static_cast<int>(c->modules.size()); ++mi) {
         const auto &m = c->modules[mi];
-        if (x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h) {
+        if (world_x >= m.x && world_x < m.x + m.w && world_y >= m.y && world_y < m.y + m.h) {
             // focus this module when clicked
             c->focused_module = mi;
             if (mi < static_cast<int>(c->module_tables.size()) && c->module_tables[mi] && c->selected_tool_canvas == 0) {
@@ -738,8 +848,8 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                 // canvas is in select/interaction mode (tool 0). In edge-mode
                 // we performed non-mutating hit tests earlier and should avoid
                 // letting the table change its own selection state here.
-                int lx = x - m.x;
-                int ly = y - m.y;
+                int lx = world_x - m.x;
+                int ly = world_y - m.y;
                 GP_TableHitBox hb{};
                 int ok = gp_table_on_click(c->module_tables[mi], lx, ly, &hb);
                 if (ok) return 1;
@@ -754,6 +864,8 @@ extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (gp_canvas_on_click(ctx_, x, y)) return 1;
+    int world_x = x + c->offset_x;
+    int world_y = y + c->offset_y;
     // otherwise check for module hit to start dragging
     for (int mi = static_cast<int>(c->modules.size()) - 1; mi >= 0; --mi) {
         const auto &m = c->modules[mi];
@@ -761,15 +873,31 @@ extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
         // top of the module. This prevents clicks on embedded table content or
         // contacts from immediately initiating a window move.
         int header_h = std::min(24, std::max(8, m.h / 6));
-        if (x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + header_h) {
+        if (world_x >= m.x && world_x < m.x + m.w && world_y >= m.y && world_y < m.y + header_h) {
             // start drag: record in per-canvas DragState
             c->drag.dragging = 1;
             c->drag.module = mi;
-            c->drag.offx = x - m.x;
-            c->drag.offy = y - m.y;
+            c->drag.offx = world_x - m.x;
+            c->drag.offy = world_y - m.y;
             // focus the module being dragged
             c->focused_module = mi;
             printf("gp_canvas_on_mouse_down: start drag canvas=%p module=%d off=%d,%d\n", (void*)c, mi, c->drag.offx, c->drag.offy);
+            return 1;
+        }
+    }
+    // In edge-tool (rightmost canvas tool) allow background drag to pan viewport.
+    if (c->selected_tool_canvas == 2) {
+        bool hit_module = false;
+        for (const auto& m : c->modules) {
+            if (world_x >= m.x && world_x < m.x + m.w && world_y >= m.y && world_y < m.y + m.h) { hit_module = true; break; }
+        }
+        if (!hit_module) {
+            c->drag.dragging = 1;
+            c->drag.panning = 1;
+            c->drag.module = -1;
+            c->drag.pan_last_x = x;
+            c->drag.pan_last_y = y;
+            printf("gp_canvas_on_mouse_down: start pan canvas=%p at view=%d,%d world=%d,%d\n", (void*)c, x, y, world_x, world_y);
             return 1;
         }
     }
@@ -779,7 +907,12 @@ extern "C" int gp_canvas_on_mouse_down(GP_CanvasContext* ctx_, int x, int y) {
 extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (!c->drag.panning) {
+        update_canvas_scroll_state(c, /*pull_from_container=*/true);
+    }
     bool handled = false;
+    int world_x = x + c->offset_x;
+    int world_y = y + c->offset_y;
     // update provisional rope endpoint to follow mouse
     if (c->prospective_rope_idx >= 0 && c->selected.module >= 0) {
         int fx = 0, fy = 0;
@@ -790,22 +923,33 @@ extern "C" int gp_canvas_on_mouse_move(GP_CanvasContext* ctx_, int x, int y) {
             } else {
                 compute_contact_pos(c->modules[c->selected.module], left, c->selected.contact_idx, fx, fy);
             }
-            rope_sim_move_endpoints(c->rope_sim, c->prospective_rope_idx, static_cast<float>(fx), static_cast<float>(fy), static_cast<float>(x), static_cast<float>(y));
+            rope_sim_move_endpoints(c->rope_sim, c->prospective_rope_idx, static_cast<float>(fx), static_cast<float>(fy), static_cast<float>(world_x), static_cast<float>(world_y));
             handled = true;
         }
+    }
+    // handle viewport pan
+    if (c->drag.dragging && c->drag.panning) {
+        int dx = x - c->drag.pan_last_x;
+        int dy = y - c->drag.pan_last_y;
+        c->offset_x -= dx;
+        c->offset_y -= dy;
+        c->drag.pan_last_x = x;
+        c->drag.pan_last_y = y;
+        update_canvas_scroll_state(c, /*pull_from_container=*/false);
+        handled = true;
     }
     // handle module drag if present (per-canvas drag state)
     DragState ds = c->drag;
     if (ds.dragging && ds.module >= 0) {
-        int nx = x - ds.offx;
-        int ny = y - ds.offy;
-        // clamp within canvas
-        nx = std::max(0, std::min(c->width - c->modules[ds.module].w, nx));
-        ny = std::max(0, std::min(c->height - c->modules[ds.module].h, ny));
+        int nx = world_x - ds.offx;
+        int ny = world_y - ds.offy;
         c->modules[ds.module].x = nx;
         c->modules[ds.module].y = ny;
         printf("gp_canvas_on_mouse_move: canvas=%p module=%d -> %d,%d\n", (void*)c, ds.module, nx, ny);
         handled = true;
+    }
+    if (handled) {
+        update_canvas_scroll_state(c, /*pull_from_container=*/false);
     }
     return handled ? 1 : 0;
 }
@@ -815,8 +959,36 @@ extern "C" int gp_canvas_on_mouse_up(GP_CanvasContext* ctx_, int x, int y) {
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
     if (!c->drag.dragging) return 0;
     c->drag.dragging = 0;
+    c->drag.panning = 0;
     printf("gp_canvas_on_mouse_up: canvas=%p module=%d\n", (void*)c, c->drag.module);
     c->drag.module = -1;
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
+    return 1;
+}
+
+extern "C" int gp_canvas_set_offset(GP_CanvasContext* ctx_, int offx, int offy) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    c->offset_x = offx;
+    c->offset_y = offy;
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
+    return 1;
+}
+
+extern "C" int gp_canvas_get_offset(GP_CanvasContext* ctx_, int* out_offx, int* out_offy) {
+    if (!ctx_ || !out_offx || !out_offy) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    *out_offx = c->offset_x;
+    *out_offy = c->offset_y;
+    return 1;
+}
+
+extern "C" int gp_canvas_get_scroll_flags(GP_CanvasContext* ctx_, int* out_has_h, int* out_has_v) {
+    if (!ctx_ || !out_has_h || !out_has_v) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
+    *out_has_h = c->scroll_x_needed;
+    *out_has_v = c->scroll_y_needed;
     return 1;
 }
 
@@ -1137,6 +1309,24 @@ extern "C" int gp_canvas_get_templates_dir(char* out_buf, int out_len) {
     return gp_table_get_library_dir(out_buf, out_len);
 }
 
+extern "C" int gp_canvas_set_container_table(GP_CanvasContext* ctx_, GP_TableContext* table, int take_ownership) {
+    if (!ctx_) return 0;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    if (c->container_table && c->container_table_owned) {
+        gp_table_destroy(c->container_table);
+    }
+    c->container_table = table;
+    c->container_table_owned = (table && take_ownership) ? 1 : 0;
+    update_canvas_scroll_state(c, /*pull_from_container=*/true);
+    return 1;
+}
+
+extern "C" GP_TableContext* gp_canvas_get_container_table(GP_CanvasContext* ctx_) {
+    if (!ctx_) return nullptr;
+    auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
+    return c->container_table;
+}
+
 extern "C" int gp_canvas_set_autosave(GP_CanvasContext* ctx_, const char* path, double interval_s) {
     if (!ctx_) return 0;
     auto *c = reinterpret_cast<GP_CanvasContextImpl*>(ctx_);
@@ -1270,6 +1460,7 @@ extern "C" int gp_canvas_save_to_file(GP_CanvasContext* ctx_, const char* path) 
     if (!ofs.good()) return 0;
     ofs << "CANVAS V1\n";
     ofs << c->width << " " << c->height << " " << c->control_bar_h << "\n";
+    ofs << "OFFSET " << c->offset_x << " " << c->offset_y << "\n";
     // modules
     for (size_t i = 0; i < c->modules.size(); ++i) {
         const auto &m = c->modules[i];
@@ -1386,8 +1577,11 @@ extern "C" int gp_canvas_load_from_file(GP_CanvasContext* ctx_, const char* path
             for (int i = 0; i < in_count; ++i) { int t; ss >> t; found->input_types.push_back(t); }
             int out_count = 0; ss >> out_count;
             for (int i = 0; i < out_count; ++i) { int t; ss >> t; found->output_types.push_back(t); }
+        } else if (tag == "OFFSET") {
+            ss >> c->offset_x >> c->offset_y;
         }
     }
+    update_canvas_scroll_state(c, /*pull_from_container=*/false);
     // done
     return 1;
 }
@@ -1424,6 +1618,8 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
     int h = ctx->height;
     int pitch = w * 4;
     if (out_len_bytes < w * h * 4) return 0;
+
+    update_canvas_scroll_state(ctx, /*pull_from_container=*/true);
 
     // clear
     memset(out_rgba, 0, static_cast<size_t>(w) * h * 4);
@@ -1565,8 +1761,10 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
 
     // draw modules
     for (const auto &m : ctx->modules) {
+        int sx = m.x - ctx->offset_x;
+        int sy = m.y - ctx->offset_y;
         Color bg{40,40,50,255};
-        memset_rect(out_rgba, w, h, pitch, m.x, m.y, m.w, m.h, bg);
+        memset_rect(out_rgba, w, h, pitch, sx, sy, m.w, m.h, bg);
         // draw contacts — prefer counts from attached table IO keys when available
         int left_count = m.left_contacts;
         int right_count = m.right_contacts;
@@ -1587,17 +1785,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             int t = 2; // thickness
             // top and bottom bands
             for (int dy = 1; dy <= t; ++dy) {
-                int ytop = m.y - dy;
-                int ybot = m.y + m.h - 1 + dy;
-                if (ytop >= 0 && ytop < h) memset_rect(out_rgba, w, h, pitch, std::max(0, m.x - dy), ytop, std::min(w, m.w + 2*dy), 1, fb);
-                if (ybot >= 0 && ybot < h) memset_rect(out_rgba, w, h, pitch, std::max(0, m.x - dy), ybot, std::min(w, m.w + 2*dy), 1, fb);
+                int ytop = sy - dy;
+                int ybot = sy + m.h - 1 + dy;
+                if (ytop >= 0 && ytop < h) memset_rect(out_rgba, w, h, pitch, std::max(0, sx - dy), ytop, std::min(w, m.w + 2*dy), 1, fb);
+                if (ybot >= 0 && ybot < h) memset_rect(out_rgba, w, h, pitch, std::max(0, sx - dy), ybot, std::min(w, m.w + 2*dy), 1, fb);
             }
             // left and right bands
             for (int dx = 1; dx <= t; ++dx) {
-                int lx = m.x - dx;
-                int rx = m.x + m.w - 1 + dx;
-                if (lx >= 0 && lx < w) memset_rect(out_rgba, w, h, pitch, lx, std::max(0, m.y - t), 1, std::min(h, m.h + 2*t), fb);
-                if (rx >= 0 && rx < w) memset_rect(out_rgba, w, h, pitch, rx, std::max(0, m.y - t), 1, std::min(h, m.h + 2*t), fb);
+                int lx = sx - dx;
+                int rx = sx + m.w - 1 + dx;
+                if (lx >= 0 && lx < w) memset_rect(out_rgba, w, h, pitch, lx, std::max(0, sy - t), 1, std::min(h, m.h + 2*t), fb);
+                if (rx >= 0 && rx < w) memset_rect(out_rgba, w, h, pitch, rx, std::max(0, sy - t), 1, std::min(h, m.h + 2*t), fb);
             }
         }
         // If module has attached table, sync its IO layout and render it into the module rect
@@ -1625,13 +1823,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             }
             // blit tmp into out_rgba at module.x,module.y (clipping)
             for (int yy = 0; yy < th; ++yy) {
-                int dst_y = m.y + yy;
+                int dst_y = sy + yy;
                 if (dst_y < 0 || dst_y >= h) continue;
-                uint8_t* dst_row = out_rgba + dst_y * pitch + m.x * 4;
+                uint8_t* dst_row = out_rgba + dst_y * pitch;
                 uint8_t* src_row = tmp.data() + yy * tw * 4;
-                int copy_w = std::min(tw, std::max(0, w - m.x));
+                int dst_x0 = sx;
+                int src_x0 = 0;
+                int copy_w = tw;
+                if (dst_x0 < 0) { src_x0 = -dst_x0; copy_w -= src_x0; dst_x0 = 0; }
+                copy_w = std::min(copy_w, std::max(0, w - dst_x0));
                 if (copy_w <= 0) continue;
-                std::memcpy(dst_row, src_row, static_cast<size_t>(copy_w) * 4);
+                std::memcpy(dst_row + dst_x0 * 4, src_row + src_x0 * 4, static_cast<size_t>(copy_w) * 4);
             }
         }
     }
@@ -1710,13 +1912,18 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
         std::vector<float> verts(static_cast<size_t>(vc) * 2);
         int got = rope_sim_get_vertices(ctx->rope_sim, ridx, verts.data(), static_cast<int>(verts.size()));
         if (got <= 0) continue;
+        std::vector<float> verts_view(static_cast<size_t>(got) * 2);
+        for (int vi = 0; vi < got; ++vi) {
+            verts_view[vi * 2 + 0] = verts[vi * 2 + 0] - static_cast<float>(ctx->offset_x);
+            verts_view[vi * 2 + 1] = verts[vi * 2 + 1] - static_cast<float>(ctx->offset_y);
+        }
         // use configured jacket/core sizing and per-edge hue array if present
         int jacket_px = ctx->jacket_px;
         int jacket_border = ctx->jacket_border;
         const float* hues_ptr = ctx->edges[ei].hues.empty() ? nullptr : ctx->edges[ei].hues.data();
         int hue_count = static_cast<int>(ctx->edges[ei].hues.size());
         int samples_per_segment = 3;
-        table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts.data(), got, jacket_px, jacket_border, hues_ptr, hue_count, samples_per_segment, ctx->edges[ei].hue_intensity);
+        table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hues_ptr, hue_count, samples_per_segment, ctx->edges[ei].hue_intensity);
     }
 
     // render provisional prospective rope (follows mouse) if present
@@ -1727,12 +1934,17 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
             std::vector<float> verts(static_cast<size_t>(vc) * 2);
             int got = rope_sim_get_vertices(ctx->rope_sim, ridx, verts.data(), static_cast<int>(verts.size()));
             if (got > 0) {
+                std::vector<float> verts_view(static_cast<size_t>(got) * 2);
+                for (int vi = 0; vi < got; ++vi) {
+                    verts_view[vi * 2 + 0] = verts[vi * 2 + 0] - static_cast<float>(ctx->offset_x);
+                    verts_view[vi * 2 + 1] = verts[vi * 2 + 1] - static_cast<float>(ctx->offset_y);
+                }
                 int jacket_px = ctx->jacket_px;
                 int jacket_border = ctx->jacket_border;
                 const float* hues_ptr = ctx->hues.empty() ? nullptr : ctx->hues.data();
                 int hue_count = static_cast<int>(ctx->hues.size());
                 int samples_per_segment = 3;
-                table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts.data(), got, jacket_px, jacket_border, hues_ptr, hue_count, samples_per_segment, ctx->hue_intensity);
+                table_draw_rope_curve_blend_colored(out_rgba, w, h, pitch, verts_view.data(), got, jacket_px, jacket_border, hues_ptr, hue_count, samples_per_segment, ctx->hue_intensity);
             }
         }
     }

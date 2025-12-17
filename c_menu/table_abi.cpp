@@ -1055,6 +1055,7 @@ struct GP_TableContext {
     // Scroll state: row offset (first visible row index) and fraction (0..1)
     int32_t scroll_row_offset = 0;
     float scroll_frac = 0.0f;
+    float scroll_frac_x = 0.0f;
     // selected LED keys: packed (row<<32) | (col<<16) | led_index
     std::unordered_set<uint64_t> selected_leds;
     std::vector<std::pair<uint64_t,uint64_t>> edges;
@@ -1698,6 +1699,12 @@ int32_t gp_table_set_scroll_fraction(GP_TableContext* ctx, float frac) {
     return 1;
 }
 
+int32_t gp_table_set_scroll_fraction_xy(GP_TableContext* ctx, float frac_x, float frac_y) {
+    if (!ctx) return 0;
+    ctx->scroll_frac_x = std::clamp(frac_x, 0.0f, 1.0f);
+    return gp_table_set_scroll_fraction(ctx, frac_y);
+}
+
 // Edge list helpers
 int32_t gp_table_add_edge(GP_TableContext* ctx, unsigned long long a, unsigned long long b) {
     if (!ctx) return 0;
@@ -2163,6 +2170,13 @@ int32_t gp_table_relax_run_until_stable(GP_TableContext* ctx) {
 int32_t gp_table_get_scroll_fraction(GP_TableContext* ctx, float* out_frac) {
     if (!ctx || !out_frac) return 0;
     *out_frac = ctx->scroll_frac;
+    return 1;
+}
+
+int32_t gp_table_get_scroll_fraction_xy(GP_TableContext* ctx, float* out_frac_x, float* out_frac_y) {
+    if (!ctx) return 0;
+    if (out_frac_x) *out_frac_x = ctx->scroll_frac_x;
+    if (out_frac_y) *out_frac_y = ctx->scroll_frac;
     return 1;
 }
 
