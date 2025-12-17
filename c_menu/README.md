@@ -29,3 +29,10 @@ See:
 - `workbench_rows_abi.{h,cpp}` (C ABI for rasterizing legacy workbench rows)
 
 Next integration step (not done yet):
+
+## Interactive demo hooks
+
+- `table_signal_workbench_interactive.py` – pygame demo that drives the C raster with hitboxes,
+  mirrors the legacy signal workbench layout (devices on the left, signals on the right), and
+  lets you click expanders/LEDs/calibration slots/scrollbars to mutate state from Python.
+  Useful while proving out the event-driven path before swapping it into `signal_workbench.py`.
