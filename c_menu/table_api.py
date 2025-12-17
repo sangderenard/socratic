@@ -151,6 +151,18 @@ class GP_TableHitBox(ctypes.Structure):
     ]
 
 
+class GP_TableRenderState(ctypes.Structure):
+    _fields_ = [
+        ("mouse_x", ctypes.c_int32),
+        ("mouse_y", ctypes.c_int32),
+        ("highlight_row", ctypes.c_int32),
+        ("highlight_col", ctypes.c_int32),
+        ("highlight_part", ctypes.c_int32),
+        ("highlight_aux0", ctypes.c_int32),
+        ("highlight_color", ctypes.c_uint8 * 4),
+    ]
+
+
 def _rgba(t):
     r, g, b, a = (list(t) + [255, 255, 255, 255])[:4]
     return (int(r) & 0xFF, int(g) & 0xFF, int(b) & 0xFF, int(a) & 0xFF)
@@ -437,10 +449,121 @@ def render_table_rgba_with_hits(
         ctypes.POINTER(GP_TableRow), ctypes.c_int32,
         ctypes.POINTER(GP_TableColumn), ctypes.c_int32,
         ctypes.POINTER(GP_TableStyle),
+        ctypes.POINTER(GP_TableRenderState),
         ctypes.c_void_p, ctypes.c_int32,
         ctypes.POINTER(GP_TableGeom),
         ctypes.POINTER(GP_TableHitBox), ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
     ]
+
+    # stateful render entry (context -> rgba with optional transient state)
+    lib.gp_table_render_rgba_with_state = getattr(lib, "gp_table_render_rgba_with_state")
+    lib.gp_table_render_rgba_with_state.restype = ctypes.c_int32
+    lib.gp_table_render_rgba_with_state.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(GP_TableRenderState),
+        ctypes.c_void_p, ctypes.c_int32,
+        ctypes.POINTER(GP_TableGeom),
+        ctypes.POINTER(GP_TableHitBox), ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
+    ]
+
+    # click & scroll helpers
+    lib.gp_table_on_click = getattr(lib, "gp_table_on_click")
+    lib.gp_table_on_click.restype = ctypes.c_int32
+    lib.gp_table_on_click.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.POINTER(GP_TableHitBox)]
+    lib.gp_table_set_scroll_fraction = getattr(lib, "gp_table_set_scroll_fraction")
+    lib.gp_table_set_scroll_fraction.restype = ctypes.c_int32
+    lib.gp_table_set_scroll_fraction.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    lib.gp_table_get_scroll_fraction = getattr(lib, "gp_table_get_scroll_fraction")
+    lib.gp_table_get_scroll_fraction.restype = ctypes.c_int32
+    lib.gp_table_get_scroll_fraction.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float)]
+    lib.gp_table_get_row_count = getattr(lib, "gp_table_get_row_count")
+    lib.gp_table_get_row_count.restype = ctypes.c_int32
+    lib.gp_table_get_row_count.argtypes = [ctypes.c_void_p]
+    lib.gp_table_get_row = getattr(lib, "gp_table_get_row")
+    lib.gp_table_get_row.restype = ctypes.c_int32
+    lib.gp_table_get_row.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(GP_TableRow)]
+    lib.gp_table_set_led_selected = getattr(lib, "gp_table_set_led_selected")
+    lib.gp_table_set_led_selected.restype = ctypes.c_int32
+    lib.gp_table_set_led_selected.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+    lib.gp_table_get_led_selected = getattr(lib, "gp_table_get_led_selected")
+    lib.gp_table_get_led_selected.restype = ctypes.c_int32
+    lib.gp_table_get_led_selected.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_int32]
+    lib.gp_table_add_edge = getattr(lib, "gp_table_add_edge")
+    lib.gp_table_add_edge.restype = ctypes.c_int32
+    lib.gp_table_add_edge.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
+    lib.gp_table_clear_edges = getattr(lib, "gp_table_clear_edges")
+    lib.gp_table_clear_edges.restype = ctypes.c_int32
+    lib.gp_table_clear_edges.argtypes = [ctypes.c_void_p]
+    lib.gp_table_get_edge_count = getattr(lib, "gp_table_get_edge_count")
+    lib.gp_table_get_edge_count.restype = ctypes.c_int32
+    lib.gp_table_get_edge_count.argtypes = [ctypes.c_void_p]
+    lib.gp_table_get_edge = getattr(lib, "gp_table_get_edge")
+    lib.gp_table_get_edge.restype = ctypes.c_int32
+    lib.gp_table_get_edge.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
+
+    # node-group / edge-rule helpers
+    lib.gp_table_node_group_set = getattr(lib, "gp_table_node_group_set")
+    lib.gp_table_node_group_set.restype = ctypes.c_int32
+    lib.gp_table_node_group_set.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int32]
+    lib.gp_table_node_group_get = getattr(lib, "gp_table_node_group_get")
+    lib.gp_table_node_group_get.restype = ctypes.c_int32
+    lib.gp_table_node_group_get.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int32)]
+    lib.gp_table_node_group_add_allowed = getattr(lib, "gp_table_node_group_add_allowed")
+    lib.gp_table_node_group_add_allowed.restype = ctypes.c_int32
+    lib.gp_table_node_group_add_allowed.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
+    lib.gp_table_node_group_clear_allowed = getattr(lib, "gp_table_node_group_clear_allowed")
+    lib.gp_table_node_group_clear_allowed.restype = ctypes.c_int32
+    lib.gp_table_node_group_clear_allowed.argtypes = [ctypes.c_void_p]
+    lib.gp_table_node_group_add_disallowed = getattr(lib, "gp_table_node_group_add_disallowed")
+    lib.gp_table_node_group_add_disallowed.restype = ctypes.c_int32
+    lib.gp_table_node_group_add_disallowed.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32]
+    lib.gp_table_node_group_clear_disallowed = getattr(lib, "gp_table_node_group_clear_disallowed")
+    lib.gp_table_node_group_clear_disallowed.restype = ctypes.c_int32
+    lib.gp_table_node_group_clear_disallowed.argtypes = [ctypes.c_void_p]
+    lib.gp_table_node_group_is_edge_allowed = getattr(lib, "gp_table_node_group_is_edge_allowed")
+    lib.gp_table_node_group_is_edge_allowed.restype = ctypes.c_int32
+    lib.gp_table_node_group_is_edge_allowed.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
+
+    # relaxer APIs
+    lib.gp_table_relax_set_mode = getattr(lib, "gp_table_relax_set_mode")
+    lib.gp_table_relax_set_mode.restype = ctypes.c_int32
+    lib.gp_table_relax_set_mode.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    lib.gp_table_relax_get_mode = getattr(lib, "gp_table_relax_get_mode")
+    lib.gp_table_relax_get_mode.restype = ctypes.c_int32
+    lib.gp_table_relax_get_mode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
+    lib.gp_table_relax_set_params = getattr(lib, "gp_table_relax_set_params")
+    lib.gp_table_relax_set_params.restype = ctypes.c_int32
+    lib.gp_table_relax_set_params.argtypes = [ctypes.c_void_p, ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int32]
+    lib.gp_table_relax_step = getattr(lib, "gp_table_relax_step")
+    lib.gp_table_relax_step.restype = ctypes.c_int32
+    lib.gp_table_relax_step.argtypes = [ctypes.c_void_p, ctypes.c_float]
+    lib.gp_table_relax_update = getattr(lib, "gp_table_relax_update")
+    lib.gp_table_relax_update.restype = ctypes.c_int32
+    lib.gp_table_relax_update.argtypes = [ctypes.c_void_p]
+    lib.gp_table_relax_run_until_stable = getattr(lib, "gp_table_relax_run_until_stable")
+    lib.gp_table_relax_run_until_stable.restype = ctypes.c_int32
+    lib.gp_table_relax_run_until_stable.argtypes = [ctypes.c_void_p]
+
+    # selected query
+    lib.gp_table_get_selected_count = getattr(lib, "gp_table_get_selected_count")
+    lib.gp_table_get_selected_count.restype = ctypes.c_int32
+    lib.gp_table_get_selected_count.argtypes = [ctypes.c_void_p]
+    lib.gp_table_get_selected_key = getattr(lib, "gp_table_get_selected_key")
+    lib.gp_table_get_selected_key.restype = ctypes.c_int32
+    lib.gp_table_get_selected_key.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_uint64)]
+
+    # prospective mode
+    lib.gp_table_set_prospective_mode = getattr(lib, "gp_table_set_prospective_mode")
+    lib.gp_table_set_prospective_mode.restype = ctypes.c_int32
+    lib.gp_table_set_prospective_mode.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+    lib.gp_table_get_prospective_mode = getattr(lib, "gp_table_get_prospective_mode")
+    lib.gp_table_get_prospective_mode.restype = ctypes.c_int32
+    lib.gp_table_get_prospective_mode.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
+    lib.gp_table_prospective_set_params = getattr(lib, "gp_table_prospective_set_params")
+    lib.gp_table_prospective_set_params.restype = ctypes.c_int32
+    lib.gp_table_prospective_set_params.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_float, ctypes.c_float]
+    lib.gp_table_prospective_get_params = getattr(lib, "gp_table_prospective_get_params")
+    lib.gp_table_prospective_get_params.restype = ctypes.c_int32
+    lib.gp_table_prospective_get_params.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
 
     if style is None:
         style = default_style()
@@ -497,6 +620,10 @@ def _bind_stateful(lib):
         ctypes.POINTER(GP_TableGeom),
         ctypes.POINTER(GP_TableHitBox), ctypes.c_int32, ctypes.POINTER(ctypes.c_int32),
     ]
+
+    # Note: template/autosave/file IO APIs intentionally not bound here.
+    # Persistence and template library functions live in the native C++ layer
+    # and are not exposed to Python by design per user request.
 
 
 class TableContext:
@@ -556,12 +683,37 @@ class TableContext:
         if not self._ctx:
             raise RuntimeError("context closed")
         g = GP_TableGeom()
-        ok = self._lib.gp_table_get_geom(self._ctx, ctypes.byref(g))
+        ok = self._lib.gp_table_get_geom(ctypes.c_void_p(int(self._ctx)), ctypes.byref(g))
         if not ok:
             raise RuntimeError("gp_table_get_geom failed")
         return g
 
     def render(self, hitbox_cap: int = 4096) -> Tuple[int, int, bytes, GP_TableGeom, Sequence[GP_TableHitBox]]:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        g = GP_TableGeom()
+        ok = self._lib.gp_table_get_geom(ctypes.c_void_p(int(self._ctx)), ctypes.byref(g))
+        if not ok:
+            raise RuntimeError("gp_table_get_geom failed")
+        w = int(g.width_px)
+        h = int(g.height_px)
+        buf_len = w * h * 4
+        buf = (ctypes.c_uint8 * buf_len)()
+        hits_arr = (GP_TableHitBox * max(0, int(hitbox_cap)))()
+        written = ctypes.c_int32(0)
+        # Use stateful render entry with no transient state by default
+        ok = self._lib.gp_table_render_rgba_with_state(
+            ctypes.c_void_p(int(self._ctx)),
+            ctypes.POINTER(GP_TableRenderState)(),
+            buf, ctypes.c_int32(buf_len),
+            ctypes.byref(g),
+            hits_arr, ctypes.c_int32(len(hits_arr)), ctypes.byref(written),
+        )
+        if not ok:
+            raise RuntimeError("gp_table_render_rgba_with_hits failed")
+        return w, h, bytes(buf), g, tuple(hits_arr[: int(written.value)])
+
+    def render_with_state(self, render_state: Optional[GP_TableRenderState], hitbox_cap: int = 4096) -> Tuple[int, int, bytes, GP_TableGeom, Sequence[GP_TableHitBox]]:
         if not self._ctx:
             raise RuntimeError("context closed")
         g = GP_TableGeom()
@@ -574,12 +726,219 @@ class TableContext:
         buf = (ctypes.c_uint8 * buf_len)()
         hits_arr = (GP_TableHitBox * max(0, int(hitbox_cap)))()
         written = ctypes.c_int32(0)
-        ok = self._lib.gp_table_render_rgba_with_hits(
-            self._ctx,
+        ok = self._lib.gp_table_render_rgba_with_state(
+            ctypes.c_void_p(int(self._ctx)),
+            ctypes.byref(render_state) if render_state is not None else ctypes.POINTER(GP_TableRenderState)(),
             buf, ctypes.c_int32(buf_len),
             ctypes.byref(g),
             hits_arr, ctypes.c_int32(len(hits_arr)), ctypes.byref(written),
         )
         if not ok:
-            raise RuntimeError("gp_table_render_rgba_with_hits failed")
+            raise RuntimeError("gp_table_render_rgba_with_state failed")
         return w, h, bytes(buf), g, tuple(hits_arr[: int(written.value)])
+
+    def on_click(self, x: int, y: int) -> Optional[GP_TableHitBox]:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        hb = GP_TableHitBox()
+        ok = self._lib.gp_table_on_click(ctypes.c_void_p(int(self._ctx)), int(x), int(y), ctypes.byref(hb))
+        if not ok:
+            return None
+        return hb
+
+    def set_scroll_fraction(self, frac: float) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_set_scroll_fraction(ctypes.c_void_p(int(self._ctx)), ctypes.c_float(frac))
+        if not ok:
+            raise RuntimeError("gp_table_set_scroll_fraction failed")
+
+    def get_scroll_fraction(self) -> float:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        outf = ctypes.c_float(0.0)
+        ok = self._lib.gp_table_get_scroll_fraction(ctypes.c_void_p(int(self._ctx)), ctypes.byref(outf))
+        if not ok:
+            raise RuntimeError("gp_table_get_scroll_fraction failed")
+        return float(outf.value)
+
+    def get_row_count(self) -> int:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        return int(self._lib.gp_table_get_row_count(ctypes.c_void_p(int(self._ctx))))
+
+    def get_row(self, idx: int) -> GP_TableRow:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        out = GP_TableRow()
+        ok = self._lib.gp_table_get_row(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(int(idx)), ctypes.byref(out))
+        if not ok:
+            raise RuntimeError("gp_table_get_row failed")
+        return out
+
+    def get_selected_count(self) -> int:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        return int(self._lib.gp_table_get_selected_count(ctypes.c_void_p(int(self._ctx))))
+
+    def get_selected_key(self, idx: int) -> Optional[int]:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        outk = ctypes.c_uint64(0)
+        ok = self._lib.gp_table_get_selected_key(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(idx), ctypes.byref(outk))
+        if not ok:
+            return None
+        return int(outk.value)
+
+    def set_prospective_mode(self, enabled: bool) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_set_prospective_mode(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(1 if enabled else 0))
+        if not ok:
+            raise RuntimeError("gp_table_set_prospective_mode failed")
+
+    def get_prospective_mode(self) -> bool:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        outm = ctypes.c_int32(0)
+        ok = self._lib.gp_table_get_prospective_mode(ctypes.c_void_p(int(self._ctx)), ctypes.byref(outm))
+        if not ok:
+            raise RuntimeError("gp_table_get_prospective_mode failed")
+        return bool(outm.value)
+
+    def set_prospective_params(self, max_history: int = 8, slack: float = 4.0, rope_length: float = 0.0) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_prospective_set_params(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(int(max_history)), ctypes.c_float(float(slack)), ctypes.c_float(float(rope_length)))
+        if not ok:
+            raise RuntimeError("gp_table_prospective_set_params failed")
+
+    def get_prospective_params(self) -> tuple[int,float,float]:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        out_max = ctypes.c_int32(0)
+        out_slack = ctypes.c_float(0.0)
+        out_rope = ctypes.c_float(0.0)
+        ok = self._lib.gp_table_prospective_get_params(ctypes.c_void_p(int(self._ctx)), ctypes.byref(out_max), ctypes.byref(out_slack), ctypes.byref(out_rope))
+        if not ok:
+            raise RuntimeError("gp_table_prospective_get_params failed")
+        return int(out_max.value), float(out_slack.value), float(out_rope.value)
+
+    # Edge helpers
+    def clear_edges(self) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_clear_edges(ctypes.c_void_p(int(self._ctx)))
+        if not ok:
+            raise RuntimeError("gp_table_clear_edges failed")
+
+    def get_edges(self) -> list[tuple[int,int]]:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        n = int(self._lib.gp_table_get_edge_count(ctypes.c_void_p(int(self._ctx))))
+        out = []
+        a = ctypes.c_uint64(0)
+        b = ctypes.c_uint64(0)
+        for i in range(n):
+            ok = self._lib.gp_table_get_edge(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(i), ctypes.byref(a), ctypes.byref(b))
+            if ok:
+                out.append((int(a.value), int(b.value)))
+        return out
+
+    # Node-group / rule helpers
+    def set_node_group(self, node_key: int, group: int) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_node_group_set(ctypes.c_void_p(int(self._ctx)), ctypes.c_uint64(node_key), ctypes.c_int32(group))
+        if not ok:
+            raise RuntimeError("gp_table_node_group_set failed")
+
+    def get_node_group(self, node_key: int) -> Optional[int]:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        outg = ctypes.c_int32(0)
+        ok = self._lib.gp_table_node_group_get(ctypes.c_void_p(int(self._ctx)), ctypes.c_uint64(node_key), ctypes.byref(outg))
+        if not ok:
+            return None
+        return int(outg.value)
+
+    def add_allowed_group_pair(self, from_group: int, to_group: int) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_node_group_add_allowed(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(from_group), ctypes.c_int32(to_group))
+        if not ok:
+            raise RuntimeError("gp_table_node_group_add_allowed failed")
+
+    def clear_allowed_group_pairs(self) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_node_group_clear_allowed(ctypes.c_void_p(int(self._ctx)))
+        if not ok:
+            raise RuntimeError("gp_table_node_group_clear_allowed failed")
+
+    def add_disallowed_group_pair(self, from_group: int, to_group: int) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_node_group_add_disallowed(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(from_group), ctypes.c_int32(to_group))
+        if not ok:
+            raise RuntimeError("gp_table_node_group_add_disallowed failed")
+
+    def clear_disallowed_group_pairs(self) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_node_group_clear_disallowed(ctypes.c_void_p(int(self._ctx)))
+        if not ok:
+            raise RuntimeError("gp_table_node_group_clear_disallowed failed")
+
+    def is_edge_allowed(self, a: int, b: int) -> bool:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_node_group_is_edge_allowed(ctypes.c_void_p(int(self._ctx)), ctypes.c_uint64(a), ctypes.c_uint64(b))
+        if ok < 0:
+            raise RuntimeError("gp_table_node_group_is_edge_allowed failed")
+        return bool(ok)
+
+    # Relaxation control
+    def set_relax_mode(self, mode: int) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_relax_set_mode(ctypes.c_void_p(int(self._ctx)), ctypes.c_int32(mode))
+        if not ok:
+            raise RuntimeError("gp_table_relax_set_mode failed")
+
+    def get_relax_mode(self) -> int:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        outm = ctypes.c_int32(0)
+        ok = self._lib.gp_table_relax_get_mode(ctypes.c_void_p(int(self._ctx)), ctypes.byref(outm))
+        if not ok:
+            raise RuntimeError("gp_table_relax_get_mode failed")
+        return int(outm.value)
+
+    def set_relax_params(self, stiffness: float, damping: float, threshold: float = 1e-3, max_iters: int = 200) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_relax_set_params(ctypes.c_void_p(int(self._ctx)), ctypes.c_float(stiffness), ctypes.c_float(damping), ctypes.c_float(threshold), ctypes.c_int32(max_iters))
+        if not ok:
+            raise RuntimeError("gp_table_relax_set_params failed")
+
+    def relax_step(self, dt: float) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_relax_step(ctypes.c_void_p(int(self._ctx)), ctypes.c_float(dt))
+        if not ok:
+            raise RuntimeError("gp_table_relax_step failed")
+
+    def relax_update(self) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_relax_update(ctypes.c_void_p(int(self._ctx)))
+        if not ok:
+            raise RuntimeError("gp_table_relax_update failed")
+
+    def relax_run_until_stable(self) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        ok = self._lib.gp_table_relax_run_until_stable(ctypes.c_void_p(int(self._ctx)))
+        if not ok:
+            raise RuntimeError("gp_table_relax_run_until_stable failed")

@@ -15,10 +15,12 @@ Ensure pygame is installed and the c_menu native library is buildable in c_menu/
 
 import sys
 import time
+import argparse
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import pygame
+import ctypes
 
 import pathlib
 
@@ -163,50 +165,104 @@ def _find_hover(hits: Sequence[ta.GP_TableHitBox], pos: Tuple[int, int]) -> Opti
 def main() -> int:
     pygame.init()
     try:
-        rendered = render_once()
+        # Create a stateful TableContext and populate it
+        style = ta.default_style(width_px=1000)
+        ctx = ta.TableContext(style=style)
+        cols = _make_columns()
+        rows = _make_rows()
+        ctx.set_columns(cols)
+        ctx.set_rows(rows)
+        # enable prospective live-edge mode for immersive cord jacking
+        try:
+            ctx.set_prospective_mode(True)
+        except Exception:
+            pass
+        # parse CLI args for prospective params
+        parser = argparse.ArgumentParser(add_help=False)
+        parser.add_argument("--prospective-max-history", type=int, default=8)
+        parser.add_argument("--prospective-slack", type=float, default=4.0)
+        parser.add_argument("--prospective-stiffness", type=float, default=10.0)
+        parser.add_argument("--prospective-damping", type=float, default=2.0)
+        args, _ = parser.parse_known_args()
+        try:
+            ctx.set_prospective_params(args.prospective_max_history, args.prospective_slack, 0.0)
+            ctx.set_relax_params(stiffness=args.prospective_stiffness, damping=args.prospective_damping)
+        except Exception:
+            pass
     except OSError as e:
         print("Failed to load native table library (c_menu). Ensure it is built and on disk.")
         print(e)
         return 1
 
-    if rendered is None:
-        print("Render failed (library missing or calc_size/raster returned false).")
-        return 1
-
-    w, h, rgba, geom, hits = rendered
+    g = ctx.geom()
+    w = int(g.width_px)
+    h = int(g.height_px)
     info_h = 28
     screen = pygame.display.set_mode((w, h + info_h))
     pygame.display.set_caption("Table ABI hitbox demo")
-    surf = pygame.image.frombuffer(bytearray(rgba), (w, h), "RGBA").convert_alpha()
+    surf = None
+    hits = []
 
     clock = pygame.time.Clock()
     hover: Optional[HoverInfo] = None
     running = True
     last_hover_idx = -2
     font = pygame.font.SysFont(None, 18)
+    mouse_pos = (-1, -1)
     while running:
+        need_rerender = True
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
             elif event.type == pygame.MOUSEMOTION:
-                hover = _find_hover(hits, event.pos)
+                mouse_pos = event.pos
+                need_rerender = True
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = event.pos
+                # forward click into C; it will update context state (expand/led toggle/scroll)
+                hit = ctx.on_click(mx, my)
+                # re-render to reflect any state change
+                need_rerender = True
+
+        # If prospective mode is enabled and exactly one node is selected, report
+        # mouse position every frame so the C renderer can relax the free end.
+        try:
+            pros = ctx.get_prospective_mode()
+            sel_count = ctx.get_selected_count()
+        except Exception:
+            pros = False
+            sel_count = 0
+
+        if pros and sel_count == 1:
+            need_rerender = True
+
+        if need_rerender:
+            # build transient render state with mouse coords so C++ can highlight under cursor
+            rs = ta.GP_TableRenderState()
+            rs.mouse_x = int(mouse_pos[0]) if mouse_pos[0] is not None else -1
+            rs.mouse_y = int(mouse_pos[1]) if mouse_pos[1] is not None else -1
+            rs.highlight_row = -1
+            rs.highlight_col = -1
+            rs.highlight_part = -1
+            rs.highlight_aux0 = -1
+            # zero color => C++ default
+            rs.highlight_color = (ctypes.c_uint8 * 4)(0, 0, 0, 0)
+            w, h, rgba, g, hits = ctx.render_with_state(rs, hitbox_cap=8192)
+            surf = pygame.image.frombuffer(bytearray(rgba), (w, h), "RGBA").convert_alpha()
 
         screen.fill((10, 10, 10))
-        screen.blit(surf, (0, 0))
+        if surf:
+            screen.blit(surf, (0, 0))
+
+        # compute hover info from latest hits
+        hover = _find_hover(hits, mouse_pos) if mouse_pos[0] >= 0 else None
         if hover:
             hb = hover.box
             label = PART_LABEL.get(hb.part, f"part {hb.part}")
             desc = f"hit {hover.idx}: row {hb.row_idx}, col {hb.col_idx}, {label}, aux=({hb.aux0},{hb.aux1}), flags={hb.flags}"
             last_hover_idx = hover.idx
-            # Visualize ONLY the hovered region (per-LED/part hitbox), not the whole cell.
-            rect = pygame.Rect(hb.x0, hb.y0, hb.x1 - hb.x0, hb.y1 - hb.y0)
-            pygame.draw.rect(screen, (255, 235, 150), rect, 0)
-            pygame.draw.rect(screen, (255, 200, 80), rect, 1)
-            cx = (hb.x0 + hb.x1) // 2
-            cy = (hb.y0 + hb.y1) // 2
-            pygame.draw.circle(screen, (255, 120, 40), (cx, cy), 3, 0)
         else:
             desc = "hover to see hit details"
             last_hover_idx = -1
