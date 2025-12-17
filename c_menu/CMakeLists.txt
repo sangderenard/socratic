@@ -8,6 +8,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(c_menu LANGUAGES CXX)
 
+include(CTest)
+
 # Export all symbols on Windows so the C ABI is visible without explicit __declspec.
 if(WIN32)
     set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
@@ -70,3 +72,10 @@ if(EXISTS ${eigen_SOURCE_DIR})
 else()
     message(WARNING "Failed to fetch Eigen; continuing without Eigen acceleration")
 endif()
+
+add_executable(canvas_table_headless_test
+    tests/canvas_table_headless_test.cpp
+)
+target_link_libraries(canvas_table_headless_test PRIVATE c_menu)
+target_include_directories(canvas_table_headless_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME canvas_table_headless_test COMMAND canvas_table_headless_test)
