@@ -297,7 +297,12 @@ HTML_TEMPLATE = """<!doctype html>
     hit.addEventListener('mouseup', ev => {{ mouseDown = false; sendEvent('up', ev); }});
     hit.addEventListener('mouseleave', ev => {{ if (mouseDown) sendEvent('up', ev); mouseDown = false; }});
     hit.addEventListener('mousemove', ev => {{ if (mouseDown) sendEvent('move', ev); }});
-    hit.addEventListener('click', ev => sendEvent('click', ev));
+    // Avoid sending a separate 'click' event in addition to 'down'/'up'.
+    // Some canvas backends treat 'click' and 'up' as distinct actions and
+    // sending both can toggle a control twice (appear to revert immediately).
+    // If a single logical click is preferred, rely on the 'down'+'up' sequence
+    // or replace this with a single 'click' handler and remove the down/up
+    // handlers instead.
 
     async function refreshFrame() {{
       const resp = await fetch('/frame');

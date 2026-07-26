@@ -163,6 +163,9 @@ class GP_TableRenderState(ctypes.Structure):
     ]
 
 
+def make_led_key(row_idx: int, col_idx: int, led_index: int) -> int:
+    return ((int(row_idx) & 0xFFFFFFFF) << 32) | ((int(col_idx) & 0xFFFF) << 16) | (int(led_index) & 0xFFFF)
+
 def _rgba(t):
     r, g, b, a = (list(t) + [255, 255, 255, 255])[:4]
     return (int(r) & 0xFF, int(g) & 0xFF, int(b) & 0xFF, int(a) & 0xFF)
@@ -510,6 +513,16 @@ def render_table_rgba_with_hits(
     lib.gp_table_get_edge.restype = ctypes.c_int32
     lib.gp_table_get_edge.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64)]
 
+    lib.gp_table_set_key_type_hint = getattr(lib, "gp_table_set_key_type_hint")
+    lib.gp_table_set_key_type_hint.restype = ctypes.c_int32
+    lib.gp_table_set_key_type_hint.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint64,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    ]
+
     # node-group / edge-rule helpers
     lib.gp_table_node_group_set = getattr(lib, "gp_table_node_group_set")
     lib.gp_table_node_group_set.restype = ctypes.c_int32
@@ -797,6 +810,29 @@ class TableContext:
             raise RuntimeError("gp_table_get_scroll_fraction_xy failed")
         return float(outx.value), float(outy.value)
 
+    def set_led_type_hint(
+        self,
+        row_idx: int,
+        col_idx: int,
+        led_index: int,
+        type_id: int,
+        *,
+        is_input: bool = True,
+        is_output: bool = True,
+    ) -> None:
+        if not self._ctx:
+            raise RuntimeError("context closed")
+        key = make_led_key(row_idx, col_idx, led_index)
+        ok = self._lib.gp_table_set_key_type_hint(
+            ctypes.c_void_p(int(self._ctx)),
+            ctypes.c_uint64(key),
+            ctypes.c_int32(int(type_id)),
+            ctypes.c_int32(1 if is_input else 0),
+            ctypes.c_int32(1 if is_output else 0),
+        )
+        if not ok:
+            raise RuntimeError("gp_table_set_key_type_hint failed")
+
     def get_row_count(self) -> int:
         if not self._ctx:
             raise RuntimeError("context closed")
@@ -977,3 +1013,4 @@ class TableContext:
         ok = self._lib.gp_table_relax_run_until_stable(ctypes.c_void_p(int(self._ctx)))
         if not ok:
             raise RuntimeError("gp_table_relax_run_until_stable failed")
+

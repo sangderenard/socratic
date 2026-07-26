@@ -9,6 +9,7 @@
 #include <memory>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 #include <stdio.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -106,6 +107,60 @@ struct DragState {
     int pan_last_y = 0;
 };
 
+struct GP_CanvasContextImpl;
+
+struct MolexLayoutInfo {
+    int rows = 0;
+    int cols = 0;
+    std::vector<uint32_t> hashes;
+};
+
+struct ModuleIORow {
+    bool is_input = false;
+    int contact_idx = 0;
+};
+
+static uint32_t hash_connector(int module_idx, bool is_input, int pin_number, int grid_row, int grid_col) {
+    uint32_t h = static_cast<uint32_t>(module_idx + 1);
+    h = (h * 0x9E3779B1u) ^ static_cast<uint32_t>(pin_number * 0x165667B1u);
+    h ^= static_cast<uint32_t>(grid_row * 31) << 8;
+    h ^= static_cast<uint32_t>(grid_col * 17) << 16;
+    if (!is_input) h ^= 0xA5A5A5A5u;
+    h = (h * 0x9E3779B1u) ^ 0xC2B2AE35u;
+    return h ? h : 1;
+}
+
+static MolexLayoutInfo make_molex_layout(int module_idx, bool is_input, int count) {
+    MolexLayoutInfo out;
+    if (count <= 0) return out;
+    const int max_cols = 8;
+    float best_score = std::numeric_limits<float>::infinity();
+    int best_cols = std::min(count, max_cols);
+    int best_rows = (count + best_cols - 1) / best_cols;
+    for (int cols = 1; cols <= std::min(count, max_cols); ++cols) {
+        int rows = (count + cols - 1) / cols;
+        int waste = cols * rows - count;
+        float ratio = float(cols) / float(std::max(1, rows));
+        float score = float(waste) + 4.0f * std::fabs(ratio - 3.0f);
+        if (score < best_score || (std::fabs(score - best_score) < 1e-4f && cols > best_cols)) {
+            best_score = score;
+            best_cols = cols;
+            best_rows = rows;
+        }
+    }
+    out.cols = best_cols;
+    out.rows = best_rows;
+    out.hashes.reserve(static_cast<size_t>(count));
+    for (int idx = 0; idx < count; ++idx) {
+        int grid_row = idx / best_cols;
+        int grid_col = idx % best_cols;
+        uint32_t h = hash_connector(module_idx, is_input, idx + 1, grid_row, grid_col);
+        out.hashes.push_back(h);
+    }
+    return out;
+}
+
+
 // Minimal internal canvas context implementation
 struct GP_CanvasContextImpl {
     int width=0, height=0;
@@ -126,6 +181,9 @@ struct GP_CanvasContextImpl {
     // per-module IO counts (inputs, outputs) exposed in the control bar
     std::vector<int> module_io_in_count;
     std::vector<int> module_io_out_count;
+    std::vector<MolexLayoutInfo> module_input_layout;
+    std::vector<MolexLayoutInfo> module_output_layout;
+    std::vector<std::vector<ModuleIORow>> module_io_rows;
     // cable style/hues
     int jacket_px = 4;
     int jacket_border = 2;
@@ -206,6 +264,7 @@ static inline void compute_contact_pos_with_count(const GP_CanvasModuleDesc &m, 
 }
 
 static inline int table_hit_contact_index(const GP_TableHitBox& hb) {
+    if (hb.row_idx >= 0) return hb.row_idx;
     if (hb.part == GP_TABLE_HIT_LED_TABLE) return hb.aux1;
     return hb.aux0;
 }
@@ -238,6 +297,15 @@ static CanvasBounds compute_canvas_bounds(const GP_CanvasContextImpl* ctx) {
         b.min_y = 0; b.max_y = ctx->height;
     }
     return b;
+}
+
+static uint32_t lookup_molex_hash(const GP_CanvasContextImpl* ctx, int module_idx, bool is_input, int contact_idx) {
+    if (!ctx || contact_idx < 0) return 0;
+    const auto &layout = is_input ? ctx->module_input_layout : ctx->module_output_layout;
+    if (module_idx < 0 || module_idx >= static_cast<int>(layout.size())) return 0;
+    const MolexLayoutInfo &info = layout[module_idx];
+    if (contact_idx >= static_cast<int>(info.hashes.size())) return 0;
+    return info.hashes[contact_idx];
 }
 
 static void clamp_offset_to_bounds(GP_CanvasContextImpl* ctx, const CanvasBounds& b) {
@@ -376,54 +444,77 @@ static void sync_module_table_io_layout(GP_CanvasContextImpl* ctx, int module_id
     }
     if (!t) return;
 
-    // create two LED-arg columns (inputs, outputs) and a single header row
-    // so the control bar's input/output counts are visible in the table.
-    // Create two columns (inputs, outputs). We'll create one row per IO index
-    // so each input/output is rendered as a single LED cell (one LED per row
-    // cell) rather than packing many LEDs into a single cell.
-    int max_count = std::max(0, std::max(in_count, out_count));
-    GP_TableColumn cols[2];
-    cols[0].kind = GP_TABLE_CELL_LEDS_ARG; cols[0].width_px = 48; cols[0].align = 0;
-    cols[1].kind = GP_TABLE_CELL_LEDS_ARG; cols[1].width_px = 48; cols[1].align = 0;
-    gp_table_set_columns(t, cols, 2);
+    // Create columns: label, LED grid, minus button, plus button.
+    GP_TableColumn cols[4];
+    cols[0].kind = GP_TABLE_CELL_TEXT; cols[0].width_px = 80; cols[0].align = 0;
+    cols[1].kind = GP_TABLE_CELL_LEDS_ARG; cols[1].width_px = 72; cols[1].align = 0;
+    cols[2].kind = GP_TABLE_CELL_TEXT; cols[2].width_px = 28; cols[2].align = 1;
+    cols[3].kind = GP_TABLE_CELL_TEXT; cols[3].width_px = 28; cols[3].align = 1;
+    gp_table_set_columns(t, cols, 4);
 
-    if (max_count <= 0) {
-        // no IO: create a single empty header row to keep table geometry stable
+    int total_rows = in_count + out_count;
+    if (total_rows <= 0) {
         GP_TableRow prow{}; memset(&prow, 0, sizeof(prow));
         prow.kind = GP_TABLE_ROW_HEADER; prow.depth = 0; prow.expanded = 1; prow.selected = 0;
-        prow.cell_count = 2;
-        // empty text cells
-        prow.cells[0].kind = GP_TABLE_CELL_TEXT; prow.cells[1].kind = GP_TABLE_CELL_TEXT;
+        prow.cell_count = 4;
+        prow.cells[0].kind = GP_TABLE_CELL_TEXT;
+        prow.cells[1].kind = GP_TABLE_CELL_TEXT;
+        prow.cells[2].kind = GP_TABLE_CELL_TEXT;
+        prow.cells[3].kind = GP_TABLE_CELL_TEXT;
         gp_table_set_rows(t, &prow, 1);
+        if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
+        ctx->module_io_rows[module_idx].clear();
         return;
     }
 
-    std::vector<GP_TableRow> rows(static_cast<size_t>(max_count));
-    for (int ri = 0; ri < max_count; ++ri) {
-        GP_TableRow r{}; memset(&r, 0, sizeof(r));
-        r.kind = GP_TABLE_ROW_DEVICE; r.depth = 0; r.expanded = 1; r.selected = 0;
-        r.cell_count = 2;
-        // left/input cell
-        if (ri < in_count) {
-            r.cells[0].kind = GP_TABLE_CELL_LEDS_ARG;
-            r.cells[0].value = 1.0f; // single LED
-            r.cells[0].flags = 1u;   // linked/on mask (one LED)
-        } else {
-            r.cells[0].kind = GP_TABLE_CELL_TEXT;
-            r.cells[0].text[0] = '\0';
-        }
-        // right/output cell
-        if (ri < out_count) {
-            r.cells[1].kind = GP_TABLE_CELL_LEDS_ARG;
-            r.cells[1].value = 1.0f;
-            r.cells[1].flags = 1u;
-        } else {
-            r.cells[1].kind = GP_TABLE_CELL_TEXT;
-            r.cells[1].text[0] = '\0';
-        }
-        rows[static_cast<size_t>(ri)] = r;
-    }
+    auto fill_text_cell = [](GP_TableCell &cell, const char* text) {
+        cell.kind = GP_TABLE_CELL_TEXT;
+        size_t len = std::min<std::size_t>(std::strlen(text), sizeof(cell.text) - 1);
+        std::memcpy(cell.text, text, len);
+        cell.text[len] = '\0';
+    };
+
+    auto fill_led_cell = [](GP_TableCell &cell) {
+        cell.kind = GP_TABLE_CELL_LEDS_ARG;
+        cell.value = 1.0f;
+        cell.flags = 1u;
+        cell.reserved0 = static_cast<int32_t>(1u);
+    };
+
+    std::vector<GP_TableRow> rows;
+    rows.reserve(static_cast<size_t>(total_rows));
+    std::vector<ModuleIORow> row_meta;
+    row_meta.reserve(static_cast<size_t>(total_rows));
+
+    auto append_row = [&](const char* label, bool is_input, int contact_idx) {
+        GP_TableRow r{};
+        memset(&r, 0, sizeof(r));
+        r.kind = GP_TABLE_ROW_DEVICE;
+        r.depth = 0;
+        r.expanded = 1;
+        r.selected = 0;
+        r.cell_count = 4;
+        fill_text_cell(r.cells[0], label);
+        fill_led_cell(r.cells[1]);
+        fill_text_cell(r.cells[2], "-");
+        fill_text_cell(r.cells[3], "+");
+        rows.push_back(r);
+        row_meta.push_back({is_input, contact_idx});
+    };
+
+    for (int i = 0; i < in_count; ++i) append_row("INPUT", true, i);
+    for (int o = 0; o < out_count; ++o) append_row("OUTPUT", false, o);
+
     gp_table_set_rows(t, rows.data(), static_cast<int>(rows.size()));
+    if (module_idx >= static_cast<int>(ctx->module_io_rows.size())) ctx->module_io_rows.resize(module_idx + 1);
+    ctx->module_io_rows[module_idx] = row_meta;
+    auto ensure_layout = [&](std::vector<MolexLayoutInfo> &arr) {
+        if (module_idx >= static_cast<int>(arr.size())) arr.resize(module_idx + 1);
+    };
+    ensure_layout(ctx->module_input_layout);
+    ensure_layout(ctx->module_output_layout);
+    ctx->module_input_layout[module_idx] = make_molex_layout(module_idx, true, in_count);
+    ctx->module_output_layout[module_idx] = make_molex_layout(module_idx, false, out_count);
     return;
 }
 extern "C" GP_CanvasContext* gp_canvas_create(int width, int height) {
@@ -458,6 +549,9 @@ extern "C" int gp_canvas_add_module(GP_CanvasContext* ctx_, const GP_CanvasModul
     c->module_table_owned.push_back(0);
     c->module_io_in_count.push_back(0);
     c->module_io_out_count.push_back(0);
+    c->module_input_layout.emplace_back();
+    c->module_output_layout.emplace_back();
+    c->module_io_rows.emplace_back();
     int new_idx = static_cast<int>(c->modules.size() - 1);
     // Ensure newly-added modules get a canvas-owned table so table-driven
     // hitboxes and dynamic LED cells work immediately instead of falling
@@ -629,6 +723,27 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                         }
                     }
                     if (found_any) {
+                        if (found.part == GP_TABLE_HIT_CELL && found.col_idx >= 0 && found.row_idx >= 0) {
+                            if (found.col_idx == 2 || found.col_idx == 3) {
+                                if (mi < static_cast<int>(c->module_io_rows.size())) {
+                                    const auto &meta = c->module_io_rows[mi];
+                                    if (found.row_idx >= 0 && found.row_idx < static_cast<int>(meta.size())) {
+                                        bool inc = (found.col_idx == 3);
+                                        bool is_input = meta[found.row_idx].is_input;
+                                        int &target_count = is_input ? c->module_io_in_count[mi] : c->module_io_out_count[mi];
+                                        target_count = std::clamp(target_count + (inc ? 1 : -1), 0, 64);
+                                        printf(
+                                            "gp_canvas_on_click: module=%d %s count adjusted -> %d\n",
+                                            mi,
+                                            (is_input ? "inputs" : "outputs"),
+                                            target_count);
+                                        sync_module_table_io_layout(c, mi);
+                                        update_canvas_scroll_state(c, /*pull_from_container=*/false);
+                                        return 1;
+                                    }
+                                }
+                            }
+                        }
                         // If LED hit, handle canvas-level connection flow. In
                         // edge-drawing mode we avoid calling into the table so
                         // we don't toggle its internal selection state.
@@ -646,7 +761,9 @@ extern "C" int gp_canvas_on_click(GP_CanvasContext* ctx_, int x, int y) {
                             if (c->selected.module == -1) {
                                 c->selected.module = mi; c->selected.contact_idx = contact_idx; c->selected.left = is_left ? 1 : 0;
                                 c->selected.anchor_x = ax; c->selected.anchor_y = ay;
-                                printf("gp_canvas_on_click: selecting table LED module=%d contact=%d left=%d anchor=%d,%d\n", mi, contact_idx, c->selected.left, ax, ay);
+                                uint32_t connector_hash = lookup_molex_hash(c, mi, is_left, contact_idx);
+                                printf("gp_canvas_on_click: selecting table LED module=%d contact=%d left=%d anchor=%d,%d hash=0x%08x\n",
+                                    mi, contact_idx, c->selected.left, ax, ay, connector_hash);
                                 if (!c->rope_sim) c->rope_sim = rope_sim_create(1024, 64);
                                 int ax0 = ax, ay0 = ay;
                                 int bx = ax, by = ay;
@@ -1661,6 +1778,64 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 }
             }
         }
+        // render labels for the small rope-bar buttons (Seg -, Seg +, Slack -, Slack +)
+        {
+            int bw = std::max(4, rb - 8);
+            int spacing = 8;
+            int bx = 8;
+            int byy = 4;
+            std::vector<std::string> lbls = {"Seg -", "Seg +"};
+            for (int i = 0; i < 2; ++i) {
+                int bx_i = bx + i * (bw + spacing);
+                auto tb = render_text_to_rgba(lbls[i], 0.9f, {230,230,230,255});
+                if (!tb.pixels.empty()) {
+                    int tx = bx_i + (bw - tb.width) / 2;
+                    int ty = byy + (rb - 8 - tb.height) / 2;
+                    for (int yy = 0; yy < tb.height; ++yy) {
+                        int dst_y = ty + yy;
+                        if (dst_y < 0 || dst_y >= h) continue;
+                        for (int xx = 0; xx < tb.width; ++xx) {
+                            int dst_x = tx + xx;
+                            if (dst_x < 0 || dst_x >= w) continue;
+                            uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                            const unsigned char* src = &tb.pixels[(yy * tb.width + xx) * 4];
+                            float sa = src[3] / 255.0f;
+                            if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                            else if (sa > 0.001f) {
+                                for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                                dst[3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+            int bx2 = w - 8 - bw*2 - spacing;
+            std::vector<std::string> lbls2 = {"Slack -", "Slack +"};
+            for (int i = 0; i < 2; ++i) {
+                int bx_i = bx2 + i * (bw + spacing);
+                auto tb = render_text_to_rgba(lbls2[i], 0.9f, {230,230,230,255});
+                if (!tb.pixels.empty()) {
+                    int tx = bx_i + (bw - tb.width) / 2;
+                    int ty = byy + (rb - 8 - tb.height) / 2;
+                    for (int yy = 0; yy < tb.height; ++yy) {
+                        int dst_y = ty + yy;
+                        if (dst_y < 0 || dst_y >= h) continue;
+                        for (int xx = 0; xx < tb.width; ++xx) {
+                            int dst_x = tx + xx;
+                            if (dst_x < 0 || dst_x >= w) continue;
+                            uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                            const unsigned char* src = &tb.pixels[(yy * tb.width + xx) * 4];
+                            float sa = src[3] / 255.0f;
+                            if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                            else if (sa > 0.001f) {
+                                for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                                dst[3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     int cbh = ctx->control_bar_h;
     if (cbh > 0) {
@@ -1686,6 +1861,27 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
                 pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
             }
+            // render canvas tool labels
+            const char* canvas_labels[3] = { "Select", "New Table", "Edge Mode" };
+            auto lbm = render_text_to_rgba(canvas_labels[bi], 0.95f, {240,240,240,255});
+            if (!lbm.pixels.empty()) {
+                int tx = bx_i + (bw - lbm.width) / 2;
+                int ty = by + (bh - lbm.height) / 2;
+                for (int yy = 0; yy < lbm.height; ++yy) {
+                    int dst_y = ty + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < lbm.width; ++xx) {
+                        int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &lbm.pixels[(yy * lbm.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
+            }
         }
         // right (table) group
         int group_width = table_btn_count * (bw + spacing) - spacing;
@@ -1701,6 +1897,27 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                 uint8_t* pright = out_rgba + y * pitch + right_x * 4;
                 pleft[0]=40; pleft[1]=40; pleft[2]=44; pleft[3]=255;
                 pright[0]=40; pright[1]=40; pright[2]=44; pright[3]=255;
+            }
+            // render table tool labels
+            const char* table_labels[3] = { "Tbl Select", "Tbl Edit", "Tbl More" };
+            auto lbm2 = render_text_to_rgba(table_labels[bi], 0.85f, {230,220,240,255});
+            if (!lbm2.pixels.empty()) {
+                int tx = bx_i + (bw - lbm2.width) / 2;
+                int ty = by + (bh - lbm2.height) / 2;
+                for (int yy = 0; yy < lbm2.height; ++yy) {
+                    int dst_y = ty + yy; if (dst_y < 0 || dst_y >= h) continue;
+                    for (int xx = 0; xx < lbm2.width; ++xx) {
+                        int dst_x = tx + xx; if (dst_x < 0 || dst_x >= w) continue;
+                        uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                        const unsigned char* src = &lbm2.pixels[(yy * lbm2.width + xx) * 4];
+                        float sa = src[3] / 255.0f;
+                        if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                        else if (sa > 0.001f) {
+                            for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                            dst[3] = 255;
+                        }
+                    }
+                }
             }
         }
         // IO counts (inputs / outputs) shown to the left of the table buttons
@@ -1741,7 +1958,30 @@ extern "C" int gp_canvas_raster_rgba(GP_CanvasContext* ctx_, uint8_t* out_rgba, 
                     }
                 }
             }
-            // tiny label (not required) is skipped for compactness
+            // tiny label: render above number area
+            if (label && label[0] != '\0') {
+                auto lb = render_text_to_rgba(label, 0.75f, {200,200,200,255});
+                if (!lb.pixels.empty()) {
+                    int tx = bx_num + (num_w - lb.width) / 2;
+                    int ty = byy - lb.height - 2; // place slightly above number
+                    for (int yy = 0; yy < lb.height; ++yy) {
+                        int dst_y = ty + yy;
+                        if (dst_y < 0 || dst_y >= h) continue;
+                        for (int xx = 0; xx < lb.width; ++xx) {
+                            int dst_x = tx + xx;
+                            if (dst_x < 0 || dst_x >= w) continue;
+                            uint8_t* dst = out_rgba + dst_y * pitch + dst_x * 4;
+                            const unsigned char* src = &lb.pixels[(yy * lb.width + xx) * 4];
+                            float sa = src[3] / 255.0f;
+                            if (sa >= 0.999f) { dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3]; }
+                            else if (sa > 0.001f) {
+                                for (int cch = 0; cch < 3; ++cch) dst[cch] = static_cast<uint8_t>(std::lround((src[cch]/255.0f * sa + dst[cch]/255.0f * (1.0f-sa)) * 255.0f));
+                                dst[3] = 255;
+                            }
+                        }
+                    }
+                }
+            }
         };
         // compute left of table buttons start for groups placement
         int io_base_x = bx_r; // place IO groups to the left of the table buttons
